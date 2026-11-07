@@ -1,0 +1,29 @@
+# build output
+build/
+dist/bin/
+dist/*.exe
+*.o
+*.a
+*.obj
+*.pdb
+*.ilk
+a.out
+
+# vendored toolchains fetched by `make bootstrap` (large, re-downloadable)
+.cache/
+zig/
+ziglang/
+
+# runtime data: never commit user audio, databases, logs or models
+*.db
+*.db-journal
+*.db-wal
+*.osam.tmp
+*.osmt.tmp
+
+# editor / OS noise
+.DS_Store
+Thumbs.db
+*.swp
+.vscode/
+.idea/
