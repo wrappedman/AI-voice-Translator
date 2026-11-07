@@ -71,8 +71,11 @@ def main() -> int:
     exe_hash = sha256(EXE)
     zip_hash = sha256(OUT)
     sums = os.path.join(ROOT, "dist", "checksums-%s.txt" % VERSION)
+    # Paths are relative to dist/, so `cd dist && sha256sum -c checksums-<v>.txt`
+    # works. A bare "OpenSpeechAI.exe" is not in that directory (the binary is
+    # under bin/), which made the list look correct but verify as missing.
     with open(sums, "w", encoding="utf-8") as f:
-        f.write("%s  OpenSpeechAI.exe\n" % exe_hash)
+        f.write("%s  bin/OpenSpeechAI.exe\n" % exe_hash)
         f.write("%s  %s\n" % (zip_hash, os.path.basename(OUT)))
     print("zip   : %s (%.1f MB)" % (OUT, os.path.getsize(OUT) / 1048576))
     print("sha256: %s" % zip_hash)
