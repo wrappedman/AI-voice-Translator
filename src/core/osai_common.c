@@ -541,12 +541,26 @@ size_t osa_base64_decode(const char *in, size_t n, uint8_t *out) {
 }
 
 /* ============================== time ============================== */
+
+/* A pinned clock, used by the snapshot renderer.
+ *
+ * The screenshots are checked into the repository and CI fails when they
+ * drift, so anything derived from "now" — history timestamps above all — has
+ * to be pinned or the images change every run. When g_fixed_ms >= 0 the rest
+ * of the program sees a constant wall clock. */
+static int64_t g_fixed_ms = -1;
+
+void osa_time_freeze(int64_t epoch_ms) { g_fixed_ms = epoch_ms; }
+bool osa_time_is_frozen(void) { return g_fixed_ms >= 0; }
+
 int64_t osa_now_ms(void) {
+    if (g_fixed_ms >= 0) return g_fixed_ms;
     struct timespec ts;
     clock_gettime(CLOCK_REALTIME, &ts);
     return (int64_t)ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
 }
 int64_t osa_now_us(void) {
+    if (g_fixed_ms >= 0) return g_fixed_ms * 1000;
     struct timespec ts;
     clock_gettime(CLOCK_REALTIME, &ts);
     return (int64_t)ts.tv_sec * 1000000 + ts.tv_nsec / 1000;
@@ -564,7 +578,14 @@ void osa_iso_time(int64_t epoch_ms, char out[32]) {
 #else
     localtime_r(&t, &tmv);
 #endif
-    strftime(out, 32, "%Y-%m-%d %H:%M:%S", &tmv);
+    /* Manual formatting: strftime("%Y-%m-%d") follows LC_TIME, which would
+     * make stored timestamps locale-dependent and the snapshots unstable. */
+    /* clamp the year so the compiler can see the result always fits */
+    int y = tmv.tm_year + 1900;
+    if (y < 0) y = 0;
+    if (y > 9999) y = 9999;
+    snprintf(out, 32, "%04d-%02d-%02d %02d:%02d:%02d", y,
+             tmv.tm_mon + 1, tmv.tm_mday, tmv.tm_hour, tmv.tm_min, tmv.tm_sec);
 }
 int64_t osa_iso_parse(const char *s) {
     int y=0,mo=0,d=0,h=0,mi=0,se=0;

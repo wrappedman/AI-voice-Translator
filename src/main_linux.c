@@ -23,6 +23,20 @@
 #include <string.h>
 #include <math.h>
 
+/* Fixed wall clock for snapshots: 2026-11-07 13:29:43 UTC. Deterministic, and
+ * late enough that the "11-07 13:29" history row reads naturally. */
+#define OSAI_SNAPSHOT_EPOCH_MS 1794058183000LL
+
+/* Where the snapshot renderer keeps its throwaway database. Fixed, because the
+ * data root is drawn on the Settings screen. */
+static const char *osa_snapshot_data_dir(void) {
+#ifdef _WIN32
+    return "C:\\OpenSpeechAI-snapshot";
+#else
+    return "/tmp/openspeech-snapshot";
+#endif
+}
+
 /* The streams the harness writes into. */
 #define OUT stdout
 
@@ -59,6 +73,29 @@ static int run_snapshots(const char *dir, int w, int h, shell_lang lang, bool da
     if (!osa_mkdirs(dir)) {
         fprintf(stderr, "cannot create %s\n", dir);
         return 1;
+    }
+    /* The screenshots are committed and CI compares them, so they must not
+     * depend on machine state:
+     *   - the clock is pinned, because history rows show timestamps;
+     *   - the data directory is a scratch copy, because the real one holds
+     *     however many transcripts the user happened to make.
+     * On the first run the sample transcription below therefore produces the
+     * only history row, and the images are byte-identical every time. */
+    osa_time_freeze(OSAI_SNAPSHOT_EPOCH_MS);
+    {
+        /* A fixed path, not one derived from the output directory: the Settings
+         * screen prints the data root, so a per-run path would change the
+         * image. Reusing the same directory means the sample transcription
+         * must not append a new row on every run. */
+        const char *scratch = osa_snapshot_data_dir();
+        static char db[OSAI_MAX_PATH + 32];
+        snprintf(db, sizeof db, "%s/Database/openspeech.db", scratch);
+        remove(db);
+#ifdef _WIN32
+        _putenv_s("OSAI_DATA_DIR", scratch);
+#else
+        setenv("OSAI_DATA_DIR", scratch, 1);
+#endif
     }
     osa_error err;
     osa_app *app = osa_app_create(&err);

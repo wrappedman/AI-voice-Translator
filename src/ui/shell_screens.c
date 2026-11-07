@@ -420,6 +420,17 @@ static void hist_visit(void *ud, const char *o, const char *e) {
     h->n++;
 }
 
+/* Short form of a stored ISO timestamp for list rows: "11-07 13:29".
+ * A full "2026-11-07 13:29:43" does not fit in a 62 px row. Anything that does
+ * not look like an ISO timestamp is copied through unchanged. */
+static void ui_fmt_when(const char *iso, char *out, size_t cap) {
+    size_t n = iso ? strlen(iso) : 0;
+    if (n >= 16 && iso[4] == '-' && iso[7] == '-' && (iso[10] == ' ' || iso[10] == 'T'))
+        snprintf(out, cap, "%.5s %.5s", iso + 5, iso + 11);
+    else
+        snprintf(out, cap, "%s", iso ? iso : "");
+}
+
 static void draw_history(shell_state *s, ui_context *u, osa_rect body) {
     float pad = 20 * u->L.scale;
     osa_rect inner = rect_inset(body, pad);
@@ -462,12 +473,7 @@ static void draw_history(shell_state *s, ui_context *u, osa_rect body) {
         char durs[32];
         char when[32];
         ui_fmt_duration(hr.dur[i] / 1000.0, durs, sizeof durs);
-        /* "2026-11-07 13:29:43" is too wide for a list row; keep the day and
-         * the time, drop the redundant parts of the date */
-        const char *w = hr.when[i];
-        if (strlen(w) >= 16) snprintf(when, sizeof when, "%s %s", w + 5, w + 11);
-        else osa_strlcpy(when, w, sizeof when);
-        when[10] = 0;                       /* "11-07 13:29" is enough */
+        ui_fmt_when(hr.when[i], when, sizeof when);
         snprintf(meta, sizeof meta, "%s · %s · %.0f%%", when, durs, hr.conf[i] * 100.0);
         text_localize_digits(meta, s->lang == UI_FA ? "fa" : "en", loc, sizeof loc);
         ui_label(u, rectf(row.x + 12 * u->L.scale, row.y + 31 * u->L.scale,

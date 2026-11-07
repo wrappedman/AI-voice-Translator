@@ -106,6 +106,10 @@ size_t osa_base64_decode(const char *in, size_t n, uint8_t *out);
 
 /* ---------------- time / ids ---------------- */
 int64_t osa_now_ms(void);               /* unix epoch ms */
+/* Pin the wall clock. Used by the snapshot renderer so screenshots that show a
+ * timestamp are reproducible; pass -1 to resume the real clock. */
+void    osa_time_freeze(int64_t epoch_ms);
+bool    osa_time_is_frozen(void);
 int64_t osa_now_us(void);
 void    osa_sleep_ms(int ms);
 void    osa_iso_time(int64_t epoch_ms, char out[32]);

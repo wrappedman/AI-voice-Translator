@@ -35,6 +35,10 @@ jobs:
 
       - name: Render screens and diff against the committed baseline
         run: |
+          # The renderer is required to be deterministic: it pins the clock and
+          # uses a throwaway data directory, so a clean checkout must reproduce
+          # the committed images byte for byte.
+          rm -rf /tmp/openspeech-snapshot
           make snapshots
           git add -A dist/screenshots
           if ! git diff --cached --quiet; then
