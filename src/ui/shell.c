@@ -280,7 +280,14 @@ osa_rect shell_draw_chrome(shell_state *s, ui_context *u, osa_rect r, const char
                            const char *subtitle_key) {
     c_fill(u->c, r, u->t.bg);
     float pad = 20 * u->L.scale;
-    osa_rect tr = rectf(r.x + pad, r.y + 10 * u->L.scale, r.w * 0.55f, 24 * u->L.scale);
+    /* The chips are laid out from one edge of the bar; the title must stop
+     * short of them, otherwise the subtitle runs underneath the pills as soon
+     * as the window narrows. 130 + 8 + 84 + 8 + 34 = 264 px of chrome. */
+    float chips_w = 264 * u->L.scale + 16 * u->L.scale;
+    float title_w = r.w - pad * 2 - chips_w;
+    if (title_w < 120 * u->L.scale) title_w = 120 * u->L.scale;
+    float title_x = u->L.rtl ? r.x + pad + chips_w : r.x + pad;
+    osa_rect tr = rectf(title_x, r.y + 10 * u->L.scale, title_w, 24 * u->L.scale);
     ui_label(u, tr, tt(s->lang, title_key), 18 * u->L.scale, u->t.text, u->L.rtl ? 2 : 0);
     osa_rect sr = rectf(tr.x, r.y + 32 * u->L.scale, tr.w, 17 * u->L.scale);
     ui_label(u, sr, tt(s->lang, subtitle_key), 11.5f * u->L.scale, u->t.text_dim,
