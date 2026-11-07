@@ -918,18 +918,14 @@ static void draw_settings(shell_state *s, ui_context *u, osa_rect body) {
         osa_rect side = rectf(u->L.rtl ? inner.x : inner.x + cw + 14 * u->L.scale,
                               inner.y, inner.w - cw - 14 * u->L.scale, inner.h);
         ui_card(u, side);
-        osa_rect dot = rectf(side.x + 20 * u->L.scale, side.y + 20 * u->L.scale, 12,
-                             12 * u->L.scale);
-        c_circle(u->c, dot.x + 6 * u->L.scale, dot.y + 6 * u->L.scale, 6 * u->L.scale,
-                 u->t.success);
         text_opts o = text_default_opts(12 * u->L.scale);
         o.max_width = side.w - 40 * u->L.scale;
         o.line_height = 12 * u->L.scale * 1.9f;
         o.rtl = u->L.rtl;
         o.align = u->L.rtl ? 2 : 0;
         text_draw_box(u->c, u->reg, 12 * u->L.scale, u->t.text_dim,
-                      rectf(side.x + 20 * u->L.scale, side.y + 48 * u->L.scale,
-                            side.w - 40 * u->L.scale, side.h - 70 * u->L.scale),
+                      rectf(side.x + 20 * u->L.scale, side.y + 24 * u->L.scale,
+                            side.w - 40 * u->L.scale, side.h - 48 * u->L.scale),
                       tt(s->lang, "settings.privacynote"), o);
     }
 }
