@@ -193,7 +193,35 @@ int osa_audio_vad(const osa_audio *a, osa_segment *segs, int max_segs) {
         mean += rms[f];
     }
     mean /= (float)nframes;
-    float thr = fmaxf(mean * 1.6f, peak * 0.06f);
+    /* Threshold from the noise floor, not the mean.
+     *
+     * A short isolated word fills most of its own buffer, so the mean frame
+     * energy is itself speech energy: `mean * 1.6` lands *above* the quieter
+     * syllables and the VAD then starts the segment in the middle of the word
+     * (a 0.57 s word got a segment starting at 0.30 s, losing its first
+     * syllable). Take the 10th percentile instead, which is silence whenever
+     * the recording contains any. */
+    float thr;
+    {
+        float *sorted = (float *)malloc((size_t)nframes * sizeof(float));
+        if (sorted) {
+            memcpy(sorted, rms, (size_t)nframes * sizeof(float));
+            /* insertion sort: nframes is small (a 20 s clip is 1000 frames) */
+            for (int a = 1; a < nframes; a++) {
+                float v = sorted[a];
+                int b = a - 1;
+                while (b >= 0 && sorted[b] > v) { sorted[b + 1] = sorted[b]; b--; }
+                sorted[b + 1] = v;
+            }
+            float floor_r = sorted[nframes / 10];
+            free(sorted);
+            thr = fmaxf(floor_r * 3.0f, peak * 0.08f);
+            /* never above half the peak, or a uniform utterance yields nothing */
+            if (thr > peak * 0.5f) thr = peak * 0.5f;
+        } else {
+            thr = fmaxf(mean * 1.6f, peak * 0.06f);
+        }
+    }
     if (thr < 0.002f) thr = 0.002f;
 
     int count = 0;

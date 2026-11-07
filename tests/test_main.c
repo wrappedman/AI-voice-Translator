@@ -351,6 +351,68 @@ static void test_neural_net(void) {
     nn_free(n);
 }
 
+/* Voice activity detection.
+ *
+ * The threshold used to be derived from the mean frame energy. When a short
+ * word fills its own buffer the mean is speech energy, so `mean * 1.6` landed
+ * above the quieter syllables and the segment started mid-word, cutting the
+ * first syllable off. Padded silence is what exposed it: whether the VAD fired
+ * at all changed with 10 ms of extra padding. These cases pin the behaviour to
+ * something monotonic. */
+static void test_vad(void) {
+    suite("vad");
+
+    /* one synthetic word, padded with silence up to 130 ms: the segment must
+     * start at the beginning of the word and keep essentially all of it */
+    const char *word = "انتخاب";
+    int64_t n = 0;
+    float *pcm = tts_speak(word, "fa", &n);
+    CHECK(pcm && n > 0);
+    if (pcm) {
+        float peak = 0;
+        for (int64_t i = 0; i < n; i++) if (fabsf(pcm[i]) > peak) peak = fabsf(pcm[i]);
+        int64_t end = n;
+        while (end > 0 && fabsf(pcm[end - 1]) < peak * 0.02f) end--;
+        CHECK_MSG(end > OSAI_SR / 4, "speech is %lld samples", (long long)end);
+
+        int64_t cap = end + 4096;
+        float *padded = (float *)calloc((size_t)cap, sizeof(float));
+        CHECK(padded != NULL);
+        if (padded) {
+            memcpy(padded, pcm, (size_t)end * sizeof(float));
+            int bad_start = 0, missed = 0;
+            for (int pad = 0; pad <= 2080; pad += 160) {   /* 0 .. 130 ms */
+                osa_audio a;
+                osa_audio_init(&a);
+                a.samples = padded;
+                a.n = end + pad;
+                osa_segment segs[8];
+                int ns = osa_audio_vad(&a, segs, 8);
+                if (ns <= 0) { missed++; continue; }
+                /* 30 ms of slack: the VAD pads 120 ms before the onset */
+                if (segs[0].start > 0.030f) bad_start++;
+            }
+            CHECK_MSG(missed == 0, "VAD found speech at every pad (%d missed)", missed);
+            CHECK_MSG(bad_start == 0, "VAD starts at the word, not mid-word (%d bad)", bad_start);
+            free(padded);
+        }
+        free(pcm);
+    }
+
+    /* digital silence must produce no segments at all */
+    float *sil = (float *)calloc((size_t)OSAI_SR, sizeof(float));
+    CHECK(sil != NULL);
+    if (sil) {
+        osa_audio a;
+        osa_audio_init(&a);
+        a.samples = sil;
+        a.n = OSAI_SR;
+        osa_segment segs[8];
+        CHECK_MSG(osa_audio_vad(&a, segs, 8) == 0, "silence yields no segments");
+        free(sil);
+    }
+}
+
 static void test_asr(void) {
     suite("asr");
     osa_error err;
@@ -618,6 +680,7 @@ int main(int argc, char **argv) {
     test_neural_net();
     test_mt();
     test_store();
+    test_vad();
     test_asr();
     test_app();
 
