@@ -286,6 +286,24 @@ static void test_mt(void) {
     if (mt_translate(m, "کتاب", MT_FA, &r, &err))
         CHECK_MSG(r.n_pieces >= 1, "unknown Persian word yields %d piece(s)", r.n_pieces);
 
+    /* A sentence with no known words must come back as itself, not as "".
+     * It used to be dropped whenever the source script matched the *target*
+     * script, so "open the door" (EN -> FA) produced an empty string. */
+    if (mt_translate(m, "open the door", MT_AUTO, &r, &err)) {
+        CHECK_MSG(r.text[0] != 0, "untranslatable sentence is not empty (\"%s\")", r.text);
+        CHECK_MSG(strstr(r.text, "door") != NULL, "unknown word kept: \"%s\"", r.text);
+    }
+    /* and a half-known sentence keeps both halves */
+    if (mt_translate(m, "hello world", MT_AUTO, &r, &err)) {
+        CHECK_MSG(strstr(r.text, "سلام") != NULL && strstr(r.text, "world") != NULL,
+                  "mixed known/unknown: \"%s\"", r.text);
+    }
+    /* EN/EM dash are word separators, same as a space */
+    mt_result dash;
+    if (mt_translate(m, "fa–en", MT_AUTO, &dash, &err) &&
+        mt_translate(m, "fa-en", MT_AUTO, &dash, &err))
+        CHECK_MSG(dash.n_pieces == 2, "en dash splits into %d pieces", dash.n_pieces);
+
     /* empty input is an error, not an empty success */
     CHECK(!mt_translate(m, "", MT_AUTO, &r, &err));
 

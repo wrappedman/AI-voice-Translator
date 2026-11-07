@@ -569,12 +569,21 @@ static void norm_key(mt_lang lang, const char *in, char *out, size_t cap) {
     size_t o = 0;
     bool prev_space = true;
     for (const char *p = tmp; *p && o + 2 < cap; p++) {
+        /* EN DASH (E2 80 93) and EM DASH (E2 80 94) are multi-byte, so they can
+         * never match a single-byte comparison; rewrite them to spaces first so
+         * "fa–en" tokenises the same way "fa - en" does. */
+        if ((unsigned char)p[0] == 0xE2 && (unsigned char)p[1] == 0x80 &&
+            ((unsigned char)p[2] == 0x93 || (unsigned char)p[2] == 0x94)) {
+            if (!prev_space) { out[o++] = ' '; prev_space = true; }
+            p += 2;
+            continue;
+        }
         unsigned char ch = (unsigned char)*p;
         if (ch < 0x80) {
             bool space = (ch == ' ' || ch == '\t' || ch == '\n' || ch == '\r');
             bool punct = (ch == ',' || ch == '.' || ch == '!' || ch == '?' || ch == ';' ||
                           ch == ':' || ch == '"' || ch == '\'' || ch == '(' || ch == ')' ||
-                          ch == '[' || ch == ']' || ch == '-' || ch == 0x2013 || ch == 0x2014);
+                          ch == '[' || ch == ']' || ch == '-');
             if (space || punct) {
                 if (!prev_space) { out[o++] = ' '; prev_space = true; }
                 continue;
@@ -780,15 +789,17 @@ bool mt_translate(const mt_model *m, const char *text, mt_lang src,
             int c2 = gloss_word(m, tok, src, NULL, dst, sizeof dst);
             if (c2 > 0 && (size_t)c2 == tl) { consumed = (int)tl; }
             else {
-                /* Unknown token: keep Latin words only in Latin output and
-                 * Persian words only in Persian output, so the result is not a
-                 * script salad. The piece still records the source text. */
-                bool target_is_fa = (out->dst_lang == MT_FA);
-                bool latin = false;
-                for (const char *q = tok; *q; q++)
-                    if ((*q >= 'a' && *q <= 'z') || (*q >= 'A' && *q <= 'Z')) { latin = true; break; }
-                if (target_is_fa == latin) dst[0] = 0;
-                else osa_strlcpy(dst, tok, sizeof dst);
+                /* Unknown token: pass it through unchanged.
+                 *
+                 * It used to be dropped when its script did not match the
+                 * target ("open the door" -> ""), on the theory that mixing
+                 * scripts looks wrong. Persian text is full of Latin loanwords
+                 * (سیستم، آنلاین، HTML) and proper nouns, so dropping them is
+                 * both wrong and silently lossy: an untranslatable sentence
+                 * produced an empty string with no indication why. Keeping the
+                 * source word means the user sees exactly what the engine did
+                 * not know, which is the honest result. */
+                osa_strlcpy(dst, tok, sizeof dst);
                 consumed = (int)tl;
             }
             if (consumed == 0) break;
