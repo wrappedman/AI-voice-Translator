@@ -163,8 +163,8 @@ void osa_audio_resample(const float *in, int64_t n_in, int sr_in, float **out, i
             int64_t idx = i0 + t;
             if (idx < 0 || idx >= n_in) continue;
             double x = src - (double)idx;
-            double sinc = fabs(x) < 1e-9 ? 1.0 : sin(M_PI * cutoff * x) / (M_PI * cutoff * x);
-            double win = 0.5 + 0.5 * cos(M_PI * x / (double)(TAPS + 1));
+            double sinc = fabs(x) < 1e-9 ? 1.0 : sin(OSAI_PI * cutoff * x) / (OSAI_PI * cutoff * x);
+            double win = 0.5 + 0.5 * cos(OSAI_PI * x / (double)(TAPS + 1));
             double w = sinc * win;
             acc += in[idx] * w;
             wsum += w;
@@ -280,7 +280,7 @@ int64_t osa_mel_spectrogram(const float *samples, int64_t n, float **out, int *n
         free(win); free(re); free(im); free(frame); free(power); free(f); free(mel_fb);
         return 0;
     }
-    for (int i = 0; i < OSAI_FRAME_LEN; i++) win[i] = 0.54f - 0.46f * cosf(2.0f * (float)M_PI * i / (OSAI_FRAME_LEN - 1));
+    for (int i = 0; i < OSAI_FRAME_LEN; i++) win[i] = 0.54f - 0.46f * cosf(2.0f * ((float)OSAI_PI) * i / (OSAI_FRAME_LEN - 1));
 
     /* mel filterbank over 80 Hz .. 7600 Hz */
     float mel_lo = hz_to_mel(80.0f), mel_hi = hz_to_mel(7600.0f);
@@ -310,7 +310,7 @@ int64_t osa_mel_spectrogram(const float *samples, int64_t n, float **out, int *n
         for (int k = 0; k < NFFT; k++) { re[k] = frame[k]; im[k] = 0; }
         /* iterative radix-2 FFT */
         for (int len = 2; len <= NFFT; len <<= 1) {
-            float ang = -2.0f * (float)M_PI / (float)len;
+            float ang = -2.0f * ((float)OSAI_PI) / (float)len;
             float wr = cosf(ang), wi = sinf(ang);
             for (int i = 0; i < NFFT; i += len) {
                 float cr = 1.0f, ci = 0.0f;
@@ -346,10 +346,10 @@ bool osa_audio_write_test_wav(const char *path) {
     if (!s) return false;
     for (int i = 0; i < n; i++) {
         float t = (float)i / (float)sr;
-        float env = 0.5f + 0.5f * sinf(2.0f * (float)M_PI * 2.2f * t);
-        float f0 = 118.0f + 12.0f * sinf(2.0f * (float)M_PI * 0.7f * t);
+        float env = 0.5f + 0.5f * sinf(2.0f * ((float)OSAI_PI) * 2.2f * t);
+        float f0 = 118.0f + 12.0f * sinf(2.0f * ((float)OSAI_PI) * 0.7f * t);
         float v = 0;
-        for (int h = 1; h <= 12; h++) v += sinf(2.0f * (float)M_PI * f0 * (float)h * t) / (float)h;
+        for (int h = 1; h <= 12; h++) v += sinf(2.0f * ((float)OSAI_PI) * f0 * (float)h * t) / (float)h;
         v *= env * 0.25f;
         s[i] = v;
     }

@@ -4,6 +4,10 @@
 
 #ifdef _WIN32
 #include <windows.h>
+#ifndef PSAPI_VERSION
+#define PSAPI_VERSION 1
+#endif
+#include <psapi.h>
 #include <direct.h>
 #else
 #include <sys/stat.h>

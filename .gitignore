@@ -1,7 +1,5 @@
 # build output
 build/
-dist/bin/
-dist/*.exe
 *.o
 *.a
 *.obj
@@ -20,6 +18,13 @@ ziglang/
 *.db-wal
 *.osam.tmp
 *.osmt.tmp
+
+# Release artifacts that DO ship in the repository:
+#   dist/bin/OpenSpeechAI.exe          the built Windows binary
+#   dist/OpenSpeechAI-*-win64.zip      the same binary, packaged
+#   dist/checksums-*.txt               hashes for both
+# Everything else under dist/ is generated (screenshots are committed: they are
+# the visual regression baseline).
 
 # editor / OS noise
 .DS_Store

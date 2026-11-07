@@ -18,11 +18,15 @@
 #include <stdio.h>
 #include <stdlib.h>
 
-#define OSAI_VERSION        "0.1.0"
+#define OSAI_VERSION        "1.0.0"
 #define OSAI_APP_NAME       "OpenSpeech AI"
 #define OSAI_APP_ID         "OpenSpeechAI"
 
 /* ---------------- limits ---------------- */
+/* Strict C11 does not define M_PI (mingw hides it without _USE_MATH_DEFINES),
+ * so the codebase uses its own constant. */
+#define OSAI_PI 3.14159265358979323846
+
 #define OSAI_MAX_PATH       1024
 #define OSAI_MAX_LINE       4096
 #define OSAI_MAX_MSG        512

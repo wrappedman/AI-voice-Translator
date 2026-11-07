@@ -28,7 +28,12 @@ static const phrase_pair SENTENCES[] = {
     {"شب بخیر", "Good night"},
     {"خداحافظ", "Goodbye"},
     {"ممنون", "Thanks"},
+    {"ممنونم", "Thank you"},
+    {"متشکرم", "Thank you"},
+    {"مرسی", "Thanks"},
     {"خیلی ممنون", "Thank you very much"},
+    {"خیلی متشکرم", "Thank you very much"},
+    {"ببخشید", "Excuse me"},
     {"لطفا", "Please"},
     {"بله", "Yes"},
     {"نه", "No"},
@@ -551,21 +556,95 @@ const char *mt_backend_name(const char *backend) {
     return backend;
 }
 
+/* Comparison key: both sides of the phrasebook go through this so "Thank you"
+ * matches "thank you", and "Hello, how are you?" matches "hello how are you".
+ * Persian is normalised first (yeh/kaf/ZWNJ), then punctuation is folded away. */
+static void norm_key(mt_lang lang, const char *in, char *out, size_t cap) {
+    char tmp[MT_MAX_TEXT];
+    if (lang == MT_FA) normalize_fa(in, tmp, sizeof tmp);
+    else take_trim(in, in + strlen(in), tmp, sizeof tmp);
+    size_t o = 0;
+    bool prev_space = true;
+    for (const char *p = tmp; *p && o + 2 < cap; p++) {
+        unsigned char ch = (unsigned char)*p;
+        if (ch < 0x80) {
+            bool space = (ch == ' ' || ch == '\t' || ch == '\n' || ch == '\r');
+            bool punct = (ch == ',' || ch == '.' || ch == '!' || ch == '?' || ch == ';' ||
+                          ch == ':' || ch == '"' || ch == '\'' || ch == '(' || ch == ')' ||
+                          ch == '[' || ch == ']' || ch == '-' || ch == 0x2013 || ch == 0x2014);
+            if (space || punct) {
+                if (!prev_space) { out[o++] = ' '; prev_space = true; }
+                continue;
+            }
+            out[o++] = (char)((ch >= 'A' && ch <= 'Z') ? ch - 'A' + 'a' : ch);
+            prev_space = false;
+        } else if (ch == 0xD8 || ch == 0xD9 || ch == 0xDA || ch == 0xDB) {
+            /* keep Persian bytes verbatim */
+            out[o++] = (char)ch;
+            prev_space = false;
+        } else {
+            out[o++] = (char)ch;
+            prev_space = false;
+        }
+    }
+    out[o] = 0;
+    /* trailing space */
+    while (o > 0 && out[o - 1] == ' ') out[--o] = 0;
+}
+
 /* Exact sentence lookup, in the requested direction. */
 static const char *lookup_sentence(const mt_model *m, const char *norm, mt_lang src) {
+    char key[MT_MAX_TEXT];
+    norm_key(src, norm, key, sizeof key);
+    if (!key[0]) return NULL;
+    char cand[MT_MAX_TEXT];
     if (m && m->pairs) {
         for (int i = 0; i < m->n_pairs; i++) {
             const char *from = src == MT_FA ? m->pairs[i].fa : m->pairs[i].en;
             const char *to = src == MT_FA ? m->pairs[i].en : m->pairs[i].fa;
-            if (osa_streq(from, norm)) return to;
+            norm_key(src, from, cand, sizeof cand);
+            if (osa_streq(cand, key)) return to;
         }
     }
     for (size_t i = 0; i < sizeof SENTENCES / sizeof SENTENCES[0]; i++) {
         const char *from = src == MT_FA ? SENTENCES[i].fa : SENTENCES[i].en;
         const char *to = src == MT_FA ? SENTENCES[i].en : SENTENCES[i].fa;
-        if (osa_streq(from, norm)) return to;
+        norm_key(src, from, cand, sizeof cand);
+        if (osa_streq(cand, key)) return to;
     }
     return NULL;
+}
+
+/* Longest phrase (two or more words) starting at `norm`, matched on whole-token
+ * boundaries over already-normalised text. Returns bytes consumed, or 0. */
+static int gloss_phrase(const mt_model *m, const char *norm, mt_lang src, char *dst, size_t cap) {
+    size_t best = 0;
+    const char *best_to = NULL;
+    char cand[MT_MAX_TEXT];
+
+    const phrase_pair *tables[2] = { NULL, SENTENCES };
+    int counts[2] = { 0, (int)(sizeof SENTENCES / sizeof SENTENCES[0]) };
+    if (m && m->pairs) { tables[0] = m->pairs; counts[0] = m->n_pairs; }
+
+    for (int t = 0; t < 2; t++) {
+        for (int i = 0; i < counts[t]; i++) {
+            const char *from = src == MT_FA ? tables[t][i].fa : tables[t][i].en;
+            const char *to = src == MT_FA ? tables[t][i].en : tables[t][i].fa;
+            norm_key(src, from, cand, sizeof cand);
+            size_t cl = strlen(cand);
+            if (cl <= best || !strchr(cand, ' ')) continue;   /* single words go to gloss_word */
+            if (strncmp(norm, cand, cl) != 0) continue;
+            if (norm[cl] != 0 && norm[cl] != ' ') continue;
+            best = cl;
+            best_to = to;
+        }
+    }
+    if (!best || !best_to) return 0;
+    osa_strlcpy(dst, best_to, cap);
+    /* consume the trailing space too, so the caller starts on a token */
+    size_t n = best;
+    while (norm[n] == ' ') n++;
+    return (int)n;
 }
 
 /* Longest-prefix word gloss. Returns the number of bytes consumed. */
@@ -644,9 +723,11 @@ bool mt_translate(const mt_model *m, const char *text, mt_lang src,
     osa_strlcpy(out->backend, m ? m->backend : "phrasebook", sizeof out->backend);
     osa_strlcpy(out->model_id, m ? m->id : "", sizeof out->model_id);
 
+    /* One canonical form for everything downstream: Persian yeh/kaf fixed, no
+     * ZWNJ, Latin lowercased, punctuation folded to single spaces. Matching on
+     * this instead of the raw text is what makes "Thank you" find "thank you". */
     char norm[MT_MAX_TEXT];
-    if (src == MT_FA) normalize_fa(text, norm, sizeof norm);
-    else take_trim(text, text + strlen(text), norm, sizeof norm);
+    norm_key(src, text, norm, sizeof norm);
     if (!norm[0]) { osa_err_set(err, "empty input"); return false; }
 
     /* 1. whole-sentence phrasebook hit */
@@ -677,10 +758,11 @@ bool mt_translate(const mt_model *m, const char *text, mt_lang src,
         if (!*p) break;
         const char *chain = *p ? strchr(p, ' ') : NULL;
         size_t chain_len = chain ? (size_t)(chain - p) : strlen(p);
-        /* try the longest prefix of the remaining text, then backtrack to the
-         * current token boundary */
         char dst[256];
-        int consumed = gloss_word(m, p, src, NULL, dst, sizeof dst);
+        /* Multi-word phrases first ("how are you" must beat "how" + "are" +
+         * "you"), then a single-token gloss, then pass-through. */
+        int consumed = gloss_phrase(m, p, src, dst, sizeof dst);
+        if (consumed == 0) consumed = gloss_word(m, p, src, NULL, dst, sizeof dst);
         if (consumed == 0 || (size_t)consumed > chain_len) {
             /* single token: try just the token, else pass it through */
             char tok[256];

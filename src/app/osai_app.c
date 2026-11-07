@@ -680,3 +680,16 @@ char *osa_app_evaluate(osa_app *a, osa_error *err) {
     osa_err_ok(err);
     return osa_buf_detach(&b);
 }
+
+/* ---- display-only translation -------------------------------------- */
+
+const char *osa_app_translate_preview(osa_app *app, const char *text) {
+    static char buf[8192];
+    static mt_result res;          /* 8 KB of pieces: keep it off the stack */
+    buf[0] = 0;
+    if (!app || !text || !*text || !app->mt) return buf;
+    osa_error e;
+    if (!mt_translate(app->mt, text, MT_AUTO, &res, &e)) return buf;
+    osa_strlcpy(buf, res.text, sizeof buf);
+    return buf;
+}

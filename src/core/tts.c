@@ -87,8 +87,8 @@ static const phoneme *parse_next(const char **p) {
 typedef struct resonator { float y1, y2, a1, a2, gain; } resonator;
 
 static void res_set(resonator *r, float freq, float bw, float sr) {
-    float rho = expf(-(float)M_PI * bw / sr);
-    float theta = 2.0f * (float)M_PI * freq / sr;
+    float rho = expf(-((float)OSAI_PI) * bw / sr);
+    float theta = 2.0f * ((float)OSAI_PI) * freq / sr;
     r->a1 = 2.0f * rho * cosf(theta);
     r->a2 = -rho * rho;
     r->gain = 1.0f - rho;

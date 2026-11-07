@@ -104,6 +104,11 @@ const char *osa_app_last_language(const osa_app *app);
 bool osa_app_translate(osa_app *app, const char *text, const char *src,
                        osa_app_translation *out, osa_error *err);
 
+/* Translate for display only: nothing is written to the database. Returns a
+ * pointer to an internal buffer, valid until the next call. Used by the history
+ * list, which previews many rows per frame. */
+const char *osa_app_translate_preview(osa_app *app, const char *text);
+
 /* One-shot: transcribe then translate, linking both rows. */
 bool osa_app_transcribe_and_translate(osa_app *app, const char *path,
                                       osa_app_transcript *tr,
