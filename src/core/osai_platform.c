@@ -1,5 +1,10 @@
-/* portable platform layer: filesystem, threads, metrics (POSIX implementation;
- * the Windows build uses platform/win32/{win_platform.c,win_net.c}). */
+/* Portable platform layer: filesystem, threads, clocks, metrics, process
+ * control.
+ *
+ * Both implementations live in this file, chosen by `_WIN32`: Win32
+ * (CreateFile/GetProcessMemoryInfo) on Windows, POSIX (stat/opendir/getrusage)
+ * elsewhere. src/platform/win32/ holds only the Windows entry point and
+ * resources (`main_win.c`, `app.rc`, manifest, icon), not the platform layer. */
 #include "osai_platform.h"
 
 #ifdef _WIN32
