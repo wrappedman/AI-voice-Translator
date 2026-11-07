@@ -58,7 +58,7 @@ def main() -> int:
     licence = os.path.join(ROOT, "LICENSE")
     if os.path.exists(licence):
         files.append((licence, "LICENSE.txt"))
-    font_lic = os.path.join(ROOT, "src", "ui", "assets", "OFL.txt")
+    font_lic = os.path.join(ROOT, "src", "ui", "assets", "Vazirmatn-OFL.txt")
     if os.path.exists(font_lic):
         files.append((font_lic, "LICENSE-Vazirmatn.txt"))
 
