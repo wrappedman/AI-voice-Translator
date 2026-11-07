@@ -308,6 +308,12 @@ float *tts_speak(const char *text, const char *lang, int64_t *n_out) {
             synth_silence(s, 50);
         }
     }
+    /* Nothing was spoken: return no audio at all rather than a pad of silence,
+     * so callers can treat "empty input" the same as "synthesis failed". */
+    if (s->n == 0) {
+        synth_free(s);
+        return NULL;
+    }
     synth_silence(s, 80);
     float peak = 0;
     for (int64_t i = 0; i < s->n; i++) if (fabsf(s->out[i]) > peak) peak = fabsf(s->out[i]);

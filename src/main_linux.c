@@ -31,6 +31,7 @@ static void usage(void) {
            "  --snapshots DIR   render every screen to DIR/screen-*.png\n"
            "  --transcribe FILE transcribe (and translate) a WAV/FLAC/OGG file\n"
            "  --selftest        run the built-in assertions, exit 1 on failure\n"
+           "  --models-json     print the registered models as JSON\n"
            "  --version         print the version\n"
            "  --width/--height  snapshot size (default 1440x900)\n"
            "  --lang fa|en      interface language (default fa)\n"
@@ -297,7 +298,7 @@ static int run_selftest(void) {
 int main(int argc, char **argv) {
     const char *snapdir = NULL;
     const char *file = NULL;
-    bool json = false, light = false, selftest = false;
+    bool json = false, light = false, selftest = false, models_json = false;
     int w = 1440, h = 900;
     shell_lang lang = UI_FA;
 
@@ -313,6 +314,7 @@ int main(int argc, char **argv) {
         else if (osa_streq(a, "--json")) json = true;
         else if (osa_streq(a, "--light")) light = true;
         else if (osa_streq(a, "--selftest")) selftest = true;
+        else if (osa_streq(a, "--models-json")) models_json = true;
         else if (osa_streq(a, "--lang") && i + 1 < argc)
             lang = osa_starts(argv[++i], "en") ? UI_EN : UI_FA;
         else { fprintf(stderr, "unknown argument: %s\n", a); usage(); return 2; }
@@ -321,6 +323,15 @@ int main(int argc, char **argv) {
     if (snapdir) return run_snapshots(snapdir, w, h, lang, !light);
     if (file) return run_transcribe(file, json);
     if (selftest) return run_selftest();
+    if (models_json) {
+        osa_error err;
+        osa_app *app = osa_app_create(&err);
+        if (!app) { fprintf(stderr, "app init failed: %s\n", err.msg); return 1; }
+        char *json = osa_app_models_json(app, &err);
+        if (json) { printf("%s\n", json); free(json); }
+        osa_app_destroy(app);
+        return json ? 0 : 1;
+    }
     usage();
     return 0;
 }

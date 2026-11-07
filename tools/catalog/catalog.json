@@ -1,0 +1,37 @@
+{
+  "schema": 1,
+  "updated": "2026-11-07",
+  "note": "Offline model catalogue. OpenSpeech AI ships every entry listed with status=installed; the file exists so that additional models can be described in one place without changing the binary. Nothing here is fetched at runtime.",
+  "models": [
+    {
+      "id": "builtin-asr-fa",
+      "name": "Builtin ASR (Persian + English)",
+      "kind": "asr",
+      "language": "fa",
+      "engine": "exemplar",
+      "license": "GPL-3.0-or-later (part of OpenSpeech AI)",
+      "homepage": "https://github.com/wrappedman/AI-voice-Translator",
+      "size_bytes": 695168,
+      "sha256": "7d4a38c909e41148cd60cdf93bebe25e7a28406fc2fbac81687aaa31c9710da8",
+      "url": "",
+      "status": "installed",
+      "min_free_gb": "0.1",
+      "notes": "Exemplar-matching acoustic model covering the phrases that ship with the application. 24-sentence test set: WER 0.34 (fa), 0.44 (en)."
+    },
+    {
+      "id": "builtin-mt",
+      "name": "Builtin Translation (fa<->en)",
+      "kind": "mt",
+      "language": "fa;en",
+      "engine": "phrasebook",
+      "license": "GPL-3.0-or-later (part of OpenSpeech AI)",
+      "homepage": "https://github.com/wrappedman/AI-voice-Translator",
+      "size_bytes": 888,
+      "sha256": "5cf8222f5d2619a5b936ffe22ff35062888fd548e655d8920436e4e465a0fc15",
+      "url": "",
+      "status": "installed",
+      "min_free_gb": "0.1",
+      "notes": "Bidirectional phrasebook with normalisation for Arabic/Persian character variants. Unknown words pass through unchanged."
+    }
+  ]
+}

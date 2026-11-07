@@ -519,6 +519,22 @@ bool osa_store_transcription_list(osa_db *db, osa_rs *rs, int limit, const char 
     return ok;
 }
 
+/* Deleting a transcript also removes the translations that point at it, so the
+ * history never shows an orphaned row. */
+bool osa_store_transcription_delete(osa_db *db, const char *id, osa_error *err) {
+    osa_arena a; osa_arena_init(&a);
+    osa_buf sql; osa_buf_init(&sql);
+    const char *idq = osa_sql_escape(&a, id);
+    osa_buf_printf(&sql,
+        "DELETE FROM Translations WHERE transcription_id='%s';"
+        "DELETE FROM UserCorrections WHERE transcription_id='%s';"
+        "DELETE FROM Transcriptions WHERE id='%s';", idq, idq, idq);
+    bool ok = osa_sql_exec(db, sql.data, err);
+    osa_buf_free(&sql);
+    osa_arena_free(&a);
+    return ok;
+}
+
 bool osa_store_translation_add(osa_db *db, const osa_translation *t, osa_error *err) {
     osa_arena a; osa_arena_init(&a);
     osa_buf sql; osa_buf_init(&sql);

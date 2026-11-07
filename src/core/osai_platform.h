@@ -27,6 +27,8 @@ bool osa_file_exists(const char *path);
 bool osa_dir_exists(const char *path);
 int64_t osa_file_size(const char *path);
 bool osa_mkdirs(const char *path);
+/* Reads a whole file into `out`, which the caller must have initialised with
+ * osa_buf_init(). Appends to whatever is already there. */
 bool osa_file_read(const char *path, osa_buf *out);
 bool osa_file_write(const char *path, const void *data, size_t n);
 bool osa_file_write_atomic(const char *path, const void *data, size_t n); /* tmp + rename */

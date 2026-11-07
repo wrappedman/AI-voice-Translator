@@ -160,7 +160,9 @@ $(WIN_BIN): $(WIN_OBJ)
 #  Tests, snapshots, distribution
 # ===========================================================================
 .PHONY: tests
-tests: $(LINUX_BIN)
+tests: unittest $(LINUX_BIN)
+	@echo ""
+	@echo "== headless self-test =="
 	$(LINUX_BIN) --selftest
 
 .PHONY: snapshots
@@ -182,3 +184,18 @@ clean:
 	rm -rf $(BUILD)
 
 -include $(shell find $(BUILD) -name "*.d" 2>/dev/null)
+
+# ===========================================================================
+#  Unit tests — tests/test_main.c against the portable objects
+# ===========================================================================
+TEST_BIN := $(BUILD)/tests
+TEST_OBJ := $(filter-out $(BUILD)/lin/src/main_linux.o,$(LINUX_OBJ))
+
+.PHONY: unittest
+unittest: $(TEST_BIN)
+	$(TEST_BIN)
+
+$(TEST_BIN): tests/test_main.c $(TEST_OBJ)
+	@mkdir -p $(dir $@)
+	$(CC) $(CFLAGS_COMMON) $(INCLUDES) -c tests/test_main.c -o $(BUILD)/test_main.o
+	$(CXX) -o $@ $(BUILD)/test_main.o $(TEST_OBJ) -lm -lpthread -ldl

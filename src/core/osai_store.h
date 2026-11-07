@@ -120,6 +120,8 @@ bool osa_store_download_list(osa_db *db, osa_rs *rs, osa_error *err);
 /* transcriptions + translations + corrections + history */
 bool osa_store_transcription_add(osa_db *db, const osa_transcription *t, osa_error *err);
 bool osa_store_transcription_list(osa_db *db, osa_rs *rs, int limit, const char *q, osa_error *err);
+/* Removes the row, its corrections and any translations linked to it. */
+bool osa_store_transcription_delete(osa_db *db, const char *id, osa_error *err);
 bool osa_store_audio_add(osa_db *db, const char *path, const char *name, int64_t bytes,
                          int64_t duration_ms, const char *fmt, const char *lang, osa_error *err);
 bool osa_store_translation_add(osa_db *db, const osa_translation *t, osa_error *err);

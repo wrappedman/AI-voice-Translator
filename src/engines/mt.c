@@ -433,7 +433,7 @@ bool mt_model_save(const mt_model *m, const char *path, osa_error *err) {
     osa_strlcpy(h.name, m->name, sizeof h.name);
     osa_strlcpy(h.license, m->license, sizeof h.license);
     osa_strlcpy(h.source, m->source, sizeof h.source);
-    osa_strlcpy(h.backend, m->backend, sizeof h.backend);
+    osa_strlcpy(h.backend, "osmt", sizeof h.backend);
     osa_strlcpy(h.src_tag, m->src_tag, sizeof h.src_tag);
     osa_strlcpy(h.dst_tag, m->dst_tag, sizeof h.dst_tag);
     bool ok = fwrite(&h, sizeof h, 1, f) == 1;
@@ -529,7 +529,7 @@ mt_model *mt_model_load(const char *path, osa_error *err) {
  *  Detection and translation
  * ===================================================================== */
 mt_lang mt_detect_lang(const char *text) {
-    if (!text) return MT_FA;
+    if (!text || !*text) return MT_AUTO;
     int fa = 0, en = 0;
     const char *p = text;
     while (*p) {
@@ -537,7 +537,10 @@ mt_lang mt_detect_lang(const char *text) {
         if (is_persian_cp(cp)) fa++;
         else if ((cp >= 'a' && cp <= 'z') || (cp >= 'A' && cp <= 'Z')) en++;
     }
-    if (fa == 0 && en == 0) return MT_FA;
+    /* No letters of either script (digits, punctuation, whitespace): the
+     * language is genuinely unknown — guessing Persian here is what made the
+     * empty-input path translate numbers into Persian. */
+    if (fa == 0 && en == 0) return MT_AUTO;
     return fa >= en ? MT_FA : MT_EN;
 }
 
@@ -718,6 +721,12 @@ bool mt_translate(const mt_model *m, const char *text, mt_lang src,
     clock_t t0 = clock();
     memset(out, 0, sizeof *out);
     if (src == MT_AUTO) src = mt_detect_lang(text);
+    if (src == MT_AUTO) {
+        /* nothing in the input identifies a language (empty, or only digits and
+         * punctuation): report it instead of inventing a translation */
+        osa_err_set(err, "no translatable text");
+        return false;
+    }
     out->src_lang = src;
     out->dst_lang = src == MT_FA ? MT_EN : MT_FA;
     osa_strlcpy(out->backend, m ? m->backend : "phrasebook", sizeof out->backend);
