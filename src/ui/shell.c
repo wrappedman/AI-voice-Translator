@@ -302,10 +302,11 @@ osa_rect shell_draw_chrome(shell_state *s, ui_context *u, osa_rect r, const char
     float lw = 84 * u->L.scale;
     osa_rect lr = rectf(u->L.rtl ? right : right - lw, r.y + 14 * u->L.scale, lw, chip_h);
     c_fill_round(u->c, lr, chip_h * 0.5f, u->t.panel_alt);
-    osa_rect fa_r = rectf(lr.x + 2, lr.y + 2, lw * 0.5f - 3, chip_h - 4);
-    osa_rect en_r = rectf(lr.x + lw * 0.5f + 1, lr.y + 2, lw * 0.5f - 3, chip_h - 4);
-    if (s->lang == UI_FA) c_fill_round(u->c, fa_r, chip_h * 0.5f - 2, u->t.accent);
-    else c_fill_round(u->c, en_r, chip_h * 0.5f - 2, u->t.accent);
+    float half = (lw - 4) * 0.5f;
+    osa_rect fa_r = rectf(lr.x + 2, lr.y + 2, half, chip_h - 4);
+    osa_rect en_r = rectf(lr.x + 2 + half, lr.y + 2, half, chip_h - 4);
+    if (s->lang == UI_FA) c_fill_round(u->c, fa_r, (chip_h - 4) * 0.5f, u->t.accent);
+    else c_fill_round(u->c, en_r, (chip_h - 4) * 0.5f, u->t.accent);
     ui_label(u, fa_r, "FA", 11 * u->L.scale,
              s->lang == UI_FA ? rgba(255,255,255,255) : u->t.text_dim, 1);
     ui_label(u, en_r, "EN", 11 * u->L.scale,
@@ -329,12 +330,14 @@ osa_rect shell_draw_chrome(shell_state *s, ui_context *u, osa_rect r, const char
             c_circle(u->c, ccx + 3 * u->L.scale, ccy - 3 * u->L.scale,
                      5 * u->L.scale, u->t.panel_alt);
         } else {
-            c_circle(u->c, ccx, ccy, 4.5f * u->L.scale, u->t.warning);
+            c_circle(u->c, ccx, ccy, 5.0f * u->L.scale, u->t.warning);
             for (int k = 0; k < 8; k++) {
                 float a = (float)k * 0.7853982f;
-                float r0 = 7 * u->L.scale, r1 = 9.5f * u->L.scale;
-                c_circle(u->c, ccx + cosf(a) * (r0 + r1) * 0.5f,
-                         ccy + sinf(a) * (r0 + r1) * 0.5f, 1.2f * u->L.scale, u->t.warning);
+                for (int seg = 0; seg < 3; seg++) {
+                    float rr = (8.0f + (float)seg * 1.1f) * u->L.scale;
+                    c_circle(u->c, ccx + cosf(a) * rr, ccy + sinf(a) * rr,
+                             1.1f * u->L.scale, u->t.warning);
+                }
             }
         }
     }
@@ -383,8 +386,10 @@ static void draw_transcribe(shell_state *s, ui_context *u, osa_rect body) {
     osa_rect fi = rect_inset(file_card, 14 * u->L.scale);
 
     /* icon tile */
+    float bw0 = 132 * u->L.scale;                        /* action button width */
     float tile = 56 * u->L.scale;
-    osa_rect icon_r = rectf(u->L.rtl ? fi.x + fi.w - tile : fi.x, fi.y + (fi.h - tile) * 0.5f,
+    float icon_y = fi.y + (fi.h - 44 * u->L.scale - tile) * 0.5f;
+    osa_rect icon_r = rectf(u->L.rtl ? fi.x + bw0 + 18 * u->L.scale : fi.x, icon_y,
                             tile, tile);
     bool have = s->audio_path[0] != 0;
     c_fill_round(u->c, icon_r, tile * 0.28f,
@@ -395,9 +400,10 @@ static void draw_transcribe(shell_state *s, ui_context *u, osa_rect body) {
     c_circle(u->c, icon_r.x + tile * 0.5f, icon_r.y + tile * 0.5f, tile * 0.09f,
              have ? u->t.accent : u->t.text_faint);
 
-    float text_x = u->L.rtl ? fi.x : fi.x + tile + 14 * u->L.scale;
-    float text_w = fi.w - tile - 14 * u->L.scale - (u->L.rtl ? 0 : 0);
-    osa_rect name_r = rectf(text_x, fi.y + 8 * u->L.scale, text_w * 0.72f, 22 * u->L.scale);
+    /* text block: between the icon tile and the button column */
+    float text_x = u->L.rtl ? fi.x + bw0 + 18 * u->L.scale : fi.x + tile + 14 * u->L.scale;
+    float text_w = fi.w - tile - bw0 - 32 * u->L.scale;
+    osa_rect name_r = rectf(text_x, fi.y + 8 * u->L.scale, text_w, 22 * u->L.scale);
     if (have) {
         const char *base = strrchr(s->audio_path, '/');
         if (!base) base = strrchr(s->audio_path, '\\');
@@ -410,18 +416,18 @@ static void draw_transcribe(shell_state *s, ui_context *u, osa_rect body) {
         text_localize_digits(dur, s->lang == UI_FA ? "fa" : "en", dur_loc, sizeof dur_loc);
         snprintf(meta, sizeof meta, "%s  ·  %s", dur_loc,
                  s->detected_lang[0] ? (osa_starts(s->detected_lang, "fa") ? "فارسی" : "English") : "—");
-        ui_label(u, rectf(name_r.x, fi.y + 30 * u->L.scale, text_w * 0.72f, 18 * u->L.scale),
+        ui_label(u, rectf(name_r.x, fi.y + 30 * u->L.scale, text_w, 18 * u->L.scale),
                  meta, 11 * u->L.scale, u->t.text_dim, u->L.rtl ? 2 : 0);
     } else {
         ui_label(u, name_r, tt(s->lang, "transcribe.none"), 14 * u->L.scale, u->t.text_dim,
                  u->L.rtl ? 2 : 0);
-        ui_label(u, rectf(name_r.x, fi.y + 30 * u->L.scale, text_w * 0.72f, 18 * u->L.scale),
+        ui_label(u, rectf(name_r.x, fi.y + 30 * u->L.scale, text_w, 18 * u->L.scale),
                  tt(s->lang, "transcribe.sub"), 11 * u->L.scale, u->t.text_faint,
                  u->L.rtl ? 2 : 0);
     }
 
     /* actions, right aligned (left in RTL) */
-    float bw = 132 * u->L.scale, bh = 34 * u->L.scale;
+    float bw = bw0, bh = 34 * u->L.scale;
     float bx = u->L.rtl ? fi.x : fi.x + fi.w - bw;
     float by = fi.y + 6 * u->L.scale;
     if (ui_button(u, 2001, rectf(bx, by, bw, bh), tt(s->lang, "btn.choose"), false)) {
@@ -479,10 +485,10 @@ static void draw_transcribe(shell_state *s, ui_context *u, osa_rect body) {
         c_hline(u->c, cols[i]->x + 14 * u->L.scale, cols[i]->x + cols[i]->w - 14 * u->L.scale,
                 cols[i]->y + 40 * u->L.scale, 1, u->t.border_soft);
         osa_rect tr = rectf(cols[i]->x + 14 * u->L.scale, cols[i]->y + 50 * u->L.scale,
-                            cols[i]->w - 28 * u->L.scale, cols[i]->h - 66 * u->L.scale);
+                            cols[i]->w - 28 * u->L.scale, cols[i]->h - 84 * u->L.scale);
         if (texts[i][0]) {
             /* source is Persian or English depending on detection; the shell draws
-             * it in the language's own direction */
+         * it in the language's own direction */
             text_opts o = text_default_opts(15 * u->L.scale);
             o.max_width = tr.w;
             o.line_height = 15 * u->L.scale * 1.7f;
@@ -494,7 +500,7 @@ static void draw_transcribe(shell_state *s, ui_context *u, osa_rect body) {
             ui_label(u, rectf(tr.x, tr.y + tr.h * 0.4f, tr.w, 20 * u->L.scale),
                      tt(s->lang, "transcribe.empty"), 12 * u->L.scale, u->t.text_faint, 1);
         }
-        /* footer metric */
+        /* footer metric: a dedicated strip, so the numbers are readable */
         if (i == 0 && s->transcript[0]) {
             char pct[32], ms[32], conf_loc[48], proc_loc[48];
             char foot[200];
@@ -503,10 +509,13 @@ static void draw_transcribe(shell_state *s, ui_context *u, osa_rect body) {
             text_localize_digits(pct, s->lang == UI_FA ? "fa" : "en", conf_loc, sizeof conf_loc);
             text_localize_digits(ms, s->lang == UI_FA ? "fa" : "en", proc_loc, sizeof proc_loc);
             snprintf(foot, sizeof foot, "%s  ·  %s", conf_loc, proc_loc);
-            ui_label(u, rectf(cols[i]->x + 14 * u->L.scale,
-                              cols[i]->y + cols[i]->h - 18 * u->L.scale,
-                              cols[i]->w - 28 * u->L.scale, 14 * u->L.scale),
-                     foot, 10 * u->L.scale, u->t.text_faint, u->L.rtl ? 2 : 0);
+            float fy = cols[i]->y + cols[i]->h - 26 * u->L.scale;
+            c_fill_round(u->c, rectf(cols[i]->x + 10 * u->L.scale, fy,
+                                     cols[i]->w - 20 * u->L.scale, 20 * u->L.scale),
+                         6 * u->L.scale, col_alpha(u->t.success, 0.10f));
+            ui_label(u, rectf(cols[i]->x + 18 * u->L.scale, fy,
+                              cols[i]->w - 36 * u->L.scale, 20 * u->L.scale),
+                     foot, 10.5f * u->L.scale, u->t.success, u->L.rtl ? 2 : 0);
         }
     }
 }
@@ -531,9 +540,9 @@ void shell_draw(shell_state *s, osa_canvas *c, ui_context *u, const ui_input *in
     /* sidebar + content split, mirrored for RTL */
     float sb_w = 226 * u->L.scale;
     osa_rect full = rectf(0, 0, (float)c->w, (float)c->h);
-    /* In Persian the navigation sits on the right, which is where an RTL
-     * interface expects the primary rail; content takes the remaining space. */
-    osa_rect sidebar = ui_split_leading(&full, sb_w, !u->L.rtl);
+    /* The rail sits on the reading-start edge: right in Persian, left in
+     * English. ui_split_leading does the mirroring, so pass the direction. */
+    osa_rect sidebar = ui_split_leading(&full, sb_w, u->L.rtl);
     draw_sidebar(s, u, sidebar);
 
     osa_rect content = full;
