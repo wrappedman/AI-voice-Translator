@@ -188,8 +188,9 @@ static void draw_live(shell_state *s, ui_context *u, osa_rect body) {
     float pad = 20 * u->L.scale;
     osa_rect inner = rect_inset(body, pad);
 
-    /* hero: big record button + level ring */
-    float hero_h = 210 * u->L.scale;
+    /* hero: big record button + level ring. The ring's outer dot reaches
+     * R*1.28+4.2 below the centre, so the caption needs its own band. */
+    float hero_h = 248 * u->L.scale;
     osa_rect hero = rectf(inner.x, inner.y, inner.w, hero_h);
     ui_card(u, hero);
     float cx = hero.x + hero.w * 0.5f;
@@ -459,8 +460,15 @@ static void draw_history(shell_state *s, ui_context *u, osa_rect body) {
         ui_label(u, tr, hr.text[i], 12.5f * u->L.scale, u->t.text, u->L.rtl ? 2 : 0);
         char meta[128], loc[160];
         char durs[32];
+        char when[32];
         ui_fmt_duration(hr.dur[i] / 1000.0, durs, sizeof durs);
-        snprintf(meta, sizeof meta, "%s · %s · %.0f%%", hr.when[i], durs, hr.conf[i] * 100.0);
+        /* "2026-11-07 13:29:43" is too wide for a list row; keep the day and
+         * the time, drop the redundant parts of the date */
+        const char *w = hr.when[i];
+        if (strlen(w) >= 16) snprintf(when, sizeof when, "%s %s", w + 5, w + 11);
+        else osa_strlcpy(when, w, sizeof when);
+        when[10] = 0;                       /* "11-07 13:29" is enough */
+        snprintf(meta, sizeof meta, "%s · %s · %.0f%%", when, durs, hr.conf[i] * 100.0);
         text_localize_digits(meta, s->lang == UI_FA ? "fa" : "en", loc, sizeof loc);
         ui_label(u, rectf(row.x + 12 * u->L.scale, row.y + 31 * u->L.scale,
                           row.w - 24 * u->L.scale, 18 * u->L.scale),
@@ -478,21 +486,22 @@ static void draw_history(shell_state *s, ui_context *u, osa_rect body) {
         ui_card(u, det);
         int i = s->history_sel < 0 ? 0 : s->history_sel;
         if (i < hr.n) {
-            ui_label(u, rectf(det.x + 16 * u->L.scale, det.y + 14 * u->L.scale,
+            ui_label(u, rectf(det.x + 16 * u->L.scale, det.y + 12 * u->L.scale,
                               det.w - 32 * u->L.scale, 20 * u->L.scale),
                      tt(s->lang, "transcribe.source"), 11 * u->L.scale, u->t.text_dim,
                      u->L.rtl ? 2 : 0);
+            float pane_h = det.h - 170 * u->L.scale;
+            if (pane_h < 120 * u->L.scale) pane_h = 120 * u->L.scale;
             text_opts o = text_default_opts(14 * u->L.scale);
             o.max_width = det.w - 32 * u->L.scale;
             o.line_height = 14 * u->L.scale * 1.8f;
             o.rtl = osa_starts(hr.lang[i], "fa");
-            float pane_h = det.h - 150 * u->L.scale;
-            if (pane_h < 80 * u->L.scale) pane_h = 80 * u->L.scale;
             text_draw_box(u->c, u->reg, 14 * u->L.scale, u->t.text,
-                          rectf(det.x + 16 * u->L.scale, det.y + 40 * u->L.scale,
-                                det.w - 32 * u->L.scale, pane_h * 0.5f - 8), hr.text[i], o);
+                          rectf(det.x + 16 * u->L.scale, det.y + 38 * u->L.scale,
+                                det.w - 32 * u->L.scale, pane_h * 0.5f - 46 * u->L.scale),
+                          hr.text[i], o);
 
-            float second = det.y + 46 * u->L.scale + pane_h * 0.5f;
+            float second = det.y + 54 * u->L.scale + pane_h * 0.5f;
             c_hline(u->c, det.x + 16 * u->L.scale, det.x + det.w - 16 * u->L.scale,
                     second - 10 * u->L.scale, 1, u->t.border_soft);
             ui_label(u, rectf(det.x + 16 * u->L.scale, second,
@@ -506,7 +515,7 @@ static void draw_history(shell_state *s, ui_context *u, osa_rect body) {
             o2.rtl = osa_starts(hr.lang[i], "en");
             text_draw_box(u->c, u->reg, 14 * u->L.scale, u->t.accent,
                           rectf(det.x + 16 * u->L.scale, second + 26 * u->L.scale,
-                                det.w - 32 * u->L.scale, pane_h * 0.5f - 34), tr, o2);
+                                det.w - 32 * u->L.scale, pane_h * 0.5f - 60), tr, o2);
 
             float by = det.y + det.h - 48 * u->L.scale;
             if (ui_button(u, 4000, rectf(det.x + 16 * u->L.scale, by, 100 * u->L.scale,
@@ -594,33 +603,30 @@ static void draw_models(shell_state *s, ui_context *u, osa_rect body) {
         c_fill_round(u->c, br, badge * 0.28f, col_alpha(tint, 0.15f));
         c_circle(u->c, br.x + badge * 0.5f, br.y + badge * 0.5f, badge * 0.19f, tint);
 
-        float tx = u->L.rtl ? r.x + 18 * u->L.scale : br.x + badge + 14 * u->L.scale;
         float tw = r.w - badge - 224 * u->L.scale;
+        float tx = u->L.rtl ? br.x - 14 * u->L.scale - tw : br.x + badge + 14 * u->L.scale;
         ui_label(u, rectf(tx, r.y + 16 * u->L.scale, tw, 22 * u->L.scale),
                  m->name, 14 * u->L.scale, u->t.text, u->L.rtl ? 2 : 0);
 
-        char sub[220];
-        snprintf(sub, sizeof sub, "%s · %s · %s", m->kind[0] ? m->kind : "model",
-                 m->engine[0] ? m->engine : "builtin", m->id);
-        ui_label(u, rectf(tx, r.y + 40 * u->L.scale, tw, 18 * u->L.scale),
-                 sub, 10.5f * u->L.scale, u->t.text_dim, u->L.rtl ? 2 : 0);
-
         char sz[40];
         ui_fmt_bytes(m->bytes, sz, sizeof sz);
-        float sx = u->L.rtl ? r.x + 18 * u->L.scale : r.x + r.w - 138 * u->L.scale;
-        ui_label(u, rectf(sx, r.y + card_h - 30 * u->L.scale, 120 * u->L.scale,
-                          18 * u->L.scale),
-                 sz, 10.5f * u->L.scale, u->t.text_faint, u->L.rtl ? 2 : 0);
+        char sub[220];
+        snprintf(sub, sizeof sub, "%s · %s · %s · %s", m->kind[0] ? m->kind : "model",
+                 m->engine[0] ? m->engine : "builtin", m->id, sz);
+        ui_label(u, rectf(tx, r.y + 40 * u->L.scale, tw, 18 * u->L.scale),
+                 sub, 10.5f * u->L.scale, u->t.text_dim, u->L.rtl ? 2 : 0);
 
         if (m->active) {
             osa_rect chip = rectf(u->L.rtl ? r.x + 18 * u->L.scale
                                            : r.x + r.w - 128 * u->L.scale,
-                                  r.y + 16 * u->L.scale, 110 * u->L.scale, 26 * u->L.scale);
+                                  r.y + (card_h - 26 * u->L.scale) * 0.5f,
+                                  110 * u->L.scale, 26 * u->L.scale);
             ui_status_chip(u, chip, tt(s->lang, "models.active"), u->t.success);
         } else {
             osa_rect btn = rectf(u->L.rtl ? r.x + 18 * u->L.scale
                                           : r.x + r.w - 128 * u->L.scale,
-                                 r.y + 14 * u->L.scale, 110 * u->L.scale, 30 * u->L.scale);
+                                 r.y + (card_h - 30 * u->L.scale) * 0.5f,
+                                 110 * u->L.scale, 30 * u->L.scale);
             if (ui_button(u, 5100 + i, btn, tt(s->lang, "btn.activate"), false)) {
                 osa_error err;
                 if (osa_app_activate_model(s->app, m->id, &err)) {
@@ -755,13 +761,26 @@ static void draw_evaluation(shell_state *s, ui_context *u, osa_rect body) {
         return;
     }
 
-    /* averages from the first language block */
+    /* Aggregates live *after* the items array; scanning forward from
+     * "languages" would find a per-sentence value first. Take the last
+     * occurrence of each key in the language block instead. */
     double wer = 0, cer = 0;
-    const char *langs = strstr(s->eval_json, "\"languages\"");
-    if (langs) {
-        const char *e = s->eval_json + strlen(s->eval_json);
-        json_num(langs, e, "\"wer\"", &wer);
-        json_num(langs, e, "\"cer\"", &cer);
+    const char *eval_end = s->eval_json + strlen(s->eval_json);
+    const char *p = s->eval_json;
+    for (;;) {
+        const char *hit = strstr(p, "\"wer\"");
+        if (!hit) break;
+        double v = 0;
+        if (json_num(hit, eval_end, "\"wer\"", &v)) wer = v;
+        p = hit + 5;
+    }
+    p = s->eval_json;
+    for (;;) {
+        const char *hit = strstr(p, "\"cer\"");
+        if (!hit) break;
+        double v = 0;
+        if (json_num(hit, eval_end, "\"cer\"", &v)) cer = v;
+        p = hit + 5;
     }
     float cw = (inner.w - 28 * u->L.scale) / 3.0f;
     char v[48], loc[64];
@@ -785,12 +804,12 @@ static void draw_evaluation(shell_state *s, ui_context *u, osa_rect body) {
              tt(s->lang, "eval.samples"), 11 * u->L.scale, u->t.text_dim, u->L.rtl ? 2 : 0);
     float ly = table.y + 40 * u->L.scale;
     int shown = 0;
-    const char *p = s->eval_json;
+    const char *sp = s->eval_json;
     const char *end = s->eval_json + strlen(s->eval_json);
-    while (shown < 10 && p && (p = strstr(p, "\"ref\"")) != NULL) {
+    while (shown < 10 && sp && (sp = strstr(sp, "\"ref\"")) != NULL) {
         char ref[300], hyp[300];
-        if (!json_str(p, end, "\"ref\"", ref, sizeof ref)) break;
-        const char *hp = strstr(p, "\"hyp\"");
+        if (!json_str(sp, end, "\"ref\"", ref, sizeof ref)) break;
+        const char *hp = strstr(sp, "\"hyp\"");
         if (!hp) break;
         if (!json_str(hp, end, "\"hyp\"", hyp, sizeof hyp)) break;
         if (ly + 26 * u->L.scale > table.y + table.h - 8) break;
@@ -805,7 +824,7 @@ static void draw_evaluation(shell_state *s, ui_context *u, osa_rect body) {
                  u->L.rtl ? 2 : 0);
         ly += 24 * u->L.scale;
         shown++;
-        p = hp + 5;
+        sp = hp + 5;
     }
 }
 
@@ -901,6 +920,7 @@ static void draw_settings(shell_state *s, ui_context *u, osa_rect body) {
         o.max_width = side.w - 40 * u->L.scale;
         o.line_height = 12 * u->L.scale * 1.9f;
         o.rtl = u->L.rtl;
+        o.align = u->L.rtl ? 2 : 0;
         text_draw_box(u->c, u->reg, 12 * u->L.scale, u->t.text_dim,
                       rectf(side.x + 20 * u->L.scale, side.y + 48 * u->L.scale,
                             side.w - 40 * u->L.scale, side.h - 70 * u->L.scale),
@@ -936,11 +956,20 @@ static void draw_about(shell_state *s, ui_context *u, osa_rect body) {
     const char *notes[3] = { "about.note", "about.offline", "about.models" };
     for (int i = 0; i < 3; i++) {
         if (fy + 24 * u->L.scale > card.y + card.h) break;
-        c_circle(u->c, u->L.rtl ? cx + 110 * u->L.scale : cx - 110 * u->L.scale,
-                 fy + 9 * u->L.scale, 3 * u->L.scale, u->t.success);
-        ui_label(u, rectf(card.x + 20 * u->L.scale, fy, card.w - 40 * u->L.scale,
-                          20 * u->L.scale),
-                 tt(s->lang, notes[i]), 11 * u->L.scale, u->t.text_dim, 1);
+        /* The note lines are centred, so a bullet at a fixed offset from the
+         * card centre lands inside the sentence. Measure the line first and
+         * put the dot just outside its leading edge. */
+        const char *line = tt(s->lang, notes[i]);
+        float fs = 11 * u->L.scale;
+        float tw = text_measure(u->reg, fs, line);
+        float avail = card.w - 44 * u->L.scale;
+        if (tw > avail) tw = avail;
+        float lx0 = u->L.rtl ? cx + tw * 0.5f : cx - tw * 0.5f;
+        float dx = u->L.rtl ? lx0 + 10 * u->L.scale : lx0 - 10 * u->L.scale;
+        c_circle(u->c, dx, fy + 9 * u->L.scale, 3 * u->L.scale, u->t.success);
+        float lx = u->L.rtl ? cx + tw * 0.5f - avail : cx - tw * 0.5f;
+        ui_label(u, rectf(lx, fy, avail, 20 * u->L.scale), line, fs,
+                 u->t.text_dim, u->L.rtl ? 2 : 0);
         fy += 24 * u->L.scale;
     }
 }

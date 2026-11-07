@@ -275,16 +275,24 @@ bool ui_nav_item(ui_context *u, int id, osa_rect r, const char *icon,
 }
 
 void ui_status_chip(ui_context *u, osa_rect r, const char *label, osa_color dot) {
+    /* A chip hugs its label: callers pass the maximum width they can spare,
+     * not the width the pill should pretend to have. */
+    float fs = 11.0f * u->L.scale;
+    float pad = 11 * u->L.scale;
+    float inset = pad + 9 * u->L.scale;
+    float need = text_measure(u->reg, fs, label) + inset + 10 * u->L.scale;
+    if (need < r.h + 8 * u->L.scale) need = r.h + 8 * u->L.scale;
+    if (need < r.w) {                       /* shrink from the trailing edge */
+        if (u->L.rtl) r.x += r.w - need; else r.w = need;
+        if (u->L.rtl) r.w = need;
+    }
     c_fill_round(u->c, r, r.h * 0.5f, u->t.panel_alt);
     float cy = r.y + r.h * 0.5f;
-    float pad = 11 * u->L.scale;
     float dx = u->L.rtl ? r.x + r.w - pad : r.x + pad;
     c_circle(u->c, dx, cy, 3.5f * u->L.scale, dot);
-    /* leave room for the dot on whichever side it sits */
-    float inset = pad + 9 * u->L.scale;
     osa_rect lr = rectf(u->L.rtl ? r.x + 6 * u->L.scale : r.x + inset, r.y,
                         r.w - inset - 6 * u->L.scale, r.h);
-    ui_label(u, lr, label, 11.0f * u->L.scale, u->t.text_dim, u->L.rtl ? 2 : 0);
+    ui_label(u, lr, label, fs, u->t.text_dim, u->L.rtl ? 2 : 0);
 }
 
 void ui_scrollbar(ui_context *u, osa_rect track, int value, int total, int page) {
