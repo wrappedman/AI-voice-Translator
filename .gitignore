@@ -1,5 +1,6 @@
 # build output
 build/
+build_asan/
 *.o
 *.a
 *.obj
@@ -23,6 +24,12 @@ ziglang/
 #   dist/bin/OpenSpeechAI.exe          the built Windows binary
 #   dist/OpenSpeechAI-*-win64.zip      the same binary, packaged
 #   dist/checksums-*.txt               hashes for both
+#
+# Everything else `make dist` lays out next to the exe is regenerated from the
+# repository (fonts, catalogue, docs), so it is not committed twice.
+dist/bin/assets/
+dist/bin/docs/
+dist/bin/README.md
 # Everything else under dist/ is generated (screenshots are committed: they are
 # the visual regression baseline).
 

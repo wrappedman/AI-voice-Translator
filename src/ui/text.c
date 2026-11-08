@@ -111,17 +111,33 @@ static const char *weight_file(osa_font_weight w) {
     }
 }
 
-/* try a sequence of candidate directories for a bundled asset */
+/* Try every place a bundled asset may live, in the order a shipped build and
+ * a developer checkout expect:
+ *
+ *   1. <dir of the exe>/assets/fonts      the layout `make dist` produces —
+ *                                          this is the one the release uses
+ *   2. <dir of the exe>/assets            the older flat layout
+ *   3. <dir of the exe>/fonts
+ *   4. <dir of the exe>                   a hand-copied exe in a folder of fonts
+ *   5. src/ui/assets                      running from the repository
+ *   6. assets                             running from the build directory
+ *
+ * A missing font used to mean a silent fallback to nothing and an empty
+ * window; the distribution now ships the font tree, and this list is wide
+ * enough that moving the exe around does not break it. */
 static bool find_asset(const char *name, char *out, size_t cap) {
-    const char *bases[5];
-    char b1[OSAI_MAX_PATH], b2[OSAI_MAX_PATH], b3[OSAI_MAX_PATH];
-    snprintf(b1, sizeof b1, "%s/assets", osa_exe_dir());
-    snprintf(b2, sizeof b2, "%s", osa_exe_dir());
-    snprintf(b3, sizeof b3, "src/ui/assets");
-    bases[0] = b1; bases[1] = b2; bases[2] = b3;
-    bases[3] = "assets"; bases[4] = "../src/ui/assets";
-    for (int i = 0; i < 5; i++) {
-        osa_path_join(out, cap, bases[i], name);
+    char cand[8][OSAI_MAX_PATH];
+    int n = 0;
+    snprintf(cand[n++], OSAI_MAX_PATH, "%s/assets/fonts", osa_exe_dir());
+    snprintf(cand[n++], OSAI_MAX_PATH, "%s/assets", osa_exe_dir());
+    snprintf(cand[n++], OSAI_MAX_PATH, "%s/fonts", osa_exe_dir());
+    snprintf(cand[n++], OSAI_MAX_PATH, "%s", osa_exe_dir());
+    snprintf(cand[n++], OSAI_MAX_PATH, "src/ui/assets");
+    snprintf(cand[n++], OSAI_MAX_PATH, "assets/fonts");
+    snprintf(cand[n++], OSAI_MAX_PATH, "assets");
+    snprintf(cand[n++], OSAI_MAX_PATH, "../src/ui/assets");
+    for (int i = 0; i < n; i++) {
+        osa_path_join(out, cap, cand[i], name);
         if (osa_file_exists(out)) return true;
     }
     return false;
@@ -179,8 +195,16 @@ bool text_is_rtl(const char *utf8) {
     return false;
 }
 
+/* NOTE: not safe to call in place. Persian digits are two bytes, Latin ones one,
+ * so reading and writing the same buffer overwrites input that has not been read
+ * yet — the result is garbage that looks like digits. Use a separate buffer. */
 void text_localize_digits(const char *utf8, const char *lang, char *out, size_t cap) {
     if (!utf8) { if (cap) out[0] = 0; return; }
+    if (utf8 == out) {
+        char tmp[512];
+        osa_strlcpy(tmp, utf8, sizeof tmp);
+        utf8 = tmp;
+    }
     bool fa = lang && (osa_starts(lang, "fa") || osa_starts(lang, "ar"));
     size_t o = 0;
     for (const char *p = utf8; *p && o + 3 < cap; p++) {
@@ -198,18 +222,54 @@ void text_localize_digits(const char *utf8, const char *lang, char *out, size_t 
 }
 
 /* shape a whole string into glyphs with positions */
-typedef struct shaped_glyph { uint32_t glyph; float x_adv; float x_off, y_off; } shaped_glyph;
+typedef struct shaped_glyph {
+    uint32_t glyph;
+    float x_adv;
+    float x_off, y_off;
+    bool  skip;          /* zero-width control character: draw nothing */
+} shaped_glyph;
+
+/* Zero-width formatting characters. They must stay in the shaping buffer (they
+ * decide the Arabic joining forms: "می‌شود" is not "می شود"), but the font gives
+ * them a real advance width, which is what made every ZWNJ in the Persian UI
+ * show up as a visible gap between two halves of one word. */
+static bool rune_is_invisible(osa_rune r) {
+    return r == 0x200B ||   /* ZERO WIDTH SPACE          */
+           r == 0x200C ||   /* ZERO WIDTH NON-JOINER     */
+           r == 0x200D ||   /* ZERO WIDTH JOINER         */
+           r == 0x200E ||   /* LRM                       */
+           r == 0x200F ||   /* RLM                       */
+           r == 0x2060 ||   /* WORD JOINER               */
+           r == 0xFEFF ||   /* ZWNBSP                    */
+           r == 0x00AD ||   /* SOFT HYPHEN               */
+           r == 0x202A || r == 0x202B || r == 0x202C || r == 0x202D || r == 0x202E ||
+           r == 0x2066 || r == 0x2067 || r == 0x2068 || r == 0x2069;
+}
+
+/* Is the source character at `off` (a HarfBuzz cluster value) invisible? */
+static bool cluster_invisible(const char *utf8, size_t len, unsigned off) {
+    if (off >= len) return false;
+    osa_rune r = 0;
+    if (osa_utf8_decode(utf8 + off, len - off, &r) <= 0) return false;
+    return rune_is_invisible(r);
+}
 
 static int shape_run(osa_font *f, float size, const char *utf8, size_t len,
                      shaped_glyph *out, int maxout, bool rtl) {
     if (!f || !f->hb_font || !g_ft) return 0;
+    /* The shaping scale has to follow the requested pixel size. hb_ft_font
+     * copies the FreeType face size when it is created, so without this the
+     * advances stay at whatever size the face had at load time: every string
+     * measures the same width regardless of `size`, glyphs overlap at large
+     * sizes, and wrapping/centring/ellipsis all compute from a wrong number. */
     FT_Set_Char_Size(f->ft_face, 0, (FT_F26Dot6)(size * 64.0f), 72, 72);
+    hb_font_set_scale(f->hb_font, (int)(size * 64.0f), (int)(size * 64.0f));
     hb_buffer_t *buf = hb_buffer_create();
     hb_buffer_add_utf8(buf, utf8, (int)len, 0, (int)len);
     hb_buffer_set_direction(buf, rtl ? HB_DIRECTION_RTL : HB_DIRECTION_LTR);
-    
     hb_buffer_guess_segment_properties(buf);
     hb_buffer_set_direction(buf, rtl ? HB_DIRECTION_RTL : HB_DIRECTION_LTR);
+    hb_buffer_set_language(buf, hb_language_from_string(rtl ? "fa" : "en", -1));
     hb_shape(f->hb_font, buf, NULL, 0);
     unsigned n = 0;
     hb_glyph_info_t *info = hb_buffer_get_glyph_infos(buf, &n);
@@ -220,6 +280,14 @@ static int shape_run(osa_font *f, float size, const char *utf8, size_t len,
         out[k].x_adv = (float)pos[i].x_advance / 64.0f;
         out[k].x_off = (float)pos[i].x_offset / 64.0f;
         out[k].y_off = -(float)pos[i].y_offset / 64.0f;
+        out[k].skip = false;
+        if (cluster_invisible(utf8, len, info[i].cluster)) {
+            /* keep the glyph out of the pen advance and off the canvas */
+            out[k].skip = true;
+            out[k].x_adv = 0.0f;
+            out[k].x_off = 0.0f;
+            out[k].y_off = 0.0f;
+        }
         k++;
     }
     hb_buffer_destroy(buf);
@@ -271,6 +339,7 @@ static float draw_run(osa_canvas *c, osa_font *f, float size, osa_color col,
     int px = (int)(size + 0.5f);
     if (px < 6) px = 6;
     for (int i = 0; i < n; i++) {
+        if (gl[i].skip) continue;
         gcache_ent *e = gcache_get(f, gl[i].glyph, px);
         if (e && e->bm && c) {
             int gx = (int)floorf(pen + gl[i].x_off) + e->bx;

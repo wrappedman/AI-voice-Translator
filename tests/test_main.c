@@ -483,6 +483,50 @@ static void test_asr(void) {
         free(sil);
     }
 
+    /* Templates longer than 64 frames must be decodable.
+     *
+     * They used to be skipped by the candidate sweep (it only read the
+     * transposed cache, which holds 64 rows), so any word of more than about
+     * 0.6 s could never win a span: "recording" came back as "weather this".
+     * Assert on the long words specifically, in English, where the longest
+     * lexicon entries live. */
+    {
+        osa_error e2 = {0};
+        asr_model *en = asr_model_fixture("en", &e2);
+        CHECK(en != NULL);
+        if (en) {
+            static const char *long_words[] = { "recording", "recognition", "translation" };
+            for (size_t i = 0; i < sizeof long_words / sizeof long_words[0]; i++) {
+                int64_t n2 = 0;
+                float *p2 = tts_speak(long_words[i], "en", &n2);
+                if (!p2) { CHECK_MSG(false, "tts for %s", long_words[i]); continue; }
+                asr_result rr;
+                if (asr_transcribe_samples(en, p2, n2, "en", &rr, NULL)) {
+                    CHECK_MSG(osa_streq(rr.text, long_words[i]),
+                              "long template '%s' decoded as '%s'", long_words[i], rr.text);
+                    free(rr.segments);
+                } else {
+                    CHECK_MSG(false, "long template '%s' failed to decode", long_words[i]);
+                }
+                free(p2);
+            }
+
+            /* A model with one language's lexicon must refuse another language
+             * instead of answering with confident nonsense. */
+            int64_t n3 = 0;
+            float *p3 = tts_speak("hello world", "en", &n3);
+            if (p3) {
+                asr_result rr;
+                osa_error er = {0};
+                bool ok = asr_transcribe_samples(m, p3, n3, "en", &rr, &er);
+                CHECK_MSG(!ok && er.msg[0], "foreign language is refused: %s", er.msg);
+                if (ok) free(rr.segments);
+                free(p3);
+            }
+            asr_model_free(en);
+        }
+    }
+
     /* edit distance helpers */
     CHECK_NEAR(asr_wer("a b c", "a b c", "en"), 0.0, 1e-9);
     CHECK_NEAR(asr_wer("a b c", "a x c", "en"), 1.0 / 3.0, 1e-9);
@@ -621,6 +665,28 @@ static void test_app(void) {
         free(hist);
     }
 
+    /* training produces a new version, activates it, and keeps the old one */
+    {
+        osa_train_result tr2;
+        osa_error te = {0};
+        if (osa_app_train(app, NULL, 1, &tr2, &te)) {
+            CHECK_MSG(tr2.model_id[0] != 0, "trained version: %s", tr2.model_id);
+            CHECK_MSG(tr2.n_added > 0, "%d exemplars added", tr2.n_added);
+            CHECK_MSG(tr2.activated, "the trained version is active");
+            osa_app_status st2;
+            osa_app_get_status(app, &st2);
+            char *mj = osa_app_models_json(app, NULL);
+            CHECK(mj && strstr(mj, "builtin-asr-fa"));
+            CHECK(mj && strstr(mj, tr2.model_id));
+            free(mj);
+            /* roll back to the builtin so later assertions see a known model */
+            CHECK(osa_app_activate_model(app, "builtin-asr-fa", NULL));
+            osa_file_remove(tr2.model_path);
+        } else {
+            CHECK_MSG(false, "training failed: %s", te.msg);
+        }
+    }
+
     /* importing a bogus file fails cleanly instead of crashing */
     const char *bogus = "/tmp/osai_test_bogus.osam";
     FILE *f = fopen(bogus, "wb");
@@ -629,6 +695,31 @@ static void test_app(void) {
     CHECK(!osa_app_import_model(app, bogus, id, sizeof id, &err));
     CHECK_MSG(err.msg[0] != 0, "error message: %s", err.msg);
     osa_file_remove(bogus);
+
+    /* a real container must import: the picker hands us a .osam path, and an
+     * extension comparison that included the dot used to reject every one. */
+    {
+        osa_error ie = {0};
+        asr_model *tmpm = asr_model_fixture("fa", &ie);
+        CHECK(tmpm != NULL);
+        if (tmpm) {
+            char tmpath[OSAI_MAX_PATH];
+            snprintf(tmpath, sizeof tmpath, "%s/osai_test_import.osam", osa_path(OSAI_DIR_MODELS));
+            if (asr_model_save(tmpm, tmpath, &ie)) {
+                char iid[64] = "";
+                bool imported = osa_app_import_model(app, tmpath, iid, sizeof iid, &ie);
+                CHECK_MSG(imported, "import a real .osam: %s", ie.msg);
+                if (imported) {
+                    CHECK_MSG(iid[0] != 0, "imported id: %s", iid);
+                    char *mj2 = osa_app_models_json(app, NULL);
+                    CHECK(mj2 && strstr(mj2, iid));
+                    free(mj2);
+                }
+                osa_file_remove(tmpath);
+            }
+            asr_model_free(tmpm);
+        }
+    }
     osa_file_remove(wav);
 
     osa_app_destroy(app);

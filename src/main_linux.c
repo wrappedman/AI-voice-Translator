@@ -22,6 +22,9 @@
 #include <stdlib.h>
 #include <string.h>
 #include <math.h>
+#ifndef _WIN32
+#include <stdlib.h>          /* setenv/putenv live here, and need _DEFAULT_SOURCE */
+#endif
 
 /* Fixed wall clock for snapshots: 2026-11-07 13:29:43 UTC. Deterministic, and
  * late enough that the "11-07 13:29" history row reads naturally. */
@@ -45,6 +48,8 @@ static void usage(void) {
            "  --snapshots DIR   render every screen to DIR/screen-*.png\n"
            "  --transcribe FILE transcribe (and translate) a WAV/FLAC/OGG file\n"
            "  --selftest        run the built-in assertions, exit 1 on failure\n"
+           "  --train [FILE]    run one training cycle (FILE: optional dataset)\n"
+           "  --epochs N        training passes (default 6)\n"
            "  --models-json     print the registered models as JSON\n"
            "  --version         print the version\n"
            "  --width/--height  snapshot size (default 1440x900)\n"
@@ -158,6 +163,22 @@ static int run_snapshots(const char *dir, int w, int h, shell_lang lang, bool da
         written++;
     }
 
+    /* the Models screen's second tab: the catalogue is the part of that screen a
+     * first-time user cannot reach without knowing to click, so it gets a frame */
+    shell.screen = SCREEN_MODELS;
+    shell.models_tab = 1;
+    shell.message[0] = 0;
+    shell_draw(&shell, &canvas, &ui, NULL);
+    {
+        char mpath[OSAI_MAX_PATH + 64];
+        snprintf(mpath, sizeof mpath, "%s/screen-04b-models-download.png", dir);
+        if (canvas_save_png(&canvas, mpath)) {
+            printf("  %s\n", mpath);
+            written++;
+        }
+    }
+    shell.models_tab = 0;
+
     /* the evaluation screen with results, as a second frame */
     shell.screen = SCREEN_EVALUATION;
     free(shell.eval_json);
@@ -190,7 +211,7 @@ static int run_snapshots(const char *dir, int w, int h, shell_lang lang, bool da
     canvas_free(&canvas);
     osa_app_destroy(app);
     printf("%d images written to %s\n", written, dir);
-    return written == SCREEN_COUNT + 2 ? 0 : 1;
+    return written == SCREEN_COUNT + 3 ? 0 : 1;
 }
 
 /* ---- transcribe --------------------------------------------------- */
@@ -285,8 +306,11 @@ static int run_selftest(void) {
     for (size_t i = 0; i < sizeof cases / sizeof cases[0]; i++) {
         osa_app_translation mt;
         bool ok = osa_app_translate(app, cases[i].in, NULL, &mt, &err);
+        /* The pair can be long; %.*s keeps gcc from warning about truncation
+         * and keeps the label readable in the log. */
         char what[512];
-        snprintf(what, sizeof what, "%s -> %s", cases[i].in, mt.text);
+        snprintf(what, sizeof what, "%.180s -> %.180s", cases[i].in,
+                 mt.text[0] ? mt.text : "(empty)");
         check(ok && osa_strieq(mt.text, cases[i].out), what);
     }
 
@@ -338,6 +362,9 @@ int main(int argc, char **argv) {
     bool json = false, light = false, selftest = false, models_json = false;
     int w = 1440, h = 900;
     shell_lang lang = UI_FA;
+    const char *train_data = NULL;
+    int train_epochs = 6;
+    bool train = false;
 
     if (argc <= 1) { usage(); return 0; }
     for (int i = 1; i < argc; i++) {
@@ -352,6 +379,13 @@ int main(int argc, char **argv) {
         else if (osa_streq(a, "--light")) light = true;
         else if (osa_streq(a, "--selftest")) selftest = true;
         else if (osa_streq(a, "--models-json")) models_json = true;
+        else if (osa_streq(a, "--train")) {
+            /* `--train` on its own trains on the bundled lexicon; a following
+             * argument that is not a switch is a dataset file. */
+            train = true;
+            if (i + 1 < argc && !osa_starts(argv[i + 1], "--")) train_data = argv[++i];
+        }
+        else if (osa_streq(a, "--epochs") && i + 1 < argc) train_epochs = atoi(argv[++i]);
         else if (osa_streq(a, "--lang") && i + 1 < argc)
             lang = osa_starts(argv[++i], "en") ? UI_EN : UI_FA;
         else { fprintf(stderr, "unknown argument: %s\n", a); usage(); return 2; }
@@ -360,6 +394,19 @@ int main(int argc, char **argv) {
     if (snapdir) return run_snapshots(snapdir, w, h, lang, !light);
     if (file) return run_transcribe(file, json);
     if (selftest) return run_selftest();
+    if (train) {
+        osa_error err;
+        osa_app *app = osa_app_create(&err);
+        if (!app) { fprintf(stderr, "app init failed: %s\n", err.msg); return 1; }
+        osa_train_result res;
+        memset(&res, 0, sizeof res);
+        bool ok = osa_app_train(app, train_data, train_epochs, &res, &err);
+        printf("%s\n", ok ? res.log : err.msg);
+        if (ok) printf("model: %s\npath: %s\nwords: %d, added: %d\n", res.model_id,
+                       res.model_path, res.n_words, res.n_added);
+        osa_app_destroy(app);
+        return ok ? 0 : 1;
+    }
     if (models_json) {
         osa_error err;
         osa_app *app = osa_app_create(&err);

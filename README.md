@@ -6,9 +6,9 @@ Download one file, double-click it, talk. No installer, no account, no network
 call at any point — not at start-up, not while transcribing, not for updates.
 
 ```
- dist/bin/OpenSpeechAI.exe     31 MB, x86-64, static, GUI subsystem
- dist/OpenSpeechAI-1.0.0-win64.zip   the same binary, packaged
- dist/checksums-1.0.0.txt      SHA-256 of both
+ dist/bin/OpenSpeechAI.exe          31 MB, x86-64, static, GUI subsystem
+ dist/OpenSpeechAI-1.1.0-win64.zip  the same binary, packaged
+ dist/checksums-1.1.0.txt           SHA-256 of both
 ```
 
 ![Transcribe screen](dist/screenshots/screen-00-transcribe.png)
@@ -19,19 +19,20 @@ call at any point — not at start-up, not while transcribing, not for updates.
 
 | | |
 |---|---|
-| **Transcribe** | Load a WAV/FLAC/OGG file and get the Persian (or English) text, with confidence, duration and processing time. |
-| **Translate** | Bidirectional Persian ⇄ English, using a local phrasebook with proper normalisation of Arabic/Persian character variants. |
-| **Live** | Microphone capture with a live level meter and streaming partial results. |
+| **Transcribe** | Load a WAV/FLAC/OGG file and get the Persian (or English) text, with confidence, duration and processing time. A correction box stores the fixed transcript for the next training run, and says that the current model does not change yet. |
+| **Translate** | Bidirectional Persian ⇄ English, using a local phrasebook with proper normalisation of Arabic/Persian character variants, optional transliteration and Persian/Arabic digit handling. |
+| **Live** | Microphone capture with a level meter, a session timer and streaming partial results; the target language and the running translation update as you speak. |
 | **History** | Every transcript is stored locally in SQLite with its audio, and can be searched, replayed, copied or deleted. |
-| **Models** | Import `.osam` / `.osmt` files, see what is installed, switch versions. The previous version is never deleted. |
-| **Evaluation** | WER and CER measured against a built-in test set, per sentence, in the app. |
-| **Bilingual UI** | The whole interface is available in Persian (default, right-to-left) and English, with correct bidirectional text rendering. |
+| **Models** | Two tabs: what is installed (activate / roll back, never deleted) and the offline catalogue of 17 packs and models with licence, size and one working action each — download when a verified URL exists, install-from-file otherwise. Import `.osam` / `.osmt` files here too. |
+| **Training** | Trains on a dataset of `audio<TAB>text` pairs, or on the bundled lexicon when none is chosen; the run saves a **new** model version, activates it, and leaves the previous one installed for rollback. |
+| **Evaluation** | WER and CER measured in the app, per sentence, with each reference and hypothesis shown side by side. A language the active model has no lexicon for is reported as *not measured*, not as an error rate of 100%. |
+| **Bilingual UI** | The whole interface is available in Persian (default, right-to-left) and English, with correct bidirectional text rendering, mirrored layouts and Persian digits. |
 
 ## Screenshots
 
 | | |
 |---|---|
-| ![History](dist/screenshots/screen-03-history.png) | ![Models](dist/screenshots/screen-04-models.png) |
+| ![History](dist/screenshots/screen-03-history.png) | ![Models](dist/screenshots/screen-04b-models-download.png) |
 | ![Settings](dist/screenshots/screen-07-settings.png) | ![Light theme](dist/screenshots/screen-00b-transcribe-en-light.png) |
 
 All images in `dist/screenshots/` are rendered by the application's own drawing
@@ -88,18 +89,20 @@ for the exact byte layout of the model containers.
 
 ### Measured accuracy
 
-On ten sentences produced with the bundled TTS, transcribed through the same
-public entry point the application uses (`osa_app_evaluate` for Persian, and the
-English builtin model for the parallel set):
+Five sentences per language, produced with the bundled TTS and transcribed
+through the same public entry point the application uses
+(`osa_app_evaluate`, which the Evaluation screen calls). Each language is
+measured with its own builtin model active:
 
 | | WER | CER |
 |---|---|---|
-| Persian | **0.040** | 0.035 |
-| English | **0.050** | 0.029 |
+| Persian (`builtin-asr-fa`) | **0.040** | 0.035 |
+| English (`builtin-asr-en`) | **0.050** | 0.029 |
 
 Four of the five Persian sentences and four of the five English ones are exact.
 Both remaining errors are single short function words ("امروز هوا شما قشنگ
-است" for "خیلی"; "select a audio file" for "the").
+است" for "خیلی"; "select a audio file" for "the"). Reproduce with
+`./build/openspeech --selftest`, or in the app on the Evaluation screen.
 
 These numbers only mean something for this vocabulary: the sentences are the
 ones the builtin lexicon covers. On unrestricted speech the recogniser simply
@@ -178,9 +181,15 @@ Stated plainly, because the screenshots look more capable than the engine is:
 - **Translation is a phrasebook,** not a machine-translation model. It handles
   the builtin phrases, common words and number/time expressions; it glosses
   word by word beyond that and says so.
-- **Training in the app is not implemented.** The Training screen configures a
-  run and explains what data it would need; the button reports that honestly
-  instead of pretending to train.
+- **Training adapts, it does not learn a language.** A run adds exemplars
+  (whole-word recordings, cut proportionally from each clip when the dataset is
+  `audio<TAB>text`) to a new model version and activates it. It improves the
+  recogniser for the words and the speaker you give it; it will not grow the
+  vocabulary beyond the words in your dataset.
+- **Only one speech model is active at a time.** The bundled model carries one
+  language's lexicon. Transcribing English with the Persian model active now
+  fails with an explanation instead of returning confident Persian words; switch
+  to the English model on the Models screen (or import one).
 - **The Windows binary is cross-compiled and not smoke-tested on Windows here.**
   CI verifies the PE header, subsystem, machine type and embedded resources,
   and the engine/UI logic is exercised by the Linux test suite and snapshot

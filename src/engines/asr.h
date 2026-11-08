@@ -89,6 +89,7 @@ const char *asr_model_backend(const asr_model *m);
 const char *asr_model_license(const asr_model *m);
 const char *asr_model_source(const asr_model *m);
 const char *asr_model_version(const asr_model *m);
+const char *asr_model_base(const asr_model *m);      /* what it was derived from */
 
 /* Batch recognition of a whole file. */
 typedef struct asr_segment_result {

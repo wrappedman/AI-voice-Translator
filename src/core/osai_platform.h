@@ -92,6 +92,15 @@ void osa_sys_stats_sample(osa_sys_stats *out);
 /* ---------------- desktop helpers ---------------- */
 bool osa_open_in_explorer(const char *path);   /* opens folder/file with the OS shell */
 bool osa_clipboard_set(const char *utf8);
+
+/* Plays a short WAV file through the default output device. Playback is
+ * asynchronous and a new call stops the previous one, so the UI thread never
+ * waits for the sound. Returns false when playback is unavailable. */
+bool osa_audio_play_file(const char *wav_path);
+/* True while a file started by osa_audio_play_file is still playing. */
+bool osa_audio_is_playing(void);
+/* Stops the current playback, if any. */
+void osa_audio_stop(void);
 char *osa_clipboard_get(osa_arena *a);         /* NULL when empty/unavailable */
 
 #endif

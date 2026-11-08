@@ -56,12 +56,23 @@ static inline osa_rect rect_split_top(osa_rect *r, float h) {
 }
 
 /* ------------------------------ canvas ------------------------------ */
+#define OSA_CANVAS_CLIP_MAX 16
+
+typedef struct osa_clip_rect { int x0, y0, x1, y1; } osa_clip_rect;
+
 typedef struct osa_canvas {
     int w, h, stride;
     uint32_t *px;             /* 0xAARRGGBB, premultiplied */
     int clip_x0, clip_y0, clip_x1, clip_y1;
+    osa_clip_rect clip_stack[OSA_CANVAS_CLIP_MAX];
+    int clip_depth;
     int dc_x0, dc_y0, dc_x1, dc_y1;   /* dirty region */
     float scale;
+    /* Seconds since the previous frame. The shell animates from this instead of
+     * the frame counter, so a 60 Hz repaint and a 20 Hz repaint look the same
+     * and a still (frame_time == 0) is reproducible. */
+    float frame_time;
+    bool  rtl;                /* drawing order: true while the UI is RTL */
 } osa_canvas;
 
 bool   canvas_init(osa_canvas *c, int w, int h);
@@ -70,6 +81,7 @@ void   canvas_resize(osa_canvas *c, int w, int h);
 void   canvas_clear(osa_canvas *c, osa_color col);
 void   canvas_clip_push(osa_canvas *c, osa_rect r);
 void   canvas_clip_pop(osa_canvas *c);
+void   canvas_clip_reset(osa_canvas *c);
 osa_rect canvas_clip_get(osa_canvas *c);
 void   canvas_reset_dirty(osa_canvas *c);
 void   canvas_mark_all_dirty(osa_canvas *c);
@@ -87,6 +99,10 @@ void   c_arc(osa_canvas *c, float cx, float cy, float r, float width, float a0, 
 void   c_gradient_v(osa_canvas *c, osa_rect r, osa_color top, osa_color bottom);
 void   c_gradient_h(osa_canvas *c, osa_rect r, osa_color left, osa_color right);
 void   c_shadow(osa_canvas *c, osa_rect r, float rad, float blur, osa_color col);
+/* Approximate a Gaussian drop shadow below a rounded rect (blur in px). The
+ * falloff is computed per pixel, not by stacking offset copies. */
+void   c_soft_shadow(osa_canvas *c, osa_rect r, float rad, float spread,
+                     float dy, osa_color col);
 void   c_blend_px(osa_canvas *c, int x, int y, osa_color col);
 void   c_blend_sprite(osa_canvas *c, int x, int y, int w, int h,
                       const uint8_t *alpha, int stride, osa_color col);

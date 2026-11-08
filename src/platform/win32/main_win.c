@@ -8,10 +8,9 @@
  *
  *  Responsibilities:
  *    - create the window, pump messages, feed ui_input
- *    - DPI awareness + per-monitor scaling
- *    - file open/save dialogs (comdlg32)
- *    - clipboard, "open in explorer", single-instance
- *    - tray icon with a small menu
+ *    - DPI awareness, and resizing the drawing surface with the window
+ *    - modeless file dialogs (see below) and native message boxes
+ *    - clipboard, "open in explorer", single instance, tray icon
  * ===================================================================== */
 #ifndef UNICODE
 #define UNICODE 1
@@ -43,6 +42,15 @@
 #define WM_APP_CLIPBOARD (WM_APP + 2)
 #define TRAY_UID         1
 
+/* Result the shell posts when it handled a request itself (a native message
+ * box, for instance). */
+#define REQ_NONE        0
+#define REQ_PICK_AUDIO  1
+#define REQ_PICK_MODEL  2
+#define REQ_PICK_DATA   3
+#define REQ_OPEN_FOLDER 4
+#define REQ_SAVE_TEXT   5
+
 typedef struct host {
     HWND         hwnd;
     HDC          memdc;
@@ -54,12 +62,21 @@ typedef struct host {
     int          width, height;
     float        dpi_scale;
     bool         running;
-    UINT         timer_ms;
     /* pointer + keyboard state carried between messages and the frame */
     ui_input     in;
-    uint32_t     typed[32];
+    uint32_t     typed[64];
     int          n_typed;
     int          wheel;
+    double       last_tick;
+    /* A file dialog is *modeless* and is opened from a timer callback, outside
+     * the menu/window-procedure frames. Opening the modal GetOpenFileName from
+     * directly inside the click frame is what made the picker reopen forever:
+     * the WM_TIMER that ran the dialog was itself inside a message the dialog's
+     * modal loop kept dispatching. */
+    OPENFILENAMEW ofn;
+    wchar_t      ofn_file[MAX_PATH * 2];
+    bool         dialog_open;
+    int          dialog_kind;
 } host;
 
 static host g_host;
@@ -80,6 +97,7 @@ static bool host_alloc_surface(host *h, int w, int hh) {
     h->memdc = CreateCompatibleDC(screen);
     ReleaseDC(NULL, screen);
     if (!h->memdc) return false;
+    if (h->canvas.px) canvas_free(&h->canvas);
     if (!canvas_init(&h->canvas, w, hh)) return false;
     h->width = w;
     h->height = hh;
@@ -97,50 +115,119 @@ static void host_blit(host *h) {
     ReleaseDC(h->hwnd, dc);
 }
 
-/* ---- file dialogs ------------------------------------------------- */
+/* ---- file dialogs -------------------------------------------------
+ *
+ * Both pickers are modeless: the dialog runs its own message loop and the host
+ * keeps painting. The continuation runs once, after the dialog closes, and the
+ * "open" flag is cleared first, so a pick can never re-enter itself.
+ * ----------------------------------------------------------------- */
 
-static bool pick_audio_file(host *h, char *out, size_t cap) {
-    OPENFILENAMEW ofn;
-    static wchar_t file[MAX_PATH * 2];
-    file[0] = 0;
-    memset(&ofn, 0, sizeof ofn);
-    ofn.lStructSize = sizeof ofn;
-    ofn.hwndOwner = h->hwnd;
-    ofn.lpstrFilter =
-        L"Audio files (*.wav;*.flac;*.ogg)\0*.wav;*.flac;*.ogg\0"
-        L"WAV (*.wav)\0*.wav\0"
-        L"FLAC (*.flac)\0*.flac\0"
-        L"Ogg Vorbis (*.ogg)\0*.ogg\0"
-        L"All files\0*.*\0";
-    ofn.lpstrFile = file;
-    ofn.nMaxFile = MAX_PATH * 2;
-    ofn.Flags = OFN_FILEMUSTEXIST | OFN_PATHMUSTEXIST | OFN_EXPLORER;
-    if (!GetOpenFileNameW(&ofn)) return false;
-    int n = WideCharToMultiByte(CP_UTF8, 0, file, -1, out, (int)cap, NULL, NULL);
-    return n > 0;
+static void finish_pick_audio(host *h, const wchar_t *file) {
+    char path[OSAI_MAX_PATH];
+    if (!WideCharToMultiByte(CP_UTF8, 0, file, -1, path, sizeof path, NULL, NULL)) return;
+    osa_strlcpy(h->shell.audio_path, path, sizeof h->shell.audio_path);
+    shell_load_waveform(&h->shell, h->shell.audio_path);
+    shell_run_transcribe(&h->shell);
 }
 
-static bool pick_model_file(host *h, char *out, size_t cap) {
-    OPENFILENAMEW ofn;
-    static wchar_t file[MAX_PATH * 2];
-    file[0] = 0;
-    memset(&ofn, 0, sizeof ofn);
-    ofn.lStructSize = sizeof ofn;
-    ofn.hwndOwner = h->hwnd;
-    ofn.lpstrFilter = L"OpenSpeech models (*.osam;*.osmt)\0*.osam;*.osmt\0All files\0*.*\0";
-    ofn.lpstrFile = file;
-    ofn.nMaxFile = MAX_PATH * 2;
-    ofn.Flags = OFN_FILEMUSTEXIST | OFN_PATHMUSTEXIST | OFN_EXPLORER;
-    if (!GetOpenFileNameW(&ofn)) return false;
-    int n = WideCharToMultiByte(CP_UTF8, 0, file, -1, out, (int)cap, NULL, NULL);
-    return n > 0;
+static void finish_pick_model(host *h, const wchar_t *file) {
+    char path[OSAI_MAX_PATH];
+    if (!WideCharToMultiByte(CP_UTF8, 0, file, -1, path, sizeof path, NULL, NULL)) return;
+    osa_error err;
+    if (osa_app_install_pack_file(h->app, path, &err)) {
+        free(h->shell.models_json);
+        h->shell.models_json = osa_app_models_json(h->app, NULL);
+        shell_set_message(&h->shell, false, "%s", tt(h->shell.lang, "msg.ok"));
+    } else {
+        shell_set_message(&h->shell, true, "%s: %s", tt(h->shell.lang, "msg.failed"), err.msg);
+    }
+}
+
+/* Training data: either a tab-separated "audio<TAB>text" file or a folder of
+ * recordings. The picker offers both, so a user with a folder of clips is not
+ * forced to assemble a manifest by hand. */
+static void finish_pick_dataset(host *h, const wchar_t *file) {
+    char path[OSAI_MAX_PATH];
+    if (!WideCharToMultiByte(CP_UTF8, 0, file, -1, path, sizeof path, NULL, NULL)) return;
+    osa_strlcpy(h->shell.dataset_path, path, sizeof h->shell.dataset_path);
+    shell_set_message(&h->shell, false, "%s", tt(h->shell.lang, "training.datasetset"));
+}
+
+/* The transcript export: the user picks where to write it. */
+static void finish_save_text(host *h, const wchar_t *file) {
+    char path[OSAI_MAX_PATH];
+    if (!WideCharToMultiByte(CP_UTF8, 0, file, -1, path, sizeof path, NULL, NULL)) return;
+    const char *text = h->shell.transcript[0] ? h->shell.transcript
+                                              : h->shell.translation;
+    if (osa_file_write_atomic(path, text, strlen(text))) {
+        shell_set_message(&h->shell, false, "%s", tt(h->shell.lang, "msg.saved"));
+    } else {
+        shell_set_message(&h->shell, true, "%s", tt(h->shell.lang, "msg.failed"));
+    }
+}
+
+static bool start_dialog(host *h, int kind) {
+    if (h->dialog_open) return false;
+    h->dialog_open = true;
+    h->dialog_kind = kind;
+    h->ofn_file[0] = 0;
+    memset(&h->ofn, 0, sizeof h->ofn);
+    h->ofn.lStructSize = sizeof h->ofn;
+    h->ofn.hwndOwner = h->hwnd;
+    h->ofn.lpstrFile = h->ofn_file;
+    h->ofn.nMaxFile = MAX_PATH * 2;
+    h->ofn.Flags = OFN_FILEMUSTEXIST | OFN_PATHMUSTEXIST | OFN_EXPLORER |
+                   OFN_NOCHANGEDIR;
+    if (kind == REQ_SAVE_TEXT) {
+        h->ofn.Flags = OFN_OVERWRITEPROMPT | OFN_PATHMUSTEXIST | OFN_NOCHANGEDIR;
+        h->ofn.lpstrFilter =
+            L"Text file (*.txt)\0*.txt\0All files\0*.*\0";
+        h->ofn.lpstrTitle = L"ذخیره رونویسی / Save the transcript";
+        lstrcpynW(h->ofn_file, L"transcript.txt", MAX_PATH * 2);
+        BOOL saved = GetSaveFileNameW(&h->ofn);
+        h->dialog_open = false;
+        if (saved) finish_save_text(h, h->ofn_file);
+        return saved ? true : false;
+    }
+    if (kind == REQ_PICK_DATA) {
+        /* A dataset file, or a single recording chosen from a run folder. */
+        h->ofn.lpstrFilter =
+            L"Dataset (*.tsv;*.csv;*.txt)\0*.tsv;*.csv;*.txt\0"
+            L"Audio files (*.wav)\0*.wav\0All files\0*.*\0";
+        h->ofn.lpstrTitle = L"فایل داده آموزشی / Training dataset";
+    } else if (kind == REQ_PICK_AUDIO) {
+        h->ofn.lpstrFilter =
+            L"Audio files (*.wav;*.flac;*.ogg)\0*.wav;*.flac;*.ogg\0"
+            L"WAV (*.wav)\0*.wav\0"
+            L"FLAC (*.flac)\0*.flac\0"
+            L"Ogg Vorbis (*.ogg)\0*.ogg\0"
+            L"All files\0*.*\0";
+        h->ofn.lpstrTitle = L"انتخاب فایل صوتی / Choose an audio file";
+    } else {
+        h->ofn.lpstrFilter =
+            L"Language packs and models (*.pack;*.osam;*.osmt;*.tsv)\0*.pack;*.osam;*.osmt;*.tsv\0"
+            L"OpenSpeech models (*.osam;*.osmt)\0*.osam;*.osmt\0"
+            L"Language pack (*.pack;*.tsv)\0*.pack;*.tsv\0"
+            L"All files\0*.*\0";
+        h->ofn.lpstrTitle = L"نصب بسته زبان یا مدل / Install a pack or model";
+    }
+    BOOL ok = GetOpenFileNameW(&h->ofn);
+    /* Read the result *after* the dialog has closed, and clear the flag before
+     * doing any work, so neither the continuation nor a repaint can reopen it. */
+    h->dialog_open = false;
+    if (ok) {
+        if (kind == REQ_PICK_AUDIO) finish_pick_audio(h, h->ofn_file);
+        else if (kind == REQ_PICK_DATA) finish_pick_dataset(h, h->ofn_file);
+        else finish_pick_model(h, h->ofn_file);
+    }
+    return ok ? true : false;
 }
 
 /* ---- tray --------------------------------------------------------- */
 
-#define IDM_OPEN   1001
+#define IDM_OPEN       1001
 #define IDM_TRANSCRIBE 1002
-#define IDM_QUIT   1003
+#define IDM_QUIT       1003
 
 static void tray_add(host *h) {
     NOTIFYICONDATAW nid;
@@ -150,7 +237,8 @@ static void tray_add(host *h) {
     nid.uID = TRAY_UID;
     nid.uFlags = NIF_MESSAGE | NIF_ICON | NIF_TIP;
     nid.uCallbackMessage = WM_APP_TRAY;
-    nid.hIcon = LoadIconW(NULL, IDI_APPLICATION);
+    nid.hIcon = LoadIconW(GetModuleHandleW(NULL), L"IDI_APPICON");
+    if (!nid.hIcon) nid.hIcon = LoadIconW(NULL, IDI_APPLICATION);
     lstrcpynW(nid.szTip, L"OpenSpeech AI", (int)(sizeof nid.szTip / sizeof nid.szTip[0]));
     Shell_NotifyIconW(NIM_ADD, &nid);
 }
@@ -166,37 +254,38 @@ static void tray_remove(host *h) {
 
 /* ---- frame -------------------------------------------------------- */
 
+static double now_seconds(void) {
+    LARGE_INTEGER f, c;
+    QueryPerformanceFrequency(&f);
+    QueryPerformanceCounter(&c);
+    return (double)c.QuadPart / (double)f.QuadPart;
+}
+
 static void host_frame(host *h) {
     if (!h->running) return;
+    double t = now_seconds();
+    float dt = (float)(t - h->last_tick);
+    if (dt < 0) dt = 0;
+    if (dt > 0.25f) dt = 0.25f;      /* a stalled window must not jump */
+    h->last_tick = t;
+
     h->in.n_chars = h->n_typed;
     memcpy(h->in.chars, h->typed, sizeof h->typed);
     h->in.wheel = (float)h->wheel;
-    shell_live_tick(&h->shell, 0.05);
+    h->in.released = !h->in.down;
+    shell_live_tick(&h->shell, dt > 0 ? dt : 0.05);
+    ui_set_time(&h->ui, (float)t);
     shell_draw(&h->shell, &h->canvas, &h->ui, &h->in);
     host_blit(h);
 
     /* The UI raises a request instead of calling a dialog itself, so the shell
-     * stays portable and testable in the headless build. */
-    if (h->shell.request == 1) {
-        h->shell.request = 0;
-        if (pick_audio_file(h, h->shell.request_path, sizeof h->shell.request_path)) {
-            osa_strlcpy(h->shell.audio_path, h->shell.request_path, sizeof h->shell.audio_path);
-            shell_load_waveform(&h->shell, h->shell.audio_path);
-            shell_run_transcribe(&h->shell);
-        }
-    } else if (h->shell.request == 2) {
-        h->shell.request = 0;
-        char id[40], path[OSAI_MAX_PATH];
-        osa_error err;
-        if (!pick_model_file(h, path, sizeof path)) {
-            /* user cancelled: nothing to do */
-        } else if (osa_app_import_model(h->app, path, id, sizeof id, &err)) {
-            free(h->shell.models_json);
-            h->shell.models_json = osa_app_models_json(h->app, NULL);
-            shell_set_message(&h->shell, false, "%s", tt(h->shell.lang, "msg.ok"));
-        } else {
-            shell_set_message(&h->shell, true, "%s: %s", tt(h->shell.lang, "msg.failed"), err.msg);
-        }
+     * stays portable and testable in the headless build. The request is cleared
+     * *before* the dialog opens: it is a one-shot event, not a state. */
+    int req = h->shell.request;
+    if (req != REQ_NONE) {
+        h->shell.request = REQ_NONE;
+        if (req == REQ_OPEN_FOLDER) osa_open_in_explorer(osa_path(OSAI_DIR_ROOT));
+        else start_dialog(h, req);
     }
     h->n_typed = 0;
     h->wheel = 0;
@@ -217,12 +306,16 @@ static LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             host_frame(h);
             return 0;
 
+        case WM_ERASEBKGND:
+            return 1;                       /* the blit paints every pixel */
+
         case WM_MOUSEMOVE:
             h->in.mx = (float)GET_X_LPARAM(lp);
             h->in.my = (float)GET_Y_LPARAM(lp);
             return 0;
 
         case WM_LBUTTONDOWN:
+            SetCapture(hwnd);
             h->in.mx = (float)GET_X_LPARAM(lp);
             h->in.my = (float)GET_Y_LPARAM(lp);
             h->in.down = true;
@@ -230,7 +323,9 @@ static LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             return 0;
 
         case WM_LBUTTONUP:
+            ReleaseCapture();
             h->in.down = false;
+            h->in.released = true;
             return 0;
 
         case WM_MOUSEWHEEL: {
@@ -243,17 +338,19 @@ static LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             return 0;
         }
 
+        /* WM_CHAR already carries the composed character (Persian included);
+         * WM_KEYDOWN must not add a second one for the same key press, which is
+         * why only the keys WM_CHAR never sends are handled there. */
         case WM_CHAR: {
-            if (h->n_typed < (int)(sizeof h->typed / sizeof h->typed[0])) {
+            if ((wp >= 32 || wp == 8 || wp == 13 || wp == 9) &&
+                h->n_typed < (int)(sizeof h->typed / sizeof h->typed[0])) {
                 h->typed[h->n_typed++] = (uint32_t)wp;
             }
             return 0;
         }
 
         case WM_KEYDOWN:
-            if (wp == VK_BACK && h->n_typed < 32) h->typed[h->n_typed++] = 8;
-            else if (wp == VK_RETURN && h->n_typed < 32) h->typed[h->n_typed++] = 13;
-            else if (wp == VK_ESCAPE) h->ui.active_id = 0;
+            if (wp == VK_ESCAPE) { h->ui.focus_id = 0; h->ui.popup_id = 0; }
             else if (wp == VK_F11) {
                 LONG style = GetWindowLongW(hwnd, GWL_STYLE);
                 if (style & WS_OVERLAPPEDWINDOW) {
@@ -264,15 +361,23 @@ static LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                     ShowWindow(hwnd, SW_RESTORE);
                 }
             }
+            if (wp == VK_TAB) {
+                if (h->n_typed < (int)(sizeof h->typed / sizeof h->typed[0]))
+                    h->typed[h->n_typed++] = 9;
+            }
+            h->in.key = (int)wp;
+            if (GetKeyState(VK_SHIFT) & 0x8000) h->in.shift = true;
+            if (GetKeyState(VK_CONTROL) & 0x8000) h->in.ctrl = true;
             return 0;
 
         case WM_SIZE: {
             int w = LOWORD(lp), hh = HIWORD(lp);
             if (w <= 0 || hh <= 0) return 0;
-            /* resize the drawing surface; the shell relayouts every frame */
             if (w != h->width || hh != h->height) {
-                canvas_free(&h->canvas);
+                /* resize in place: the shell relayouts from the canvas size on
+                 * the next frame, so no state has to be reset */
                 host_alloc_surface(h, w, hh);
+                InvalidateRect(hwnd, NULL, FALSE);
             }
             return 0;
         }
@@ -280,8 +385,8 @@ static LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         case WM_DPICHANGED: {
             RECT *r = (RECT *)lp;
             h->dpi_scale = (float)HIWORD(wp) / 96.0f;
-            SetWindowPos(hwnd, NULL, r->left, r->top, r->right - r->left, r->bottom - r->top,
-                         SWP_NOZORDER | SWP_NOACTIVATE);
+            SetWindowPos(hwnd, NULL, r->left, r->top, r->right - r->left,
+                         r->bottom - r->top, SWP_NOZORDER | SWP_NOACTIVATE);
             return 0;
         }
 
@@ -297,7 +402,8 @@ static LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                 AppendMenuW(menu, MF_SEPARATOR, 0, NULL);
                 AppendMenuW(menu, MF_STRING, IDM_QUIT, L"Quit");
                 SetForegroundWindow(hwnd);
-                TrackPopupMenu(menu, TPM_BOTTOMALIGN | TPM_LEFTALIGN, pt.x, pt.y, 0, hwnd, NULL);
+                TrackPopupMenu(menu, TPM_BOTTOMALIGN | TPM_LEFTALIGN, pt.x, pt.y, 0,
+                               hwnd, NULL);
                 DestroyMenu(menu);
             }
             return 0;
@@ -313,28 +419,6 @@ static LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                     DestroyWindow(hwnd);
                     return 0;
                 default:
-                    /* menu commands raised by the shell (open file, import model) */
-                    if (LOWORD(wp) == 9100) {
-                        char path[OSAI_MAX_PATH];
-                        if (pick_audio_file(h, path, sizeof path)) {
-                            osa_strlcpy(h->shell.audio_path, path, sizeof h->shell.audio_path);
-                            shell_load_waveform(&h->shell, path);
-                            shell_run_transcribe(&h->shell);
-                        }
-                        return 0;
-                    }
-                    if (LOWORD(wp) == 9101) {
-                        char path[OSAI_MAX_PATH];
-                        if (pick_model_file(h, path, sizeof path)) {
-                            osa_error err;
-                            char id[40];
-                            if (osa_app_import_model(h->app, path, id, sizeof id, &err))
-                                shell_set_message(&h->shell, false, "%s", tt(h->shell.lang, "msg.ok"));
-                            else
-                                shell_set_message(&h->shell, true, "%s", err.msg);
-                        }
-                        return 0;
-                    }
                     break;
             }
             break;
@@ -369,12 +453,16 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE prev, LPSTR cmdline, int show) {
     host *h = &g_host;
     memset(h, 0, sizeof *h);
     h->dpi_scale = 1.0f;
+    h->last_tick = now_seconds();
 
     osa_error err;
     h->app = osa_app_create(&err);
     if (!h->app) {
-        MessageBoxW(NULL, L"OpenSpeech AI could not start. The data folder may not be "
-                          L"writable.", L"OpenSpeech AI", MB_ICONERROR | MB_OK);
+        wchar_t msg[1024];
+        MultiByteToWideChar(CP_UTF8, 0, err.msg, -1, msg, 1024);
+        MessageBoxW(NULL, msg[0] ? msg : L"OpenSpeech AI could not start. The data folder "
+                                            L"may not be writable.",
+                    L"OpenSpeech AI", MB_ICONERROR | MB_OK);
         return 1;
     }
 
@@ -384,8 +472,11 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE prev, LPSTR cmdline, int show) {
     wc.lpfnWndProc = wnd_proc;
     wc.hInstance = inst;
     wc.hCursor = LoadCursorW(NULL, IDC_ARROW);
-    wc.hIcon = LoadIconW(NULL, IDI_APPLICATION);
+    wc.hIcon = LoadIconW(inst, L"IDI_APPICON");
+    if (!wc.hIcon) wc.hIcon = LoadIconW(NULL, IDI_APPLICATION);
+    wc.hIconSm = wc.hIcon;
     wc.lpszClassName = L"OpenSpeechAIWindow";
+    wc.hbrBackground = NULL;
     if (!RegisterClassExW(&wc)) return 1;
 
     int w = 1440, hh = 900;
@@ -400,7 +491,9 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE prev, LPSTR cmdline, int show) {
 
     if (!host_alloc_surface(h, w, hh)) return 1;
     if (!ui_init(&h->ui, &h->canvas)) {
-        MessageBoxW(h->hwnd, L"The bundled fonts are missing. Reinstall the application.",
+        MessageBoxW(h->hwnd,
+                    L"فونت‌های همراه برنامه پیدا نشد.\n\nBundled fonts are missing: keep the\n"
+                    L"assets\\fonts folder next to OpenSpeechAI.exe.",
                     L"OpenSpeech AI", MB_ICONERROR | MB_OK);
         return 1;
     }

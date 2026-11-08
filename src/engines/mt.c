@@ -27,6 +27,23 @@ static const phrase_pair SENTENCES[] = {
     {"صبح بخیر", "Good morning"},
     {"شب بخیر", "Good night"},
     {"خداحافظ", "Goodbye"},
+    /* greetings and everyday courtesy */
+    {"از آشنایی با شما خوشحالم", "Nice to meet you"},
+    {"از آشنایی با شما هم خوشحالم", "Nice to meet you too"},
+    {"از دیدن شما خوشحالم", "Glad to see you"},
+    {"چه خبر", "What's new"},
+    {"حال شما چطور است", "How are you doing"},
+    {"خوبم ممنون", "I am fine, thanks"},
+    {"اسم من", "My name is"},
+    {"اسم شما چیست", "What is your name"},
+    {"لطفا کمک کنید", "Please help"},
+    {"ببخشید مزاحم شدم", "Sorry to bother you"},
+    {"وقت بخیر", "Good afternoon"},
+    {"روز خوبی داشته باشید", "Have a good day"},
+    {"تا بعد", "See you later"},
+    {"به امید دیدار", "See you soon"},
+    {"شب آرامی داشته باشید", "Good night"},
+    {"خوش آمدید", "Welcome"},
     {"ممنون", "Thanks"},
     {"ممنونم", "Thank you"},
     {"متشکرم", "Thank you"},
@@ -108,6 +125,18 @@ static const phrase_pair SENTENCES[] = {
     {"دقیق", "Accurate"},
     {"دقیق است", "Is accurate"},
     {"تشخیص گفتار فارسی دقیق است", "Persian speech recognition is accurate"},
+    /* sentences about the application itself, so the Translate screen has
+       something useful to say on day one */
+    {"این برنامه به صورت آفلاین کار می کند", "This application works offline"},
+    {"هیچ داده ای به اینترنت ارسال نمی شود", "No data is sent to the internet"},
+    {"متن را به انگلیسی ترجمه کن", "Translate the text into English"},
+    {"متن را به فارسی ترجمه کن", "Translate the text into Persian"},
+    {"فایل صوتی را بارگذاری کنید", "Load the audio file"},
+    {"ضبط صدا را متوقف کنید", "Stop recording the audio"},
+    {"مدل جدید را دانلود کنید", "Download the new model"},
+    {"زبان مبدا و مقصد را انتخاب کنید", "Choose the source and target language"},
+    {"ترجمه دقیق است", "The translation is accurate"},
+    {"این جمله ترجمه شد", "This sentence was translated"},
 
     {"کاربر", "User"},
     {"رمز عبور", "Password"},
@@ -223,6 +252,167 @@ static const phrase_pair WORDS[] = {
 };
 
 /* English -> Persian direction uses the same tables reversed. */
+
+/* =====================================================================
+ *  Register ("style") of the produced translation
+ *
+ *  A phrasebook cannot generate a register, so each register is a rewrite over
+ *  the neutral result: the tokens that differ between formal writing and
+ *  everyday speech are replaced, in the target language. The tables are small
+ *  on purpose — they cover the words a Persian/English speaker actually
+ *  switches when moving between "کتابی" and "روزمره", and anything outside
+ *  them is left exactly as the neutral engine produced it, so a register can
+ *  never make a sentence worse.
+ * ===================================================================== */
+
+/* Persian: neutral -> formal (written, polite) and neutral -> casual (spoken). */
+typedef struct style_pair { const char *from; const char *to; } style_pair;
+
+static const style_pair FA_FORMAL[] = {
+    {"می شود", "می‌شود"}, {"می کند", "می‌کند"}, {"نمی شود", "نمی‌شود"},
+    {"نمی کند", "نمی‌کند"}, {"می کنم", "می‌کنم"}, {"می کنید", "می‌کنید"},
+    {"می کنیم", "می‌کنیم"}, {"می خواهم", "می‌خواهم"}, {"می خواهید", "می‌خواهید"},
+    {"خوب است", "خوب می‌باشد"}, {"است", "می‌باشد"},
+    {"تو را", "شما را"}, {"تو ", "شما "}, {"مال تو", "متعلق به شما"},
+    {"ممنون", "سپاسگزارم"}, {"مرسی", "سپاسگزارم"}, {"باشه", "بسیار خوب"},
+    {"بده", "لطفاً ارائه فرمایید"}, {"میشه", "می‌شود"}, {"نمیشه", "نمی‌شود"},
+    {"چیه", "چیست"}, {"کجاست", "در کجا قرار دارد"}, {"خیلی", "بسیار"},
+    {"الان", "اکنون"}, {"الآن", "اکنون"}, {"ولی", "اما"}, {"تو", "شما"},
+};
+
+static const style_pair FA_CASUAL[] = {
+    {"می‌باشد", "است"}, {"می باشد", "است"}, {"می‌شود", "می‌شه"},
+    {"می شود", "می‌شه"}, {"نمی‌شود", "نمی‌شه"}, {"نمی شود", "نمی‌شه"},
+    {"می‌کند", "می‌کنه"}, {"می کند", "می‌کنه"}, {"نمی‌کند", "نمی‌کنه"},
+    {"می‌کنید", "می‌کنید"}, {"می‌کنم", "می‌کنم"}, {"می‌خواهم", "می‌خوام"},
+    {"می خواهم", "می‌خوام"}, {"می‌خواهید", "می‌خواید"}, {"شما", "تو"},
+    {"سپاسگزارم", "ممنون"}, {"بسیار", "خیلی"}, {"اکنون", "الان"},
+    {"اما", "ولی"}, {"چیست", "چیه"}, {"کدام", "کدوم"}, {"این‌گونه", "این‌طوری"},
+    {"بروید", "برو"}, {"بیایید", "بیا"}, {"کنید", "کن"}, {"بدهید", "بده"},
+    {"بگیرید", "بگیر"}, {"بگویید", "بگو"}, {"می‌دهد", "می‌ده"}, {"می‌گیرد", "می‌گیره"},
+    {"است", "هست"},
+};
+
+/* English: neutral -> formal / casual. Word-boundary matched, case-folded. */
+static const style_pair EN_FORMAL[] = {
+    {"Thanks", "Thank you"}, {"Hi", "Good day"},
+    {"don't", "do not"}, {"can't", "cannot"}, {"won't", "will not"},
+    {"it's", "it is"}, {"i'm", "I am"}, {"you're", "you are"},
+    {"that's", "that is"}, {"i'd", "I would"}, {"let's", "let us"},
+    {"thanks", "thank you"}, {"hi", "good day"}, {"yeah", "yes"},
+    {"okay", "certainly"}, {"ok", "certainly"}, {"kids", "children"},
+    {"get", "obtain"}, {"got", "obtained"}, {"big", "substantial"},
+    {"a lot of", "a considerable amount of"}, {"stuff", "material"},
+    {"want", "wish"}, {"ask", "request"},
+};
+
+static const style_pair EN_CASUAL[] = {
+    {"do not", "don't"}, {"cannot", "can't"}, {"will not", "won't"},
+    {"it is", "it's"}, {"i am", "I'm"}, {"you are", "you're"},
+    {"that is", "that's"}, {"I would", "I'd"}, {"let us", "let's"},
+    {"thank you", "thanks"}, {"good day", "hi"}, {"yes", "yeah"},
+    {"certainly", "sure"}, {"children", "kids"}, {"obtain", "get"},
+    {"obtained", "got"}, {"substantial", "big"}, {"a considerable amount of", "a lot of"},
+    {"material", "stuff"}, {"wish", "want"}, {"request", "ask"},
+};
+
+const char *mt_style_key(mt_style s) {
+    switch (s) {
+        case MT_STYLE_FORMAL: return "formal";
+        case MT_STYLE_CASUAL: return "casual";
+        default: return "neutral";
+    }
+}
+
+const char *mt_style_label(mt_style s, bool persian) {
+    if (persian) {
+        switch (s) {
+            case MT_STYLE_FORMAL: return "رسمی و کتابی";
+            case MT_STYLE_CASUAL: return "عامیانه و روزمره";
+            default: return "ساده و متعادل";
+        }
+    }
+    switch (s) {
+        case MT_STYLE_FORMAL: return "Formal";
+        case MT_STYLE_CASUAL: return "Everyday";
+        default: return "Neutral";
+    }
+}
+
+/* Replaces whole-token occurrences of `from` with `to`. Persian entries match
+ * byte-wise (the orthography is already normalised), English entries match
+ * case-insensitively on word boundaries. */
+static void apply_style_pairs(const char *in, const style_pair *pairs, int n,
+                              bool persian, char *out, size_t cap) {
+    osa_strlcpy(out, in, cap);
+    char work[MT_MAX_TEXT];
+    for (int k = 0; k < n; k++) {
+        const char *from = pairs[k].from;
+        const char *to = pairs[k].to;
+        size_t fl = strlen(from);
+        if (fl == 0) continue;
+        osa_strlcpy(work, out, sizeof work);
+        size_t o = 0;
+        const char *p = work;
+        while (*p && o + 2 < cap) {
+            bool at_start = (p == work);
+            bool boundary_before = at_start || p[-1] == ' ' || p[-1] == '\n' ||
+                                   (!persian && (p[-1] == '.' || p[-1] == ',' ||
+                                                 p[-1] == '!' || p[-1] == '?'));
+            bool match = false;
+            if (boundary_before && (size_t)(strlen(p)) >= fl) {
+                if (persian) match = (strncmp(p, from, fl) == 0);
+                else match = (osa_strstr_ci(p, from) == p);
+                if (match) {
+                    /* the token must end here too (no prefix of a longer word) */
+                    char after = p[fl];
+                    if (after && after != ' ' && after != '\n' && after != '.' &&
+                        after != ',' && after != '!' && after != '?' && after != '\'' &&
+                        after != (char)0xD8)   /* lead byte of «،» */
+                        match = false;
+                }
+            }
+            if (match) {
+                size_t tl = strlen(to);
+                if (o + tl + 1 < cap) {
+                    bool cap_first = !persian && from[0] >= 'A' && from[0] <= 'Z';
+                    memcpy(out + o, to, tl);
+                    if (cap_first && to[0] >= 'a' && to[0] <= 'z') out[o] = (char)(to[0] - 32);
+                    o += tl;
+                }
+                p += fl;
+            } else {
+                out[o++] = *p++;
+            }
+        }
+        out[o] = 0;
+    }
+}
+
+/* Rewrites `text` (in `lang`) into the requested register. */
+static void restyle(const char *text, mt_lang lang, mt_style style,
+                    char *out, size_t cap) {
+    osa_strlcpy(out, text, cap);
+    if (style == MT_STYLE_NEUTRAL) return;
+    char tmp[MT_MAX_TEXT];
+    if (lang == MT_FA) {
+        if (style == MT_STYLE_FORMAL)
+            apply_style_pairs(text, FA_FORMAL, (int)(sizeof FA_FORMAL / sizeof FA_FORMAL[0]),
+                              true, tmp, sizeof tmp);
+        else
+            apply_style_pairs(text, FA_CASUAL, (int)(sizeof FA_CASUAL / sizeof FA_CASUAL[0]),
+                              true, tmp, sizeof tmp);
+    } else {
+        if (style == MT_STYLE_FORMAL)
+            apply_style_pairs(text, EN_FORMAL, (int)(sizeof EN_FORMAL / sizeof EN_FORMAL[0]),
+                              false, tmp, sizeof tmp);
+        else
+            apply_style_pairs(text, EN_CASUAL, (int)(sizeof EN_CASUAL / sizeof EN_CASUAL[0]),
+                              false, tmp, sizeof tmp);
+    }
+    osa_strlcpy(out, tmp, cap);
+}
+
 
 /* =====================================================================
  *  Model container (.osmt)
@@ -341,9 +531,14 @@ static void normalize_fa(const char *in, char *out, size_t cap) {
             continue;
         }
         if (is_space_cp(emit)) {
-            if (o == 0 || out[o - 1] == ' ') { p = save; continue; }
+            /* Collapse runs of separators to one space. This used to `continue`
+             * without advancing, which is an infinite loop: the app froze the
+             * moment the user typed a space in the Translate box and appeared
+             * to close itself. */
+            if (o == 0 || out[o - 1] == ' ') continue;
             emit = ' ';
         }
+        (void)save;
         o += (size_t)utf8_put(out, cap, o, emit);
         if (o + 8 >= cap) break;
     }
@@ -724,8 +919,21 @@ double mt_score(const char *reference, const char *hypothesis) {
     return 2.0 * prec * rec / (prec + rec);
 }
 
-bool mt_translate(const mt_model *m, const char *text, mt_lang src,
-                  mt_result *out, osa_error *err) {
+/* One-shot conversion of an already translated result. The whole-sentence and
+ * gloss paths both end here so a register applies exactly once. */
+static void finish_style(mt_result *out, mt_style style) {
+    if (style == MT_STYLE_NEUTRAL || !out->text[0]) return;
+    char styled[MT_MAX_TEXT];
+    restyle(out->text, out->dst_lang, style, styled, sizeof styled);
+    osa_strlcpy(out->text, styled, sizeof out->text);
+    if (out->n_pieces == 1) {
+        restyle(out->pieces[0].dst, out->dst_lang, style,
+                out->pieces[0].dst, sizeof out->pieces[0].dst);
+    }
+}
+
+bool mt_translate_styled(const mt_model *m, const char *text, mt_lang src,
+                         mt_style style, mt_result *out, osa_error *err) {
     if (!text || !out) { osa_err_set(err, "bad arguments"); return false; }
     clock_t t0 = clock();
     memset(out, 0, sizeof *out);
@@ -759,6 +967,7 @@ bool mt_translate(const mt_model *m, const char *text, mt_lang src,
         out->pieces[0].src_end = (int)strlen(text);
         out->pieces[0].confidence = 0.98f;
         out->confidence = 0.98f;
+        finish_style(out, style);
         out->elapsed_ms = 1000.0 * (double)(clock() - t0) / (double)CLOCKS_PER_SEC;
         osa_err_ok(err);
         return true;
@@ -824,7 +1033,13 @@ bool mt_translate(const mt_model *m, const char *text, mt_lang src,
     }
     if (out->n_pieces == 0) { osa_err_set(err, "nothing to translate"); return false; }
     out->confidence = conf_n ? conf_sum / (float)conf_n : 0.0f;
+    finish_style(out, style);
     out->elapsed_ms = 1000.0 * (double)(clock() - t0) / (double)CLOCKS_PER_SEC;
     osa_err_ok(err);
     return true;
+}
+
+bool mt_translate(const mt_model *m, const char *text, mt_lang src,
+                  mt_result *out, osa_error *err) {
+    return mt_translate_styled(m, text, src, MT_STYLE_NEUTRAL, out, err);
 }

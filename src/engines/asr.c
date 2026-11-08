@@ -247,6 +247,7 @@ const char *asr_model_backend(const asr_model *m)  { return m ? m->backend : "";
 const char *asr_model_license(const asr_model *m)  { return m ? m->license : ""; }
 const char *asr_model_source(const asr_model *m)   { return m ? m->source_url : ""; }
 const char *asr_model_version(const asr_model *m)  { return m ? m->version : ""; }
+const char *asr_model_base(const asr_model *m)     { return m ? m->base_model : ""; }
 
 /* A stable id derived from the model's own name/backend when the container does
  * not carry one, so imported models always get a usable identifier. */
@@ -881,11 +882,28 @@ static int decode_dtw(const asr_model *m, const float *feat, int nframes,
             int l1[NOFF]; float c1[NOFF];
             for (int k = 0; k < NOFF; k++) { l1[k] = 0; c1[k] = 1e30f; }
             for (int L = lo; L <= hi && t + L <= hi_t; L++) {
+                /* Both caches are warmed by dtw_fixed_avg() before this loop:
+                 * s_td[i][j] is the template row read forward, s_tdt[j][i] the
+                 * same matrix transposed for sequential access. Long templates
+                 * (over 64 frames — most multi-syllable English words) have no
+                 * transposed copy, so they read the forward one. Skipping them,
+                 * as an earlier version did, made every such word
+                 * unrecognisable: "recording" (65 frames) could never win a
+                 * span, and the decoder emitted whichever short words scored
+                 * best in its place. */
                 float acc = 0;
-                for (int i = 0; i < T; i++) {
-                    int j = t + (int)((long)i * (long)L / (long)T);
-                    if (j >= t + L) j = t + L - 1;
-                    acc += s_tdt[j][i];
+                if (T <= 64) {
+                    for (int i = 0; i < T; i++) {
+                        int j = t + (int)((long)i * (long)L / (long)T);
+                        if (j >= t + L) j = t + L - 1;
+                        acc += s_tdt[j][i];
+                    }
+                } else {
+                    for (int i = 0; i < T; i++) {
+                        int j = t + (int)((long)i * (long)L / (long)T);
+                        if (j >= t + L) j = t + L - 1;
+                        acc += s_td[i][j];
+                    }
                 }
                 float avg = acc / (float)T;
                 float ratio = (float)L / (float)T;
@@ -1053,6 +1071,19 @@ bool asr_transcribe_samples(asr_model *m, const float *samples, int64_t n,
     const char *lang = (force_lang && *force_lang && !osa_strieq(force_lang, "auto"))
                        ? force_lang : asr_detect_language(samples, n);
     osa_strlcpy(out->language, lang, sizeof out->language);
+    /* A lexicon covers exactly one language. Asking an English clip of the
+     * Persian lexicon does not fail, it returns the nearest Persian words —
+     * confident nonsense. Say so instead: drop the guess and report a failed
+     * attempt, so callers (evaluation, the transcribe screen) show an honest
+     * outcome rather than a wrong one. A model with an explicit multi-language
+     * marker ("multi", "fa;en", "*") is left alone. */
+    const char *cover = m->language[0] ? m->language : "*";
+    if (!osa_streq(cover, "multi") && !strstr(cover, ";") && !osa_streq(cover, "*") &&
+        !osa_starts(cover, lang)) {
+        out->text[0] = 0;
+        osa_err_set(err, "this model's lexicon covers '%s', not '%s'", cover, lang);
+        return false;
+    }
     osa_audio tmp;
     osa_audio_init(&tmp);
     tmp.samples = (float *)samples;

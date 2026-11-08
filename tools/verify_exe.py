@@ -5,8 +5,12 @@ CI cannot run a Windows binary, so the next best thing is to verify the parts
 of the PE header a broken build gets wrong: machine type, optional-header
 magic, GUI subsystem, no DLL flag, and the embedded version resource.
 """
+import os
+import re
 import struct
 import sys
+
+ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 EXPECT_MACHINE = 0x8664        # AMD64
 EXPECT_MAGIC_PE32P = 0x020B
@@ -37,12 +41,25 @@ def check(path: str) -> int:
     dll = struct.unpack_from("<H", data, opt + 70)[0] & 1
     if dll:
         fails.append("image is marked as a DLL")
+    # The version is checked against the one header the whole program uses, so a
+    # release cannot ship with the previous version's string baked in.
+    ver = version_from_header()
     for needle, what in ((b"OpenSpeech AI", "product name"),
-                         (b"1.0.0", "version string"),
+                         (ver.encode(), "version string (%s)" % ver),
                          (b"permonitorv2", "DPI manifest")):
         if needle not in data:
             fails.append("missing %s resource" % what)
     return report(fails, path, data)
+
+
+def version_from_header() -> str:
+    """The version lives in exactly one place: src/core/osai_common.h."""
+    header = os.path.join(ROOT, "src", "core", "osai_common.h")
+    with open(header, encoding="utf-8") as f:
+        m = re.search(r'#define\s+OSAI_VERSION\s+"([0-9.]+)"', f.read())
+    if not m:
+        raise SystemExit("cannot read OSAI_VERSION from %s" % header)
+    return m.group(1)
 
 
 def report(fails, path, data) -> int:

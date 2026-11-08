@@ -19,7 +19,8 @@ BUILD   := build
 SRC     := src
 DIST    := dist
 
-CFLAGS_COMMON := -std=c11 -O2 -g -fno-omit-frame-pointer -Wall -Wextra \
+# -D_DEFAULT_SOURCE: setenv/unsetenv live behind it in glibc's strict-C11 mode.
+CFLAGS_COMMON := -std=c11 -O2 -g -fno-omit-frame-pointer -Wall -Wextra -D_DEFAULT_SOURCE \
                  -Wno-unused-parameter -Wno-missing-field-initializers -MMD -MP -pthread
 CXXFLAGS_COMMON := -std=c++17 -O2 -fno-omit-frame-pointer -fno-rtti -fno-exceptions \
                    -pthread -MMD -MP
@@ -116,7 +117,8 @@ WIN_OBJ  := $(patsubst %.c,$(BUILD)/win/%.o,$(LIB_SRC)) \
 # Only system DLLs. No D2D/DWrite: the canvas renders with GDI, which exists on
 # every supported Windows version and keeps the import table tiny.
 WIN_LIBS := -lws2_32 -lshlwapi -lshell32 -lole32 -loleaut32 -lgdi32 -luser32 \
-            -ladvapi32 -luuid -lcomdlg32 -lversion -lbcrypt -lwinmm -lpsapi -lkernel32
+            -ladvapi32 -luuid -lcomdlg32 -lversion -lbcrypt -lwinmm -lpsapi \
+            -lwinhttp -lkernel32
 
 .PHONY: win
 win: $(WIN_BIN)

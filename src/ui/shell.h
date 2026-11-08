@@ -4,6 +4,9 @@
  *  Draws the whole application with the canvas/text layer so the same code
  *  renders in the Windows build (GDI/DIB) and in the headless snapshot build
  *  used by the test-suite. Layout is immediate-mode and right-to-left aware.
+ *
+ *  The shell owns all application state; the platform layer owns the window,
+ *  the file dialogs and the microphone, and never draws.
  * ===================================================================== */
 #ifndef OSAI_SHELL_H
 #define OSAI_SHELL_H
@@ -11,6 +14,10 @@
 #include <stdbool.h>
 #include "../app/osai_app.h"
 #include "ui_kit.h"
+
+/* Shown on the About card and in the window title. One definition, taken from
+ * the library version so the exe, the About card and the zip name agree. */
+#define OSAI_APP_VERSION OSAI_VERSION
 
 typedef enum shell_screen {
     SCREEN_TRANSCRIBE = 0,
@@ -29,6 +36,17 @@ typedef enum shell_screen {
  * because the product's primary users are Persian speakers. */
 typedef enum shell_lang { UI_FA = 0, UI_EN = 1 } shell_lang;
 
+/* A request the shell raises for the platform layer to satisfy. The shell never
+ * opens a dialog itself: it stays renderable in the headless build. */
+typedef enum shell_request {
+    SHELL_REQ_NONE = 0,
+    SHELL_REQ_PICK_AUDIO,      /* open the audio file picker          */
+    SHELL_REQ_PICK_PACK,       /* open the language pack / model picker */
+    SHELL_REQ_PICK_DATASET,    /* open the training dataset picker     */
+    SHELL_REQ_OPEN_FOLDER,     /* show the data folder in Explorer    */
+    SHELL_REQ_SAVE_TRANSCRIPT  /* save the current transcript to a file */
+} shell_request;
+
 typedef struct shell_state {
     osa_app      *app;
     shell_screen  screen;
@@ -40,11 +58,15 @@ typedef struct shell_state {
     char          audio_path[OSAI_MAX_PATH];
     char          transcript[8192];
     char          translation[8192];
+    char          phonetic[4096];        /* آوانویسی of the translation       */
+    char          correction[4096];      /* edited transcript awaiting review  */
     char          detected_lang[8];
     char          transcript_id[40];
     float         transcript_conf;
     double        transcript_rtf;
     double        transcript_dur;
+    double        transcript_ms;
+    int           transcript_words;
     bool          working;
     char          message[512];
     bool          message_is_error;
@@ -67,6 +89,20 @@ typedef struct shell_state {
     /* models */
     char         *models_json;
     int           models_scroll;
+    int           models_tab;            /* 0 installed, 1 downloadable */
+    int           packs_scroll;
+    double        dl_progress;           /* 0..1 while downloading      */
+    char          dl_pack[64];
+    bool          downloading;
+
+    /* training */
+    int           train_epochs;
+    int           train_lang;
+    bool          train_gpu;
+    char          train_log[2048];
+    char          dataset_path[OSAI_MAX_PATH];
+    bool          trained;
+    bool          training;
 
     /* evaluation */
     char         *eval_json;
@@ -75,13 +111,26 @@ typedef struct shell_state {
     bool          auto_detect;
     bool          save_audio;
     bool          privacy_logs;
+    bool          show_phonetic;
     float         vad_sensitivity;
     int           asr_threads;
+
+    /* language pair + register (persisted) */
+    char          lang_src[8];
+    char          lang_dst[8];
+    mt_style      style;
+
+    /* translate screen buffer */
+    char          tr_in[4096];
+    char          tr_out[4096];
+    char          tr_phonetic[2048];
+    char          tr_out_lang[8];
+    double        tr_score;
 
     /* Set by the UI when it needs the platform layer to run a modal dialog.
      * The host consumes the request, fills in the result and clears it; the UI
      * itself never touches the filesystem dialog APIs. */
-    int           request;        /* 0 none, 1 pick audio, 2 pick model */
+    shell_request request;
     char          request_path[OSAI_MAX_PATH];
 
     /* ui bookkeeping */
@@ -104,12 +153,26 @@ bool shell_load_waveform(shell_state *s, const char *path);
  * button and by the command-line/snapshot driver. */
 bool shell_run_transcribe(shell_state *s);
 
-/* Persisted UI preferences (theme, language, scale, toggles). */
+/* Runs the translate action for the Translate screen's current input. */
+void shell_run_translate(shell_state *s);
+
+/* Recomputes the آوانویسی line for the current translation. */
+void shell_refresh_phonetic(shell_state *s);
+
+/* Loads a stored transcript (by its id) into the Transcribe screen. Used by the
+ * history table and by the recent-items strip. */
+bool shell_load_transcript(shell_state *s, const char *id, const char *text,
+                           const char *lang, float confidence, double duration);
+
+/* Persisted UI preferences (theme, language, scale, toggles, language pair). */
 void shell_load_prefs(shell_state *s);
 void shell_save_prefs(shell_state *s);
 
 /* i18n: tt(lang, key) returns the interface string. */
 const char *tt(shell_lang lang, const char *key);
+
+/* Synthesises and plays `text` in `lang` (the "listen" buttons). */
+void shell_speak(shell_state *s, const char *text, const char *lang);
 
 /* Writes a transient status line at the bottom of the content area. */
 void shell_set_message(shell_state *s, bool err, const char *fmt, ...)
@@ -125,12 +188,17 @@ void shell_live_tick(shell_state *s, double dt);
 /* Screens other than Transcribe live in shell_screens.c. */
 void shell_draw_screen(shell_state *s, ui_context *u, osa_rect body, const ui_input *in);
 
-/* Draws the title bar (resolving the two translation keys) and returns the
- * content rect that remains below it. */
+/* Applies a drop-down choice captured before ui_popup_draw(). */
+void shell_popup_commit(shell_state *s, int popup_id, int sel);
+
+/* Draws the title bar and returns the content rect that remains below it. */
 osa_rect shell_draw_chrome(shell_state *s, ui_context *u, osa_rect content,
                            const char *title_key, const char *subtitle_key);
 osa_rect shell_screen_chrome(shell_state *s, ui_context *u, osa_rect content,
                              shell_screen sc);
 void     shell_draw_toast(shell_state *s, ui_context *u, osa_rect body);
+
+/* Two-letter code of the language name for the interface ("fa"/"en"). */
+const char *shell_lang_name(shell_state *s, const char *code);
 
 #endif /* OSAI_SHELL_H */

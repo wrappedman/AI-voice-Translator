@@ -12,6 +12,10 @@ bool canvas_init(osa_canvas *c, int w, int h) {
     c->px = (uint32_t *)calloc((size_t)w * (size_t)h, 4);
     if (!c->px) return false;
     c->clip_x0 = 0; c->clip_y0 = 0; c->clip_x1 = w; c->clip_y1 = h;
+    /* A scissor rectangle in *this* canvas, used to keep widgets from drawing
+     * outside their card (see canvas_clip_push). */
+    c->rtl = false;
+    c->frame_time = 0.0f;
     canvas_mark_all_dirty(c);
     return true;
 }
@@ -40,17 +44,18 @@ static void mark_dirty(osa_canvas *c, int x0, int y0, int x1, int y1) {
     if (y1 > c->dc_y1) c->dc_y1 = y1;
 }
 
-typedef struct clip_ent { int x0, y0, x1, y1; } clip_ent;
-static clip_ent g_clip_stack[32];
-static int g_clip_depth = 0;
-
+/* The clip stack belongs to the canvas, not to the process: two canvases (the
+ * Windows surface and, say, an offscreen preview) used to share a global stack
+ * whose depth was never reset, so a single unbalanced push left every later
+ * frame drawn through a stale rectangle — in the RTL layout that reads as the
+ * whole content area going blank. */
 void canvas_clip_push(osa_canvas *c, osa_rect r) {
-    if (g_clip_depth >= 32) return;
-    g_clip_stack[g_clip_depth].x0 = c->clip_x0;
-    g_clip_stack[g_clip_depth].y0 = c->clip_y0;
-    g_clip_stack[g_clip_depth].x1 = c->clip_x1;
-    g_clip_stack[g_clip_depth].y1 = c->clip_y1;
-    g_clip_depth++;
+    if (c->clip_depth >= OSA_CANVAS_CLIP_MAX) return;
+    c->clip_stack[c->clip_depth].x0 = c->clip_x0;
+    c->clip_stack[c->clip_depth].y0 = c->clip_y0;
+    c->clip_stack[c->clip_depth].x1 = c->clip_x1;
+    c->clip_stack[c->clip_depth].y1 = c->clip_y1;
+    c->clip_depth++;
     int x0 = (int)floorf(r.x), y0 = (int)floorf(r.y);
     int x1 = (int)ceilf(r.x + r.w), y1 = (int)ceilf(r.y + r.h);
     if (x0 > c->clip_x0) c->clip_x0 = x0;
@@ -66,12 +71,18 @@ void canvas_clip_push(osa_canvas *c, osa_rect r) {
 }
 
 void canvas_clip_pop(osa_canvas *c) {
-    if (g_clip_depth <= 0) return;
-    g_clip_depth--;
-    c->clip_x0 = g_clip_stack[g_clip_depth].x0;
-    c->clip_y0 = g_clip_stack[g_clip_depth].y0;
-    c->clip_x1 = g_clip_stack[g_clip_depth].x1;
-    c->clip_y1 = g_clip_stack[g_clip_depth].y1;
+    if (c->clip_depth <= 0) return;
+    c->clip_depth--;
+    c->clip_x0 = c->clip_stack[c->clip_depth].x0;
+    c->clip_y0 = c->clip_stack[c->clip_depth].y0;
+    c->clip_x1 = c->clip_stack[c->clip_depth].x1;
+    c->clip_y1 = c->clip_stack[c->clip_depth].y1;
+}
+
+void canvas_clip_reset(osa_canvas *c) {
+    c->clip_depth = 0;
+    c->clip_x0 = 0; c->clip_y0 = 0;
+    c->clip_x1 = c->w; c->clip_y1 = c->h;
 }
 
 osa_rect canvas_clip_get(osa_canvas *c) {
@@ -374,6 +385,44 @@ void c_shadow(osa_canvas *c, osa_rect r, float rad, float blur, osa_color col) {
         osa_color cc = col;
         cc.a = (uint8_t)((float)col.a / (float)(i * 2));
         c_fill_round(c, rectf(r.x - e, r.y - e * 0.5f, r.w + e * 2, r.h + e), rad + e, cc);
+    }
+}
+
+/* Signed distance to a rounded rectangle, negative inside. Used for the soft
+ * shadow below, so the falloff is smooth instead of a stack of hard rings. */
+static float sd_round_rect(float px, float py, osa_rect r, float rad) {
+    float hx = r.w * 0.5f, hy = r.h * 0.5f;
+    float qx = fabsf(px - (r.x + hx)) - (hx - rad);
+    float qy = fabsf(py - (r.y + hy)) - (hy - rad);
+    float ax = qx > 0 ? qx : 0, ay = qy > 0 ? qy : 0;
+    float outside = sqrtf(ax * ax + ay * ay);
+    float inside = (qx > qy ? qx : qy);
+    if (inside > 0) inside = 0;
+    return outside + inside - rad;
+}
+
+void c_soft_shadow(osa_canvas *c, osa_rect r, float rad, float spread, float dy,
+                   osa_color col) {
+    if (col.a == 0) return;
+    float reach = spread * 1.5f;
+    int x0 = (int)floorf(r.x - reach), x1 = (int)ceilf(r.x + r.w + reach);
+    int y0 = (int)floorf(r.y - reach + dy), y1 = (int)ceilf(r.y + r.h + reach + dy);
+    if (x0 < c->clip_x0) x0 = c->clip_x0;
+    if (y0 < c->clip_y0) y0 = c->clip_y0;
+    if (x1 > c->clip_x1) x1 = c->clip_x1;
+    if (y1 > c->clip_y1) y1 = c->clip_y1;
+    if (x1 <= x0 || y1 <= y0) return;
+    osa_rect body = rectf(r.x, r.y + dy, r.w, r.h);
+    for (int y = y0; y < y1; y++) {
+        for (int x = x0; x < x1; x++) {
+            float d = sd_round_rect((float)x + 0.5f, (float)y + 0.5f, body, rad);
+            if (d > reach) continue;
+            float t = 1.0f - (d < 0 ? 0.0f : d / reach);
+            t = t * t * (3.0f - 2.0f * t);           /* smoothstep */
+            osa_color cc = col;
+            cc.a = (uint8_t)((float)col.a * t);
+            if (cc.a) c_blend_px(c, x, y, cc);
+        }
     }
 }
 

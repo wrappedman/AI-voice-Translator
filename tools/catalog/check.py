@@ -16,15 +16,16 @@ import os
 import re
 import subprocess
 import sys
+import tempfile
 
 ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 CATALOG = os.path.join(ROOT, "tools", "catalog", "catalog.json")
 HEADLESS = os.path.join(ROOT, "build", "openspeech")
 
 HEX64 = re.compile(r"^[0-9a-f]{64}$")
-KINDS = {"asr", "mt"}
+KINDS = {"asr", "mt", "lang"}
 ENGINES = {"exemplar", "trained", "phrasebook"}
-STATUSES = {"installed", "available", "deprecated"}
+STATUSES = {"installed", "available", "manual", "deprecated"}
 
 
 def fail(errors, msg):
@@ -72,14 +73,27 @@ def main() -> int:
             fail(errors, "%s status must be one of %s" % (tag, sorted(STATUSES)))
         if not m.get("license"):
             fail(errors, "%s has no license" % tag)
+        # A hash is only meaningful for bytes we actually ship. Manual-install
+        # entries carry an empty hash on purpose: an entry that claims a hash
+        # nobody verified is worse than one that admits it has none.
         sha = m.get("sha256", "")
-        if not HEX64.match(sha):
-            fail(errors, "%s sha256 is not 64 lowercase hex characters" % tag)
+        if m.get("status") == "installed" and not HEX64.match(sha):
+            fail(errors, "%s is installed but its sha256 is not 64 lowercase hex characters" % tag)
+        if sha and not HEX64.match(sha):
+            fail(errors, "%s sha256 is malformed" % tag)
         size = m.get("size_bytes")
-        if not isinstance(size, int) or size <= 0:
-            fail(errors, "%s size_bytes must be a positive integer" % tag)
+        if not isinstance(size, int) or size < 0:
+            fail(errors, "%s size_bytes must be a non-negative integer (0 = unknown)" % tag)
+        if m.get("status") == "installed" and (not isinstance(size, int) or size <= 0):
+            fail(errors, "%s is installed but has no size" % tag)
         if m.get("status") == "available" and not m.get("url"):
             fail(errors, "%s is downloadable but has no url" % tag)
+        # A downloadable entry whose bytes we have not verified is a liability:
+        # either publish the hash, or mark the entry as a manual install.
+        if m.get("url") and not HEX64.match(sha) and m.get("status") == "available":
+            fail(errors, "%s has a url but no verified sha256" % tag)
+        if m.get("status") == "manual" and m.get("url"):
+            fail(errors, "%s is manual-install but also has a url" % tag)
         if m.get("status") == "installed" and m.get("url"):
             fail(errors, "%s is installed but also has a url" % tag)
 
@@ -91,7 +105,14 @@ def main() -> int:
         if not os.path.exists(HEADLESS):
             print("  SKIP %s not built (run `make linux`)" % HEADLESS)
             return 1 if errors else 0
-        out = subprocess.run([HEADLESS, "--models-json"], capture_output=True, text=True)
+        # Run against a throwaway data directory: the hashes must describe the
+        # built binary's models, not whatever a previous run left in the user's
+        # real profile (a stale model file there would otherwise look like drift).
+        env = dict(os.environ)
+        with tempfile.TemporaryDirectory(prefix="osai-catalog-") as tmp:
+            env["OSAI_DATA_DIR"] = tmp
+            out = subprocess.run([HEADLESS, "--models-json"], capture_output=True,
+                                 text=True, env=env)
         if out.returncode != 0:
             fail(errors, "headless host failed: %s" % (out.stderr.strip() or out.returncode))
         else:

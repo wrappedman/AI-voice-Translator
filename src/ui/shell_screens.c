@@ -5,9 +5,13 @@
  *  Each screen is a plain function that owns its own layout; the shell picks
  *  one per frame. Keeping them in a separate translation unit makes it easy to
  *  see which screen owns which state.
+ *
+ *  All application state lives in shell_state; the only module-local state is
+ *  the live microphone handle, which cannot outlive the process anyway.
  * ===================================================================== */
-#include "shell.h"
+#include "shell_internal.h"
 #include "../core/osai_platform.h"
+#include "../core/tts.h"
 #include "../platform/mic.h"
 #include <stdio.h>
 #include <stdlib.h>
@@ -21,268 +25,97 @@
 #define MINF(a,b) ((a) < (b) ? (a) : (b))
 #endif
 
-#define APP_VERSION "1.0.0"
-osa_rect shell_draw_chrome(shell_state *s, ui_context *u, osa_rect content,
-                           const char *title_key, const char *subtitle_key);
-void shell_draw_toast(shell_state *s, ui_context *u, osa_rect body);
-
 /* ---- helpers ------------------------------------------------------ */
 
-/* A tiny JSON reader good enough for the arrays the app API returns. It walks
- * the object array and hands each object's raw text to a visitor. */
-static const char *json_skip_ws(const char *p) {
-    while (*p == ' ' || *p == '\t' || *p == '\n' || *p == '\r') p++;
-    return p;
+static const char *kl(shell_state *s, const char *key) { return tt(s->lang, key); }
+
+/* mt_style_key() returns "formal"/"casual"/"neutral"; the interface strings are
+ * keyed style.<that>, so the lookup needs the prefix. */
+static const char *style_label(shell_state *s, mt_style st) {
+    char key[32];
+    snprintf(key, sizeof key, "style.%s", mt_style_key(st));
+    return kl(s, key);
 }
 
-/* Finds "key":"value" inside `obj` (bounded by `end`) and copies the unescaped
- * value into `out`. Returns false when the key is absent. */
-static bool json_str(const char *obj, const char *end, const char *key, char *out, size_t cap) {
-    size_t kl = strlen(key);
-    const char *p = obj;
-    while (p && p < end) {
-        p = (const char *)strstr(p, key);
-        if (!p || p >= end) return false;
-        /* reject matches that are not a whole key: "key" must be followed by : */
-        const char *q = json_skip_ws(p + kl);
-        if (*q != ':') { p += kl; continue; }
-        q = json_skip_ws(q + 1);
-        size_t n = 0;
-        if (*q != '"') {
-            /* bare literal: true / false / null / a number */
-            while (*q && *q != ',' && *q != '}' && *q != ']' && q < end && n + 1 < cap)
-                out[n++] = *q++;
-            while (n > 0 && (out[n - 1] == ' ' || out[n - 1] == '\n')) n--;
-            out[n] = 0;
-            return n > 0;
-        }
-        q++;
-        while (*q && *q != '"' && q < end) {
-            if (*q == '\\' && q[1]) {
-                q++;
-                char ch = *q++;
-                if (ch == 'n') ch = '\n';
-                else if (ch == 't') ch = '\t';
-                else if (ch == 'r') { ch = '\r'; }
-                else if (ch == 'u') { q += 4; ch = '?'; }
-                if (n + 1 < cap) out[n++] = ch;
-            } else {
-                if (n + 1 < cap) out[n++] = *q;
-                q++;
-            }
-        }
-        out[n] = 0;
-        return true;
-    }
-    return false;
+static const char *lt(shell_state *s) { return s->lang == UI_FA ? "fa" : "en"; }
+
+/* Localises a number string for display: Persian digits in the Persian UI. */
+static void num_fa(shell_state *s, const char *in, char *out, size_t cap) {
+    text_localize_digits(in, lt(s), out, cap);
 }
 
-static bool json_num(const char *obj, const char *end, const char *key, double *out) {
-    char buf[64];
-    if (!json_str(obj, end, key, buf, sizeof buf)) {
-        /* numeric values are unquoted; retry without the quote requirement */
-        size_t kl = strlen(key);
-        const char *p = obj;
-        while (p && p < end) {
-            p = (const char *)strstr(p, key);
-            if (!p || p >= end) return false;
-            const char *q = json_skip_ws(p + kl);
-            if (*q != ':') { p += kl; continue; }
-            q = json_skip_ws(q + 1);
-            *out = atof(q);
-            return true;
-        }
-        return false;
-    }
-    *out = atof(buf);
-    return true;
-}
-
-/* Iterates the objects inside the top-level array of `json`. `visit` receives
- * the object's start and one-past-end pointers. */
-static int json_each_object(const char *json, void (*visit)(void *ud, const char *obj,
-                                                            const char *end), void *ud) {
-    if (!json) return 0;
-    const char *p = strchr(json, '[');
-    if (!p) return 0;
-    int depth = 1;
-    const char *obj_start = NULL;
-    int obj_depth = 0;
-    int n = 0;
-    for (p++; *p; p++) {
-        if (*p == '"') {                       /* skip strings so brackets inside them don't count */
-            p++;
-            while (*p && *p != '"') { if (*p == '\\' && p[1]) p++; p++; }
-            if (!*p) break;
+/* A stat tile: label above, big value below. Used by the evaluation and
+ * history summaries where a row of bare numbers otherwise reads as noise. */
+static void stat_tile(ui_context *u, osa_rect r, const char *label, const char *value,
+                      osa_color tint) {
+    c_fill_round(u->c, r, u->L.radius_sm, u->t.panel_alt);
+    c_stroke_round(u->c, r, u->L.radius_sm, 1.0f, u->t.border_soft);
+    ui_label(u, rectf(r.x + 12 * u->L.scale, r.y + 8 * u->L.scale,
+                      r.w - 24 * u->L.scale, 16 * u->L.scale),
+             label, UI_FS_TINY * u->L.scale, u->t.text_faint, u->L.rtl ? 2 : 0);
+    /* Numbers get the display size; a word ("exemplar") would overflow the tile,
+     * so it steps down a size and ellipsizes instead of bleeding out. */
+    /* A multi-byte literal is not allowed in a char comparison, so the
+     * multiplication sign is matched as a sequence. */
+    bool numeric = true;
+    for (const char *q = value; *q; q++) {
+        if ((*q >= '0' && *q <= '9') || *q == '.' || *q == '%' || *q == '-' || *q == ' ')
             continue;
-        }
-        if (*p == '[' || *p == '{') {
-            depth++;
-            if (*p == '{' && obj_depth == 0 && depth == 2) { obj_start = p; obj_depth = depth; }
-        } else if (*p == ']' || *p == '}') {
-            if (*p == '}' && obj_start && depth == obj_depth) {
-                if (visit) visit(ud, obj_start, p + 1);
-                n++;
-                obj_start = NULL;
-                obj_depth = 0;
-            }
-            depth--;
-            if (depth == 0) break;
-        }
+        if ((unsigned char)q[0] == 0xC3 && (unsigned char)q[1] == 0x97) { q++; continue; }
+        numeric = false;
+        break;
     }
-    return n;
-}
-
-/* ---- shared: stat row -------------------------------------------- */
-
-static void draw_stat_card(ui_context *u, osa_rect r, const char *label, const char *value,
-                           osa_color value_col) {
-    ui_card(u, r);
-    ui_label(u, rectf(r.x + 14 * u->L.scale, r.y + 12 * u->L.scale,
-                      r.w - 28 * u->L.scale, 16 * u->L.scale),
-             label, 10.5f * u->L.scale, u->t.text_faint, u->L.rtl ? 2 : 0);
-    ui_label(u, rectf(r.x + 14 * u->L.scale, r.y + 30 * u->L.scale,
-                      r.w - 28 * u->L.scale, 26 * u->L.scale),
-             value, 17 * u->L.scale, value_col, u->L.rtl ? 2 : 0);
+    ui_label(u, rectf(r.x + 12 * u->L.scale, r.y + (numeric ? 24 : 26) * u->L.scale,
+                      r.w - 24 * u->L.scale, 26 * u->L.scale),
+             value, (numeric ? UI_FS_H1 : UI_FS_H2) * u->L.scale, tint,
+             u->L.rtl ? 2 : 0);
 }
 
 /* ---- Live --------------------------------------------------------- */
 
-typedef struct live_state {
-    osa_mic  *mic;
-    asr_stream *stream;
-    float    *ring;
-    int       ring_n;
-    int       ring_cap;
-    char      partial[4096];
-    char      final_text[8192];
-    char      translation[8192];
-    double    started;
-} live_state;
+static struct {
+    osa_mic *mic;
+    float    ring[OSAI_SR * 30];   /* 30 s of audio, enough for a sentence-pair */
+    int64_t  n;
+    double   last_emit;
+    char     partial[1024];
+    char     final_text[4096];
+    char     translation[4096];
+} g_live;
 
-static live_state g_live;
-
-static void live_stop(shell_state *s) {
-    if (g_live.stream) {
-        asr_result r;
-        if (asr_stream_finish(g_live.stream, &r)) {
-            osa_strlcpy(g_live.final_text, r.text, sizeof g_live.final_text);
-            if (g_live.final_text[0]) {
-                osa_error err;
-                osa_app_translation mt;
-                if (osa_app_translate(s->app, g_live.final_text, NULL, &mt, &err))
-                    osa_strlcpy(g_live.translation, mt.text, sizeof g_live.translation);
-                /* persist the live transcript so it shows up in the history */
-                osa_app_transcript tr;
-                osa_app_transcribe_and_translate(s->app, NULL, &tr, &mt, &err);
-            }
-        }
-        asr_stream_free(g_live.stream);
-        g_live.stream = NULL;
-    }
-    if (g_live.mic) { osa_mic_close(g_live.mic); g_live.mic = NULL; }
-    s->live = false;
+static void live_reset(void) {
+    g_live.n = 0;
+    g_live.last_emit = 0;
+    g_live.partial[0] = 0;
+    g_live.final_text[0] = 0;
+    g_live.translation[0] = 0;
 }
 
-static void draw_live(shell_state *s, ui_context *u, osa_rect body) {
-    float pad = 20 * u->L.scale;
-    osa_rect inner = rect_inset(body, pad);
+/* Transcribes whatever is in the ring buffer. Called every ~700 ms while the
+ * user speaks, so the transcript appears as it is spoken instead of only after
+ * the stop button — which is what "live" has to mean. */
+static bool live_emit(shell_state *s) {
+    if (g_live.n < OSAI_SR / 4) return false;
+    osa_app_transcript tr;
+    osa_error err;
+    if (!osa_app_transcribe_samples(s->app, g_live.ring, g_live.n, &tr, &err)) return false;
+    if (!tr.text[0]) return false;
+    osa_strlcpy(g_live.final_text, tr.text, sizeof g_live.final_text);
+    osa_app_translation mt;
+    if (osa_app_translate(s->app, tr.text, NULL, &mt, &err))
+        osa_strlcpy(g_live.translation, mt.text, sizeof g_live.translation);
+    return true;
+}
 
-    /* hero: big record button + level ring. The ring's outer dot reaches
-     * R*1.28+4.2 below the centre, so the caption needs its own band. */
-    float hero_h = 248 * u->L.scale;
-    osa_rect hero = rectf(inner.x, inner.y, inner.w, hero_h);
-    ui_card(u, hero);
-    float cx = hero.x + hero.w * 0.5f;
-    float cy = hero.y + hero_h * 0.5f - 6 * u->L.scale;
-    float R = 52 * u->L.scale;
-
-    if (s->live) {
-        /* concentric pulse rings driven by the frame counter rather than time,
-         * so snapshots stay deterministic */
-        for (int i = 0; i < 3; i++) {
-            float t = fmodf((float)(s->frame * 0.02f) + i / 3.0f, 1.0f);
-            float rr = R * (1.0f + t * 0.75f);
-            c_stroke_round(u->c, rectf(cx - rr, cy - rr, rr * 2, rr * 2), rr,
-                           2.0f * (1.0f - t) + 0.5f, col_alpha(u->t.danger, 0.35f * (1.0f - t)));
-        }
-    }
-    c_circle(u->c, cx, cy, R, s->live ? col_alpha(u->t.danger, 0.20f) : u->t.panel_alt);
-    c_circle(u->c, cx, cy, R * 0.66f, s->live ? u->t.danger : u->t.accent);
-
-    /* level meter around the button */
-    int nseg = 28;
-    for (int i = 0; i < nseg; i++) {
-        float a = (float)i / nseg * 6.2831853f - 1.5707963f;
-        bool on = s->live && (s->live_level > (float)i / nseg);
-        float rr = R * 1.28f;
-        float x = cx + cosf(a) * rr, y = cy + sinf(a) * rr;
-        c_circle(u->c, x, y, on ? 4.2f * u->L.scale : 3.0f * u->L.scale,
-                 on ? u->t.success : col_alpha(u->t.border, 1.0f));
-    }
-    osa_rect btn = rectf(cx - R, cy - R, R * 2, R * 2);
-    if (ui_hit(u, btn) && u->in.clicked && !u->consumed_click) {
-        u->consumed_click = true;
-        if (!s->live) {
-            osa_error err;
-            if (!osa_mic_available()) {
-                shell_set_message(s, true, tt(s->lang, "msg.nomic"));
-            } else {
-                g_live.mic = osa_mic_open(16000, &err);
-                if (!g_live.mic) {
-                    shell_set_message(s, true, "%s", err.msg);
-                } else {
-                    g_live.stream = asr_stream_start(NULL, NULL, &err);
-                    g_live.final_text[0] = g_live.translation[0] = g_live.partial[0] = 0;
-                    s->live = true;
-                    shell_set_message(s, false, "%s", tt(s->lang, "live.silence"));
-                }
-            }
-        } else {
-            live_stop(s);
-            shell_set_message(s, false, "%s", tt(s->lang, "msg.ok"));
-        }
-    }
-
-    ui_label(u, rectf(hero.x + 20 * u->L.scale, hero.y + hero_h - 54 * u->L.scale,
-                      hero.w - 40 * u->L.scale, 22 * u->L.scale),
-             s->live ? tt(s->lang, "btn.stop") : tt(s->lang, "btn.start"),
-             13 * u->L.scale, s->live ? u->t.danger : u->t.text, 1);
-    char tm[128];
-    char raw[48];
-    snprintf(raw, sizeof raw, "%.1f s", s->live_time);
-    text_localize_digits(raw, s->lang == UI_FA ? "fa" : "en", tm, sizeof tm);
-    ui_label(u, rectf(hero.x + 20 * u->L.scale, hero.y + hero_h - 30 * u->L.scale,
-                      hero.w - 40 * u->L.scale, 18 * u->L.scale),
-             tm, 11 * u->L.scale, u->t.text_faint, 1);
-
-    /* text panes */
-    float top = hero.y + hero_h + 14 * u->L.scale;
-    float h = inner.y + inner.h - top;
-    float col_w = (inner.w - 14 * u->L.scale) * 0.5f;
-    osa_rect a = rectf(u->L.rtl ? inner.x + col_w + 14 * u->L.scale : inner.x, top, col_w, h);
-    osa_rect b = rectf(u->L.rtl ? inner.x : inner.x + col_w + 14 * u->L.scale, top, col_w, h);
-    const char *txt[2] = { g_live.final_text[0] ? g_live.final_text : g_live.partial,
-                           g_live.translation };
-    const char *lbl[2] = { "transcribe.source", "transcribe.result" };
-    osa_rect *pane[2] = { &a, &b };
-    for (int i = 0; i < 2; i++) {
-        ui_card(u, *pane[i]);
-        ui_label(u, rectf(pane[i]->x + 14 * u->L.scale, pane[i]->y + 12 * u->L.scale,
-                          pane[i]->w - 28 * u->L.scale, 18 * u->L.scale),
-                 tt(s->lang, lbl[i]), 11 * u->L.scale, u->t.text_dim, u->L.rtl ? 2 : 0);
-        osa_rect tr = rectf(pane[i]->x + 14 * u->L.scale, pane[i]->y + 38 * u->L.scale,
-                            pane[i]->w - 28 * u->L.scale, pane[i]->h - 52 * u->L.scale);
-        if (txt[i][0]) {
-            text_opts o = text_default_opts(15 * u->L.scale);
-            o.max_width = tr.w;
-            o.line_height = 15 * u->L.scale * 1.7f;
-            o.rtl = (i == 0);
-            text_draw_box(u->c, u->reg, 15 * u->L.scale, u->t.text, tr, txt[i], o);
-        } else {
-            ui_label(u, rectf(tr.x, tr.y, tr.w, 20 * u->L.scale), "—", 13 * u->L.scale,
-                     u->t.text_faint, 1);
-        }
+static void live_stop(shell_state *s) {
+    if (g_live.n > 0) live_emit(s);
+    if (g_live.mic) { osa_mic_close(g_live.mic); g_live.mic = NULL; }
+    s->live = false;
+    s->live_level = 0;
+    if (g_live.final_text[0]) {
+        shell_set_message(s, false, "%s", kl(s, "live.done"));
+        free(s->history_json);
+        s->history_json = osa_app_history_json(s->app, 100, NULL);
     }
 }
 
@@ -292,687 +125,1811 @@ void shell_live_tick(shell_state *s, double dt) {
     float buf[1600];
     int n = osa_mic_read(g_live.mic, buf, 1600);
     s->live_level = osa_mic_level(g_live.mic);
-    if (n > 0 && g_live.stream) {
-        asr_stream_feed(g_live.stream, buf, n);
-        const char *p = asr_stream_partial(g_live.stream);
-        if (p) osa_strlcpy(g_live.partial, p, sizeof g_live.partial);
+    if (n > 0) {
+        for (int i = 0; i < n && g_live.n < (int64_t)(sizeof g_live.ring / sizeof g_live.ring[0]); i++)
+            g_live.ring[g_live.n++] = buf[i];
+        /* the ring is fixed: once it fills, drop the oldest half so a long
+         * session keeps working instead of going silent */
+        if (g_live.n >= (int64_t)(sizeof g_live.ring / sizeof g_live.ring[0])) {
+            int64_t half = g_live.n / 2;
+            memmove(g_live.ring, g_live.ring + half,
+                    (size_t)(g_live.n - half) * sizeof(float));
+            g_live.n -= half;
+        }
+        g_live.last_emit += dt;
+        if (g_live.last_emit >= 0.7) {
+            g_live.last_emit = 0;
+            live_emit(s);
+        }
+    }
+}
+
+static void draw_live(shell_state *s, ui_context *u, osa_rect body) {
+    float pad = 22 * u->L.scale;
+    osa_rect inner = rect_inset(body, pad);
+
+    /* hero: record button + level ring + caption */
+    float hero_h = 226 * u->L.scale;
+    osa_rect hero = rectf(inner.x, inner.y, inner.w, hero_h);
+    ui_card(u, hero);
+    float cx = hero.x + hero.w * 0.5f;
+    float cy = hero.y + hero_h * 0.5f - 14 * u->L.scale;
+    float R = 46 * u->L.scale;
+    bool avail = osa_mic_available();
+
+    if (s->live) {
+        for (int i = 0; i < 3; i++) {
+            float t = fmodf((float)(s->frame) * 0.012f + i / 3.0f, 1.0f);
+            float rr = R * (1.0f + t * 0.6f);
+            c_circle_stroke(u->c, cx, cy, rr, 2.0f * (1.0f - t) + 0.5f,
+                            col_alpha(u->t.danger, 0.40f * (1.0f - t)));
+        }
+    }
+    c_circle(u->c, cx, cy, R, s->live ? col_alpha(u->t.danger, 0.16f) : u->t.panel_alt);
+
+    /* level meter: 32 radial segments, computed from the live_level field */
+    int nseg = 32;
+    for (int i = 0; i < nseg; i++) {
+        float a = (float)i / nseg * 6.2831853f;
+        bool on = s->live && s->live_level > (float)i / nseg;
+        float rr = R * 1.22f;
+        c_circle(u->c, cx + cosf(a) * rr, cy + sinf(a) * rr,
+                 on ? 3.6f * u->L.scale : 2.4f * u->L.scale,
+                 on ? u->t.success : u->t.border);
+    }
+    /* the button itself: a mic glyph drawn with shapes */
+    c_circle(u->c, cx, cy, R * 0.62f, s->live ? u->t.danger : u->t.accent);
+    {
+        float sc = u->L.scale;
+        osa_color w = u->t.on_accent;
+        c_fill_round(u->c, rectf(cx - 4 * sc, cy - 13 * sc, 8 * sc, 15 * sc), 4 * sc, w);
+        c_arc(u->c, cx, cy - 2 * sc, 9 * sc, 2.2f * sc, 0.3f, 2.84f, w);
+        c_fill(u->c, rectf(cx - 1 * sc, cy + 8 * sc, 2 * sc, 5 * sc), w);
+        c_fill(u->c, rectf(cx - 6 * sc, cy + 12 * sc, 12 * sc, 2.2f * sc), w);
+    }
+    osa_rect btn = rectf(cx - R * 0.62f, cy - R * 0.62f, R * 1.24f, R * 1.24f);
+    if (ui_hit(u, btn) && u->in.clicked && !u->consumed_click) {
+        u->consumed_click = true;
+        if (!s->live) {
+            if (!avail) {
+                shell_set_message(s, true, "%s", kl(s, "msg.nomic"));
+            } else {
+                osa_error err;
+                g_live.mic = osa_mic_open(OSAI_SR, &err);
+                if (!g_live.mic) {
+                    shell_set_message(s, true, "%s", err.msg);
+                } else {
+                    live_reset();
+                    s->live = true;
+                    s->live_time = 0;
+                    s->live_words = 0;
+                    shell_set_message(s, false, "%s", kl(s, "live.listening"));
+                }
+            }
+        } else {
+            live_stop(s);
+        }
+    }
+
+    /* Session panel (leading corner) and target-language panel (trailing):
+     * a wide card with a button in the middle and nothing else reads as a
+     * placeholder, so the two corners carry the state the user cares about. */
+    {
+        float ip = 18 * u->L.scale;
+        float panel_w = 148 * u->L.scale;
+        osa_rect sess = rectf(u->L.rtl ? hero.x + hero.w - ip - panel_w : hero.x + ip,
+                              hero.y + ip, panel_w, 62 * u->L.scale);
+        c_fill_round(u->c, sess, u->L.radius_sm, u->t.panel_alt);
+        char raw[32], loc[48];
+        int secs = (int)s->live_time;
+        snprintf(raw, sizeof raw, "%02d:%02d", secs / 60, secs % 60);
+        num_fa(s, raw, loc, sizeof loc);
+        ui_label(u, rectf(sess.x + 12 * u->L.scale, sess.y + 8 * u->L.scale,
+                          sess.w - 24 * u->L.scale, 15 * u->L.scale),
+                 kl(s, "live.session"), UI_FS_TINY * u->L.scale, u->t.text_faint,
+                 u->L.rtl ? 2 : 0);
+        ui_label(u, rectf(sess.x + 12 * u->L.scale, sess.y + 24 * u->L.scale,
+                          sess.w - 24 * u->L.scale, 26 * u->L.scale),
+                 loc, UI_FS_H1 * u->L.scale, s->live ? u->t.danger : u->t.text_dim,
+                 u->L.rtl ? 2 : 0);
+
+        osa_rect lng = rectf(u->L.rtl ? hero.x + ip : hero.x + hero.w - ip - panel_w,
+                             hero.y + ip, panel_w, 62 * u->L.scale);
+        c_fill_round(u->c, lng, u->L.radius_sm, u->t.panel_alt);
+        ui_label(u, rectf(lng.x + 12 * u->L.scale, lng.y + 8 * u->L.scale,
+                          lng.w - 24 * u->L.scale, 15 * u->L.scale),
+                 kl(s, "live.targetlang"), UI_FS_TINY * u->L.scale, u->t.text_faint,
+                 u->L.rtl ? 2 : 0);
+        ui_label(u, rectf(lng.x + 12 * u->L.scale, lng.y + 24 * u->L.scale,
+                          lng.w - 24 * u->L.scale, 26 * u->L.scale),
+                 s->lang_dst[0] ? shell_lang_name(s, s->lang_dst) : kl(s, "lang.auto"),
+                 UI_FS_H2 * u->L.scale, u->t.text, u->L.rtl ? 2 : 0);
+    }
+
+    ui_label(u, rectf(hero.x + 20 * u->L.scale, hero.y + hero_h - 52 * u->L.scale,
+                      hero.w - 40 * u->L.scale, 22 * u->L.scale),
+             s->live ? kl(s, "live.stop") : kl(s, "live.start"),
+             UI_FS_H2 * u->L.scale, s->live ? u->t.danger : u->t.text, 1);
+    char raw[64], loc[96];
+    if (s->live) {
+        int secs = (int)s->live_time;
+        snprintf(raw, sizeof raw, "%02d:%02d", secs / 60, secs % 60);
+    } else if (!avail) {
+        snprintf(raw, sizeof raw, "%s", kl(s, "msg.nomic"));
+    } else {
+        snprintf(raw, sizeof raw, "%s", kl(s, "live.hint"));
+    }
+    num_fa(s, raw, loc, sizeof loc);
+    ui_label(u, rectf(hero.x + 20 * u->L.scale, hero.y + hero_h - 28 * u->L.scale,
+                      hero.w - 40 * u->L.scale, 18 * u->L.scale),
+             loc, UI_FS_SMALL * u->L.scale, u->t.text_faint, 1);
+
+    /* text panes: recognised speech on the leading side, translation trailing */
+    float top = hero.y + hero_h + 14 * u->L.scale;
+    float h = inner.y + inner.h - top - 4 * u->L.scale;
+    if (h < 90 * u->L.scale) h = 90 * u->L.scale;
+    float col_w = (inner.w - 14 * u->L.scale) * 0.5f;
+    osa_rect a = rectf(u->L.rtl ? inner.x + col_w + 14 * u->L.scale : inner.x, top,
+                       col_w, h);
+    osa_rect b = rectf(u->L.rtl ? inner.x : inner.x + col_w + 14 * u->L.scale, top,
+                       col_w, h);
+    const char *txt[2] = { g_live.final_text, g_live.translation };
+    const char *lbl[2] = { "live.recognized", "live.translated" };
+    osa_rect *pane[2] = { &a, &b };
+    for (int i = 0; i < 2; i++) {
+        ui_card(u, *pane[i]);
+        float p = 16 * u->L.scale;
+        c_fill_round(u->c, rectf(pane[i]->x + p, pane[i]->y + 14 * u->L.scale,
+                                 3 * u->L.scale, 16 * u->L.scale),
+                     1.5f * u->L.scale, i == 0 ? u->t.accent : u->t.accent2);
+        ui_label(u, rectf(pane[i]->x + p + 10 * u->L.scale, pane[i]->y + 12 * u->L.scale,
+                          pane[i]->w - p * 2 - 10 * u->L.scale, 20 * u->L.scale),
+                 kl(s, lbl[i]), UI_FS_SMALL * u->L.scale, u->t.text_dim, u->L.rtl ? 2 : 0);
+        c_hline(u->c, pane[i]->x + p, pane[i]->x + pane[i]->w - p,
+                pane[i]->y + 40 * u->L.scale, 1, u->t.border_soft);
+        osa_rect tr = rectf(pane[i]->x + p, pane[i]->y + 52 * u->L.scale,
+                            pane[i]->w - p * 2, pane[i]->h - 68 * u->L.scale);
+        if (txt[i][0]) {
+            text_opts o = text_default_opts(UI_FS_H2 * u->L.scale);
+            o.max_width = tr.w;
+            o.line_height = UI_FS_H2 * u->L.scale * 1.85f;
+            o.align = u->L.rtl ? 2 : 0;
+            text_draw_box(u->c, u->reg, UI_FS_H2 * u->L.scale, u->t.text, tr, txt[i], o);
+        } else {
+            /* The two panes must not say the same thing twice: the source pane
+             * explains how to start, the translation pane waits for it. */
+            const char *head = s->live ? kl(s, "live.listening")
+                             : i == 0 ? kl(s, "live.empty")
+                                      : kl(s, "live.emptyout");
+            const char *hint = s->live ? (i == 0 ? kl(s, "live.speaking")
+                                                : kl(s, "live.waiting"))
+                             : i == 0 ? kl(s, "live.emptyhint") : NULL;
+            ui_label(u, rectf(tr.x, tr.y + tr.h * 0.34f, tr.w, 22 * u->L.scale), head,
+                     UI_FS_BODY * u->L.scale, u->t.text_faint, 1);
+            if (hint) {
+                text_opts ho = text_default_opts(UI_FS_SMALL * u->L.scale);
+                ho.max_width = tr.w * 0.8f;
+                ho.align = 1;
+                ho.max_lines = 2;
+                text_draw_box(u->c, u->reg, UI_FS_SMALL * u->L.scale, u->t.text_faint,
+                              rectf(tr.x + tr.w * 0.1f, tr.y + tr.h * 0.34f + 26 * u->L.scale,
+                                    tr.w * 0.8f, 40 * u->L.scale),
+                              hint, ho);
+            }
+        }
     }
 }
 
 /* ---- Translate ---------------------------------------------------- */
 
-static char g_tr_in[4096] = "سلام، حال شما خوب است؟";
-static char g_tr_out[4096];
-static char g_tr_lang[8] = "fa";
-static double g_tr_score;
+static void lang_picker(shell_state *s, ui_context *u, osa_rect r, int id,
+                        const char *caption, const char *value, bool open);
+
+/* One language selector. Rendered like the header of the web translators the
+ * screen is modelled on: a small caption inside the control, the language in
+ * bold under it, a chevron on the trailing edge. */
+static void lang_picker(shell_state *s, ui_context *u, osa_rect r, int id,
+                        const char *caption, const char *value, bool open) {
+    bool hov = ui_hit(u, r);
+    c_fill_round(u->c, r, u->L.radius_sm, hov || open ? u->t.panel_hover : u->t.panel_alt);
+    c_stroke_round(u->c, r, u->L.radius_sm, open ? 1.6f : 1.0f,
+                   open ? u->t.accent : (hov ? u->t.border_strong : u->t.border));
+    float p = 14 * u->L.scale;
+    ui_label(u, rectf(r.x + p, r.y + 8 * u->L.scale, r.w - p * 2 - 20 * u->L.scale,
+                      14 * u->L.scale),
+             caption, UI_FS_TINY * u->L.scale, u->t.text_faint, u->L.rtl ? 2 : 0);
+    ui_label(u, rectf(r.x + p, r.y + 23 * u->L.scale, r.w - p * 2 - 20 * u->L.scale,
+                      22 * u->L.scale),
+             value, UI_FS_H2 * u->L.scale, u->t.text, u->L.rtl ? 2 : 0);
+    osa_rect ar = rectf(u->L.rtl ? r.x + 4 * u->L.scale : r.x + r.w - 22 * u->L.scale,
+                        r.y, 18 * u->L.scale, r.h);
+    ui_dropdown_arrow(u, ar);
+    if (hov && u->in.clicked && !u->consumed_click) {
+        u->consumed_click = true;
+        u->popup_id = open ? 0 : id;
+        u->popup_rect = r;
+    }
+}
+
+static void fill_lang_items(ui_context *u, bool allow_auto) {
+    int i = 0;
+    if (allow_auto) osa_strlcpy(u->popup_items[i++], "تشخیص خودکار / Detect",
+                                sizeof u->popup_items[0]);
+    osa_strlcpy(u->popup_items[i++], "فارسی", sizeof u->popup_items[0]);
+    osa_strlcpy(u->popup_items[i++], "English", sizeof u->popup_items[0]);
+    u->popup_n = i;
+}
+
+static void draw_lang_bar(shell_state *s, ui_context *u, osa_rect r) {
+    float h = 54 * u->L.scale;
+    float arrow_w = 36 * u->L.scale;
+    float w = (r.w - arrow_w - 20 * u->L.scale) * 0.5f;
+    osa_rect src_r = rectf(u->L.rtl ? r.x + w + arrow_w + 20 * u->L.scale : r.x, r.y, w, h);
+    osa_rect dst_r = rectf(u->L.rtl ? r.x : r.x + w + arrow_w + 20 * u->L.scale, r.y, w, h);
+    osa_rect arrow = rectf(r.x + w + 10 * u->L.scale, r.y + (h - arrow_w) * 0.5f,
+                           arrow_w, arrow_w);
+
+    lang_picker(s, u, src_r, 3100, kl(s, "lang.from"),
+                s->lang_src[0] ? shell_lang_name(s, s->lang_src) : kl(s, "lang.auto"),
+                u->popup_id == 3100);
+    if (u->popup_id == 3100 && u->popup_n == 0) {
+        fill_lang_items(u, true);
+        u->popup_sel = s->lang_src[0] ? (osa_starts(s->lang_src, "en") ? 2 : 1) : 0;
+    }
+    lang_picker(s, u, dst_r, 3101, kl(s, "lang.to"),
+                s->lang_dst[0] ? shell_lang_name(s, s->lang_dst) : kl(s, "lang.auto"),
+                u->popup_id == 3101);
+    if (u->popup_id == 3101 && u->popup_n == 0) {
+        fill_lang_items(u, false);
+        u->popup_sel = osa_starts(s->lang_dst, "fa") ? 0 : 1;
+    }
+
+    /* swap button */
+    bool hov = ui_hit(u, arrow);
+    c_fill_round(u->c, arrow, arrow_w * 0.5f, u->t.accent_soft);
+    c_stroke_round(u->c, arrow, arrow_w * 0.5f, 1.0f,
+                   col_alpha(u->t.accent, hov ? 0.8f : 0.4f));
+    {
+        float ax = arrow.x + arrow.w * 0.5f, ay = arrow.y + arrow.h * 0.5f;
+        osa_color c1 = u->t.accent;
+        c_fill(u->c, rectf(ax - 8 * u->L.scale, ay - 4.0f * u->L.scale,
+                           14 * u->L.scale, 1.8f * u->L.scale), c1);
+        c_line(u->c, ax + 2 * u->L.scale, ay - 6.5f * u->L.scale,
+               ax + 7 * u->L.scale, ay - 3.1f * u->L.scale, 1.8f * u->L.scale, c1);
+        c_line(u->c, ax + 7 * u->L.scale, ay - 3.1f * u->L.scale,
+               ax + 2 * u->L.scale, ay + 0.3f * u->L.scale, 1.8f * u->L.scale, c1);
+        c_fill(u->c, rectf(ax - 6 * u->L.scale, ay + 3.0f * u->L.scale,
+                           14 * u->L.scale, 1.8f * u->L.scale), c1);
+        c_line(u->c, ax - 2 * u->L.scale, ay + 6.5f * u->L.scale,
+               ax - 7 * u->L.scale, ay + 3.1f * u->L.scale, 1.8f * u->L.scale, c1);
+        c_line(u->c, ax - 7 * u->L.scale, ay + 3.1f * u->L.scale,
+               ax - 2 * u->L.scale, ay - 0.3f * u->L.scale, 1.8f * u->L.scale, c1);
+    }
+    if (hov && u->in.clicked && !u->consumed_click) {
+        u->consumed_click = true;
+        char tmp[8];
+        osa_strlcpy(tmp, s->lang_src, sizeof tmp);
+        osa_strlcpy(s->lang_src, s->lang_dst, sizeof s->lang_src);
+        osa_strlcpy(s->lang_dst, tmp, sizeof s->lang_dst);
+        if (!s->lang_src[0]) osa_strlcpy(s->lang_src, "fa", sizeof s->lang_src);
+        osa_app_set_languages(s->app, s->lang_src, s->lang_dst, NULL);
+        shell_save_prefs(s);
+        shell_run_translate(s);
+    }
+
+    /* second row: register on the leading side, آوانویسی switch on the trailing.
+     * The two share the row, so the picker is sized against the switch group
+     * rather than as a fixed share of the window — at 42% of an 1160-pixel row
+     * it reached the switch and the label landed on top of it. */
+    float ry = r.y + h + 10 * u->L.scale;
+    const char *plabel0 = kl(s, "lang.phonetic");
+    float lw0 = text_measure(u->reg, UI_FS_SMALL * u->L.scale, plabel0);
+    float tg_gap = 10 * u->L.scale;
+    float tg_w = lw0 + 40 * u->L.scale + tg_gap;
+    float st_w = r.w * 0.42f;
+    if (st_w > r.w - tg_w - 32 * u->L.scale) st_w = r.w - tg_w - 32 * u->L.scale;
+    if (st_w < 180 * u->L.scale) st_w = 180 * u->L.scale;
+    /* In RTL the picker also reads from the trailing edge, so it has to stop
+     * short of the switch group instead of starting at the window edge — the
+     * two occupied the same pixels. */
+    osa_rect st_r = rectf(u->L.rtl ? r.x + r.w - tg_w - 12 * u->L.scale - st_w
+                                   : r.x,
+                          ry, st_w, 34 * u->L.scale);
+    char reg[128];
+    snprintf(reg, sizeof reg, "%s: %s", kl(s, "lang.register"), style_label(s, s->style));
+    bool st_open = u->popup_id == 3102;
+    if (ui_dropdown(u, 3102, st_r, reg, st_open)) {
+        u->popup_id = st_open ? 0 : 3102;
+        u->popup_rect = st_r;
+        u->popup_n = MT_STYLE_COUNT;
+        for (int i = 0; i < MT_STYLE_COUNT; i++)
+            osa_strlcpy(u->popup_items[i], style_label(s, (mt_style)i),
+                        sizeof u->popup_items[0]);
+        u->popup_sel = (int)s->style;
+    }
+
+    /* آوانویسی toggle: label immediately left of its switch, on the trailing
+     * edge. It used to be placed from the *leading* edge in RTL, which put the
+     * label at the far side of the window from the control it describes. */
+    float sw = 40 * u->L.scale, sh = 22 * u->L.scale;
+    const char *plabel = plabel0;
+    float lw = lw0;
+    /* RTL: label on the right of the group, switch to its left (reading order
+     * right→left). LTR: the mirror image. */
+    float gx = r.x + r.w - tg_w;
+    float tx = u->L.rtl ? gx + sw + tg_gap : gx;
+    float knob_x = u->L.rtl ? gx : gx + lw + tg_gap;
+    ui_label(u, rectf(tx, ry, lw, 34 * u->L.scale), plabel,
+             UI_FS_SMALL * u->L.scale, u->t.text_dim, u->L.rtl ? 2 : 0);
+    osa_rect knob = rectf(knob_x, ry + (34 * u->L.scale - sh) * 0.5f, sw, sh);
+    if (ui_toggle_switch(u, 3103, knob, &s->show_phonetic)) {
+        shell_save_prefs(s);
+        shell_run_translate(s);
+    }
+}
 
 static void draw_translate(shell_state *s, ui_context *u, osa_rect body) {
-    float pad = 20 * u->L.scale;
+    float pad = 22 * u->L.scale;
     osa_rect inner = rect_inset(body, pad);
-    float col_gap = 14 * u->L.scale;
-    float top_h = inner.h * 0.5f - col_gap * 0.5f;
-    float col_w = (inner.w - col_gap) * 0.5f;
+    float toolbar_h = 98 * u->L.scale;
 
-    osa_rect in_r = rectf(u->L.rtl ? inner.x + col_w + col_gap : inner.x, inner.y, col_w, top_h);
-    osa_rect out_r = rectf(u->L.rtl ? inner.x : inner.x + col_w + col_gap, inner.y, col_w, top_h);
+    draw_lang_bar(s, u, rectf(inner.x, inner.y, inner.w, toolbar_h));
 
+    float top = inner.y + toolbar_h + 6 * u->L.scale;
+    float total = inner.y + inner.h - top;
+    float gap = 12 * u->L.scale;
+    /* The input gets the larger share: it is the part with a cursor in it and
+     * the part that grows when someone pastes a paragraph. On a tall window,
+     * though, a text box four hundred pixels tall is a blank wall — both panes
+     * stop growing at a readable size and the pair sits centred instead of
+     * stretched to the floor. */
+    float pair_max = 560 * u->L.scale;
+    if (total > pair_max) {
+        top += (total - pair_max) * 0.35f;
+        total = pair_max;
+    }
+    float in_h = total * 0.56f;
+    osa_rect in_r = rectf(inner.x, top, inner.w, in_h);
+    osa_rect out_r = rectf(inner.x, top + in_h + gap, inner.w, total - in_h - gap);
+
+    /* ---------- input ---------- */
     ui_card(u, in_r);
-    ui_label(u, rectf(in_r.x + 14 * u->L.scale, in_r.y + 12 * u->L.scale,
-                      in_r.w - 28 * u->L.scale, 18 * u->L.scale),
-             tt(s->lang, "translate.input"), 11 * u->L.scale, u->t.text_dim, u->L.rtl ? 2 : 0);
-    osa_rect edit = rectf(in_r.x + 14 * u->L.scale, in_r.y + 38 * u->L.scale,
-                          in_r.w - 28 * u->L.scale, in_r.h - 100 * u->L.scale);
-    c_fill_round(u->c, edit, 8 * u->L.scale, u->t.panel_alt);
-    if (ui_text_area(u, 3000, edit, g_tr_in, sizeof g_tr_in, 73)) {
-        osa_error err;
-        osa_app_translation mt;
-        if (osa_app_translate(s->app, g_tr_in, NULL, &mt, &err)) {
-            osa_strlcpy(g_tr_out, mt.text, sizeof g_tr_out);
-            osa_strlcpy(g_tr_lang, mt.target_lang, sizeof g_tr_lang);
-            g_tr_score = mt.confidence;
-        }
+    float p = 16 * u->L.scale;
+    c_fill_round(u->c, rectf(in_r.x + p, in_r.y + 15 * u->L.scale, 3 * u->L.scale,
+                             15 * u->L.scale), 1.5f * u->L.scale, u->t.accent);
+    ui_label(u, rectf(in_r.x + p + 10 * u->L.scale, in_r.y + 13 * u->L.scale,
+                      in_r.w - p * 2 - 160 * u->L.scale, 20 * u->L.scale),
+             kl(s, "translate.input"), UI_FS_SMALL * u->L.scale, u->t.text_dim,
+             u->L.rtl ? 2 : 0);
+    {
+        char raw[64], loc[80];
+        snprintf(raw, sizeof raw, "%d %s", (int)strlen(s->tr_in), kl(s, "translate.chars"));
+        num_fa(s, raw, loc, sizeof loc);
+        ui_label(u, rectf(in_r.x + p, in_r.y + 13 * u->L.scale,
+                          in_r.w - p * 2 - 10 * u->L.scale, 20 * u->L.scale),
+                 loc, UI_FS_TINY * u->L.scale, u->t.text_faint, u->L.rtl ? 0 : 2);
     }
-    /* action row */
-    float by = in_r.y + in_r.h - 46 * u->L.scale;
-    if (ui_button(u, 3010, rectf(in_r.x + 14 * u->L.scale, by, 110 * u->L.scale,
-                                 32 * u->L.scale), tt(s->lang, "btn.run"), true)) {
-        osa_error err;
-        osa_app_translation mt;
-        if (osa_app_translate(s->app, g_tr_in, NULL, &mt, &err)) {
-            osa_strlcpy(g_tr_out, mt.text, sizeof g_tr_out);
-            osa_strlcpy(g_tr_lang, mt.target_lang, sizeof g_tr_lang);
-            g_tr_score = mt.confidence;
-        } else {
-            shell_set_message(s, true, "%s", err.msg);
-        }
-    }
-    if (ui_button(u, 3011, rectf(in_r.x + 132 * u->L.scale, by, 100 * u->L.scale,
-                                 32 * u->L.scale), tt(s->lang, "btn.copy"), false))
-        osa_clipboard_set(g_tr_in);
+    c_hline(u->c, in_r.x + p, in_r.x + in_r.w - p, in_r.y + 42 * u->L.scale, 1,
+            u->t.border_soft);
 
+    float btn_h = 36 * u->L.scale;
+    osa_rect area = rectf(in_r.x + p, in_r.y + 50 * u->L.scale, in_r.w - p * 2,
+                          in_r.h - 50 * u->L.scale - btn_h - 24 * u->L.scale);
+    ui_field_hint(kl(s, "translate.placeholder"));
+    bool changed = ui_text_area(u, 3200, area, s->tr_in, sizeof s->tr_in, 3800);
+    if (changed) shell_run_translate(s);
+
+    float bw = 138 * u->L.scale;
+    float by = in_r.y + in_r.h - btn_h - 14 * u->L.scale;
+    osa_rect run_r = rectf(u->L.rtl ? in_r.x + p : in_r.x + in_r.w - p - bw, by, bw, btn_h);
+    if (ui_button(u, 3201, run_r, kl(s, "btn.translate"), true)) shell_run_translate(s);
+    osa_rect clr_r = rectf(u->L.rtl ? in_r.x + p + bw + 8 * u->L.scale
+                                    : in_r.x + in_r.w - p - bw * 2 - 8 * u->L.scale,
+                           by, bw, btn_h);
+    if (ui_button_ghost(u, 3202, clr_r, kl(s, "btn.clear"))) {
+        s->tr_in[0] = 0;
+        s->tr_out[0] = 0;
+        s->tr_phonetic[0] = 0;
+        u->focus_id = 3200;
+    }
+
+    /* ---------- output ---------- */
     ui_card(u, out_r);
-    ui_label(u, rectf(out_r.x + 14 * u->L.scale, out_r.y + 12 * u->L.scale,
-                      out_r.w - 28 * u->L.scale, 18 * u->L.scale),
-             tt(s->lang, "translate.output"), 11 * u->L.scale, u->t.text_dim, u->L.rtl ? 2 : 0);
-    osa_rect orr = rectf(out_r.x + 14 * u->L.scale, out_r.y + 38 * u->L.scale,
-                         out_r.w - 28 * u->L.scale, out_r.h - 62 * u->L.scale);
-    c_fill_round(u->c, orr, 8 * u->L.scale, col_alpha(u->t.accent, 0.06f));
-    if (g_tr_out[0]) {
-        text_opts o = text_default_opts(16 * u->L.scale);
-        o.max_width = orr.w - 24 * u->L.scale;
-        o.line_height = 16 * u->L.scale * 1.7f;
-        o.rtl = osa_starts(g_tr_lang, "fa");
-        text_draw_box(u->c, u->reg, 16 * u->L.scale, u->t.text,
-                      rect_inset(orr, 12 * u->L.scale), g_tr_out, o);
-        char meta[96], loc[128];
-        snprintf(meta, sizeof meta, "%s · %.0f%%", osa_starts(g_tr_lang, "fa") ? "فارسی" : "English",
-                 g_tr_score * 100.0);
-        text_localize_digits(meta, s->lang == UI_FA ? "fa" : "en", loc, sizeof loc);
-        ui_label(u, rectf(out_r.x + 14 * u->L.scale, out_r.y + out_r.h - 22 * u->L.scale,
-                          out_r.w - 28 * u->L.scale, 16 * u->L.scale),
-                 loc, 10 * u->L.scale, u->t.text_faint, u->L.rtl ? 2 : 0);
+    c_fill_round(u->c, rectf(out_r.x + p, out_r.y + 15 * u->L.scale, 3 * u->L.scale,
+                             15 * u->L.scale), 1.5f * u->L.scale, u->t.accent2);
+    ui_label(u, rectf(out_r.x + p + 10 * u->L.scale, out_r.y + 13 * u->L.scale,
+                      out_r.w - p * 2 - 190 * u->L.scale, 20 * u->L.scale),
+             kl(s, "translate.output"), UI_FS_SMALL * u->L.scale, u->t.text_dim,
+             u->L.rtl ? 2 : 0);
+    if (s->tr_out[0]) {
+        float ow = 60 * u->L.scale;
+        osa_rect copy_r = rectf(u->L.rtl ? out_r.x + p : out_r.x + out_r.w - p - ow,
+                                out_r.y + 9 * u->L.scale, ow, 28 * u->L.scale);
+        if (ui_button_ghost(u, 3203, copy_r, kl(s, "btn.copy"))) {
+            osa_clipboard_set(s->tr_out);
+            shell_set_message(s, false, "%s", kl(s, "msg.copied"));
+        }
+        osa_rect say_r = rectf(u->L.rtl ? out_r.x + p + ow + 6 * u->L.scale
+                                        : out_r.x + out_r.w - p - ow * 2 - 6 * u->L.scale,
+                               out_r.y + 9 * u->L.scale, ow, 28 * u->L.scale);
+        if (ui_button_ghost(u, 3204, say_r, kl(s, "btn.listen"))) {
+            const char *txt = s->tr_out;
+            const char *lng = s->tr_out_lang[0] ? s->tr_out_lang : "en";
+            shell_speak(s, txt, lng);
+        }
     }
-    if (ui_button(u, 3012, rectf(out_r.x + 14 * u->L.scale, out_r.y + out_r.h - 46 * u->L.scale,
-                                 100 * u->L.scale, 32 * u->L.scale),
-                  tt(s->lang, "btn.copy"), false))
-        osa_clipboard_set(g_tr_out);
+    c_hline(u->c, out_r.x + p, out_r.x + out_r.w - p, out_r.y + 42 * u->L.scale, 1,
+            u->t.border_soft);
 
-    /* bottom: phrasebook coverage note */
-    osa_rect note = rectf(inner.x, inner.y + top_h + col_gap * 2, inner.w,
-                          inner.h - top_h - col_gap * 2);
-    if (note.h > 60 * u->L.scale) {
-        ui_card(u, note);
-        ui_label(u, rectf(note.x + 16 * u->L.scale, note.y + 14 * u->L.scale,
-                          note.w - 32 * u->L.scale, 20 * u->L.scale),
-                 tt(s->lang, "translate.note"), 11.5f * u->L.scale, u->t.text_dim,
-                 u->L.rtl ? 2 : 0);
-        ui_label(u, rectf(note.x + 16 * u->L.scale, note.y + 36 * u->L.scale,
-                          note.w - 32 * u->L.scale, 18 * u->L.scale),
-                 tt(s->lang, "about.note"), 10.5f * u->L.scale, u->t.text_faint,
+    bool ph = s->show_phonetic && s->tr_phonetic[0];
+    float ph_h = ph ? 52 * u->L.scale : 0;
+    osa_rect tr = rectf(out_r.x + p, out_r.y + 52 * u->L.scale, out_r.w - p * 2,
+                        out_r.h - 64 * u->L.scale - ph_h);
+    if (tr.h < 24) tr.h = 24;
+    if (s->tr_out[0]) {
+        text_opts o = text_default_opts(UI_FS_H2 * u->L.scale);
+        o.max_width = tr.w;
+        o.line_height = UI_FS_H2 * u->L.scale * 1.9f;
+        /* The gutter follows the interface, not the text: a Latin translation in
+         * the Persian UI still starts at the right edge, the way every other
+         * block on the screen does. */
+        o.rtl = text_is_rtl(s->tr_out);
+        o.align = u->L.rtl ? 2 : 0;
+        text_draw_box(u->c, u->reg, UI_FS_H2 * u->L.scale, u->t.text, tr, s->tr_out, o);
+    } else {
+        ui_label(u, rectf(tr.x, tr.y + 4 * u->L.scale, tr.w, 22 * u->L.scale),
+                 kl(s, "translate.empty"), UI_FS_BODY * u->L.scale, u->t.text_faint,
                  u->L.rtl ? 2 : 0);
     }
+    if (ph) {
+        osa_rect pr = rectf(out_r.x + p, out_r.y + out_r.h - ph_h - 4 * u->L.scale,
+                            out_r.w - p * 2, ph_h - 8 * u->L.scale);
+        c_fill_round(u->c, pr, u->L.radius_sm, u->t.accent2_soft);
+        ui_label(u, rectf(pr.x + 12 * u->L.scale, pr.y + 3 * u->L.scale,
+                          pr.w - 24 * u->L.scale, 15 * u->L.scale),
+                 kl(s, "transcribe.phonetic"), UI_FS_TINY * u->L.scale,
+                 col_alpha(u->t.accent2, 0.95f), u->L.rtl ? 2 : 0);
+        text_opts po = text_default_opts(UI_FS_BODY * u->L.scale);
+        po.max_width = pr.w - 24 * u->L.scale;
+        po.rtl = true;
+        po.align = 2;
+        text_draw_box(u->c, u->reg, UI_FS_BODY * u->L.scale, u->t.text,
+                      rectf(pr.x + 12 * u->L.scale, pr.y + 18 * u->L.scale,
+                            pr.w - 24 * u->L.scale, 24 * u->L.scale),
+                      s->tr_phonetic, po);
+    }
+
 }
 
 /* ---- History ------------------------------------------------------ */
 
-typedef struct hist_rows {
-    char text[200][256];
-    char lang[200][8];
-    char when[200][32];
-    char id[200][40];
-    char audio[200][OSAI_MAX_PATH];
-    double conf[200];
-    double dur[200];
-    int n;
-} hist_rows;
-
-static void hist_visit(void *ud, const char *o, const char *e) {
-    hist_rows *h = (hist_rows *)ud;
-    if (h->n >= 200) return;
-    int i = h->n;
-    if (!json_str(o, e, "\"text\"", h->text[i], sizeof h->text[i])) h->text[i][0] = 0;
-    if (!json_str(o, e, "\"language\"", h->lang[i], sizeof h->lang[i])) h->lang[i][0] = 0;
-    if (!json_str(o, e, "\"created_at\"", h->when[i], sizeof h->when[i])) h->when[i][0] = 0;
-    if (!json_str(o, e, "\"id\"", h->id[i], sizeof h->id[i])) h->id[i][0] = 0;
-    if (!json_str(o, e, "\"audio\"", h->audio[i], sizeof h->audio[i])) h->audio[i][0] = 0;
-    json_num(o, e, "\"confidence\"", &h->conf[i]);
-    json_num(o, e, "\"duration_ms\"", &h->dur[i]);
-    h->n++;
-}
-
-/* Short form of a stored ISO timestamp for list rows: "11-07 13:29".
- * A full "2026-11-07 13:29:43" does not fit in a 62 px row. Anything that does
- * not look like an ISO timestamp is copied through unchanged. */
-static void ui_fmt_when(const char *iso, char *out, size_t cap) {
-    size_t n = iso ? strlen(iso) : 0;
-    if (n >= 16 && iso[4] == '-' && iso[7] == '-' && (iso[10] == ' ' || iso[10] == 'T'))
-        snprintf(out, cap, "%.5s %.5s", iso + 5, iso + 11);
-    else
-        snprintf(out, cap, "%s", iso ? iso : "");
-}
-
 static void draw_history(shell_state *s, ui_context *u, osa_rect body) {
-    float pad = 20 * u->L.scale;
+    float pad = 22 * u->L.scale;
     osa_rect inner = rect_inset(body, pad);
     if (!s->history_json) s->history_json = osa_app_history_json(s->app, 100, NULL);
 
-    static hist_rows hr;
-    memset(&hr, 0, sizeof hr);
-    json_each_object(s->history_json, hist_visit, &hr);
+    /* summary strip */
+    osa_app_status st;
+    osa_app_get_status(s->app, &st);
+    float tile_h = 62 * u->L.scale;
+    float gap = 10 * u->L.scale;
+    float tw = (inner.w - gap * 3) / 4;
+    /* Four tiles, laid out from the leading edge so RTL mirrors the row. */
+    char vloc[96];
+    const char *labels[4] = { "history.total", "history.translated", "history.models",
+                              "history.engine" };
+    char values[4][64];
+    osa_color tints[4] = { u->t.accent, u->t.accent2, u->t.success, u->t.warning };
+    snprintf(values[0], sizeof values[0], "%d", st.n_transcripts);
+    snprintf(values[1], sizeof values[1], "%d", st.n_translations);
+    snprintf(values[2], sizeof values[2], "%d", st.n_models);
+    snprintf(values[3], sizeof values[3], "%s", st.asr_backend[0] ? st.asr_backend : "—");
+    for (int i = 0; i < 4; i++) {
+        int slot = u->L.rtl ? (3 - i) : i;
+        osa_rect tr = rectf(inner.x + (tw + gap) * i, inner.y, tw, tile_h);
+        /* Persian digits for the counts; the engine name is prose and passes
+         * through untouched. */
+        num_fa(s, values[slot], vloc, sizeof vloc);
+        stat_tile(u, tr, kl(s, labels[slot]), vloc, tints[slot]);
+    }
 
-    bool wide = u->L.win_w > 1100 * u->L.scale;
-    float list_w = wide ? inner.w * 0.58f : inner.w;
-    osa_rect list = rectf(inner.x, inner.y, list_w, inner.h);
+    float top = inner.y + tile_h + 14 * u->L.scale;
+    osa_rect list = rectf(inner.x, top, inner.w, inner.y + inner.h - top);
     ui_card(u, list);
-    if (hr.n == 0) {
-        ui_label(u, rect_inset(list, 24 * u->L.scale), tt(s->lang, "history.empty"),
-                 13 * u->L.scale, u->t.text_faint, 1);
+
+    /* One pass over the array, then draw from the parsed rows. Parsing and
+     * drawing are separate so the scroll offset and the visible window are
+     * decided once, not per row. */
+    hist_row *H = g_hist_rows;
+    shell_parse_history(s->history_json);
+    if (g_hist_n <= 0) {
+        ui_label(u, list, kl(s, "history.empty"), UI_FS_BODY * u->L.scale,
+                 u->t.text_faint, 1);
         return;
     }
-    float row_h = 62 * u->L.scale;
-    float y = list.y + 10 * u->L.scale + s->history_scroll * row_h;
-    for (int i = 0; i < hr.n; i++) {
-        osa_rect row = rectf(list.x + 8 * u->L.scale, y, list.w - 16 * u->L.scale, row_h - 4);
-        if (row.y + row.h > list.y + list.h) break;
-        if (row.y + row.h < list.y) { y += row_h; continue; }
-        if (ui_row(u, 4200 + i, row, s->history_sel == i)) {
-            s->history_sel = i;
-            osa_strlcpy(s->audio_path, hr.audio[i], sizeof s->audio_path);
-            osa_strlcpy(s->transcript, hr.text[i], sizeof s->transcript);
-            osa_strlcpy(s->detected_lang, hr.lang[i], sizeof s->detected_lang);
-            s->transcript_conf = (float)hr.conf[i];
-            s->transcript_dur = hr.dur[i] / 1000.0;
-            snprintf(s->translation, sizeof s->translation, "%s",
-                     osa_app_translate_preview(s->app, hr.text[i]));
-            shell_load_waveform(s, s->audio_path);
-        }
-        osa_rect tr = rectf(row.x + 12 * u->L.scale, row.y + 9 * u->L.scale,
-                            row.w - 24 * u->L.scale, 20 * u->L.scale);
-        ui_label(u, tr, hr.text[i], 12.5f * u->L.scale, u->t.text, u->L.rtl ? 2 : 0);
-        char meta[128], loc[160];
-        char durs[32];
-        char when[32];
-        ui_fmt_duration(hr.dur[i] / 1000.0, durs, sizeof durs);
-        ui_fmt_when(hr.when[i], when, sizeof when);
-        snprintf(meta, sizeof meta, "%s · %s · %.0f%%", when, durs, hr.conf[i] * 100.0);
-        text_localize_digits(meta, s->lang == UI_FA ? "fa" : "en", loc, sizeof loc);
-        ui_label(u, rectf(row.x + 12 * u->L.scale, row.y + 31 * u->L.scale,
-                          row.w - 24 * u->L.scale, 18 * u->L.scale),
-                 loc, 10 * u->L.scale, u->t.text_faint, u->L.rtl ? 2 : 0);
-        y += row_h;
-    }
-    ui_scrollbar(u, rectf(list.x + list.w - 6 * u->L.scale, list.y + 6 * u->L.scale,
-                          4 * u->L.scale, list.h - 12 * u->L.scale),
-                 (float)hr.n * row_h, (float)list.h, (float)s->history_scroll * row_h);
+    /* Header row: a table, because a history is a table. */
+    float p = 14 * u->L.scale;
+    float head_h = 30 * u->L.scale;
+    float row_h = 50 * u->L.scale;
+    float col_w = list.w - p * 2;
+    float c_time = 104 * u->L.scale, c_lang = 84 * u->L.scale, c_conf = 74 * u->L.scale;
+    float c_text = col_w - c_time - c_lang - c_conf - 40 * u->L.scale;
+    if (c_text < 100 * u->L.scale) c_text = 100 * u->L.scale;
 
-    /* detail pane on the right */
-    if (wide) {
-        osa_rect det = rectf(list.x + list.w + 14 * u->L.scale, inner.y,
-                             inner.w - list.w - 14 * u->L.scale, inner.h);
-        ui_card(u, det);
-        int i = s->history_sel < 0 ? 0 : s->history_sel;
-        if (i < hr.n) {
-            ui_label(u, rectf(det.x + 16 * u->L.scale, det.y + 12 * u->L.scale,
-                              det.w - 32 * u->L.scale, 20 * u->L.scale),
-                     tt(s->lang, "transcribe.source"), 11 * u->L.scale, u->t.text_dim,
-                     u->L.rtl ? 2 : 0);
-            float pane_h = det.h - 170 * u->L.scale;
-            if (pane_h < 120 * u->L.scale) pane_h = 120 * u->L.scale;
-            text_opts o = text_default_opts(14 * u->L.scale);
-            o.max_width = det.w - 32 * u->L.scale;
-            o.line_height = 14 * u->L.scale * 1.8f;
-            o.rtl = osa_starts(hr.lang[i], "fa");
-            text_draw_box(u->c, u->reg, 14 * u->L.scale, u->t.text,
-                          rectf(det.x + 16 * u->L.scale, det.y + 38 * u->L.scale,
-                                det.w - 32 * u->L.scale, pane_h * 0.5f - 46 * u->L.scale),
-                          hr.text[i], o);
-
-            float second = det.y + 54 * u->L.scale + pane_h * 0.5f;
-            c_hline(u->c, det.x + 16 * u->L.scale, det.x + det.w - 16 * u->L.scale,
-                    second - 10 * u->L.scale, 1, u->t.border_soft);
-            ui_label(u, rectf(det.x + 16 * u->L.scale, second,
-                              det.w - 32 * u->L.scale, 20 * u->L.scale),
-                     tt(s->lang, "transcribe.result"), 11 * u->L.scale, u->t.text_dim,
-                     u->L.rtl ? 2 : 0);
-            const char *tr = osa_app_translate_preview(s->app, hr.text[i]);
-            text_opts o2 = text_default_opts(14 * u->L.scale);
-            o2.max_width = det.w - 32 * u->L.scale;
-            o2.line_height = 14 * u->L.scale * 1.8f;
-            o2.rtl = osa_starts(hr.lang[i], "en");
-            text_draw_box(u->c, u->reg, 14 * u->L.scale, u->t.accent,
-                          rectf(det.x + 16 * u->L.scale, second + 26 * u->L.scale,
-                                det.w - 32 * u->L.scale, pane_h * 0.5f - 60), tr, o2);
-
-            float by = det.y + det.h - 48 * u->L.scale;
-            if (ui_button(u, 4000, rectf(det.x + 16 * u->L.scale, by, 100 * u->L.scale,
-                                         32 * u->L.scale), tt(s->lang, "btn.delete"), false)) {
-                osa_error err;
-                if (osa_app_delete_transcript(s->app, hr.id[i], &err)) {
-                    free(s->history_json);
-                    s->history_json = osa_app_history_json(s->app, 100, NULL);
-                    shell_set_message(s, false, "%s", tt(s->lang, "msg.ok"));
-                }
+    /* Columns are laid out from the leading edge, so the same table reads
+     * correctly in both directions. `colx(i)` returns the x of column i. */
+    float widths[4] = { c_time, c_text, c_lang, c_conf };
+    float colx[4];
+    {
+        float used = 10 * u->L.scale;
+        for (int i = 0; i < 4; i++) {
+            if (u->L.rtl) {
+                colx[i] = list.x + list.w - p - used - widths[i];
+            } else {
+                colx[i] = list.x + p + used;
             }
-            if (ui_button(u, 4001, rectf(det.x + 124 * u->L.scale, by, 100 * u->L.scale,
-                                         32 * u->L.scale), tt(s->lang, "btn.copy"), false))
-                osa_clipboard_set(hr.text[i]);
+            used += widths[i];
         }
     }
-    /* wheel scroll */
-    if (rect_has(rect_inset(body, 0), u->in.mx, u->in.my) && u->in.wheel) {
-        s->history_scroll -= u->in.wheel;
-        int maxs = hr.n - (int)(list.h / (62 * u->L.scale));
-        if (s->history_scroll < 0) s->history_scroll = 0;
-        if (maxs < 0) maxs = 0;
-        if (s->history_scroll > maxs) s->history_scroll = maxs;
+    osa_rect head = rectf(list.x + p, list.y + 12 * u->L.scale, col_w, head_h);
+    static const char *head_keys[4] = { "history.time", "history.text", "history.language",
+                                        "transcribe.confidence" };
+    for (int i = 0; i < 4; i++)
+        ui_label(u, rectf(colx[i], head.y, widths[i], head_h), kl(s, head_keys[i]),
+                 UI_FS_TINY * u->L.scale, u->t.text_faint, u->L.rtl ? 2 : 0);
+    c_hline(u->c, list.x + p, list.x + list.w - p, head.y + head_h, 1, u->t.border_soft);
+
+    osa_rect rows = rectf(list.x + p, head.y + head_h + 2, col_w,
+                          list.h - (head.y - list.y) - head_h - 16 * u->L.scale);
+    int visible = (int)(rows.h / row_h);
+    if (visible < 1) visible = 1;
+    int max_scroll = g_hist_n - visible;
+    if (max_scroll < 0) max_scroll = 0;
+    if (ui_hit(u, rows) && u->in.wheel != 0)
+        s->history_scroll -= (int)(u->in.wheel * 2);
+    if (s->history_scroll < 0) s->history_scroll = 0;
+    if (s->history_scroll > max_scroll) s->history_scroll = max_scroll;
+
+    canvas_clip_push(u->c, rows);
+    for (int i = s->history_scroll; i < g_hist_n && i < s->history_scroll + visible; i++) {
+        int slot = i - s->history_scroll;
+        osa_rect rr = rectf(rows.x, rows.y + slot * row_h, rows.w, row_h - 2);
+        hist_row *row = &H[i];
+        if (ui_row(u, 4100 + i, rr, osa_streq(row->id, s->transcript_id))) {
+            osa_strlcpy(s->transcript_id, row->id, sizeof s->transcript_id);
+            osa_strlcpy(s->transcript, row->text, sizeof s->transcript);
+            osa_strlcpy(s->detected_lang, row->lang, sizeof s->detected_lang);
+            s->transcript_conf = (float)row->conf;
+            s->transcript_dur = row->dur;
+            s->translation[0] = 0;
+            const char *pv = osa_app_translate_preview(s->app, row->text);
+            if (pv) osa_strlcpy(s->translation, pv, sizeof s->translation);
+            shell_refresh_phonetic(s);
+            s->screen = SCREEN_TRANSCRIBE;
+            break;
+        }
+        ui_label(u, rectf(colx[0], rr.y, c_time, row_h - 2), row->when,
+                 UI_FS_SMALL * u->L.scale, u->t.text_faint, u->L.rtl ? 2 : 0);
+        ui_label(u, rectf(colx[1], rr.y, c_text, row_h - 2), row->text,
+                 UI_FS_BODY * u->L.scale, u->t.text, u->L.rtl ? 2 : 0);
+        ui_label(u, rectf(colx[2], rr.y, c_lang, row_h - 2),
+                 shell_lang_name(s, row->lang), UI_FS_SMALL * u->L.scale, u->t.text_dim,
+                 u->L.rtl ? 2 : 0);
+        char pc[32], pcl[40];
+        snprintf(pc, sizeof pc, "%.0f%%", row->conf * 100.0);
+        num_fa(s, pc, pcl, sizeof pcl);
+        ui_label(u, rectf(colx[3], rr.y, c_conf, row_h - 2), pcl,
+                 UI_FS_SMALL * u->L.scale,
+                 row->conf > 0.7 ? u->t.success : u->t.warning, u->L.rtl ? 2 : 0);
     }
+    canvas_clip_pop(u->c);
+    if (max_scroll > 0)
+        ui_scrollbar(u, rectf(list.x + list.w - 10 * u->L.scale, rows.y, 5 * u->L.scale, rows.h),
+                     s->history_scroll, g_hist_n, visible);
 }
 
 /* ---- Models ------------------------------------------------------- */
 
-typedef struct model_row {
-    char id[64];
-    char name[160];
-    char kind[8];
-    char engine[32];
-    double bytes;
-    bool active;
+#define MAX_MODELS 64
+
+typedef struct {
+    char     id[64], name[128], kind[16], engine[32], license[72];
+    bool     active;
+    long long bytes;
 } model_row;
 
-typedef struct model_rows {
-    model_row row[16];
-    int n;
-} model_rows;
+typedef struct { model_row *r; int n; } model_ud;
 
 static void model_visit(void *ud, const char *o, const char *e) {
-    model_rows *mr = (model_rows *)ud;
-    if (mr->n >= 16) return;
-    model_row *r = &mr->row[mr->n];
-    memset(r, 0, sizeof *r);
-    json_str(o, e, "\"id\"", r->id, sizeof r->id);
-    json_str(o, e, "\"name\"", r->name, sizeof r->name);
-    json_str(o, e, "\"kind\"", r->kind, sizeof r->kind);
-    json_str(o, e, "\"engine\"", r->engine, sizeof r->engine);
-    json_num(o, e, "\"bytes\"", &r->bytes);
-    char act[16] = {0};
-    if (json_str(o, e, "\"active\"", act, sizeof act)) r->active = osa_starts(act, "true");
-    mr->n++;
+    model_ud *mu = (model_ud *)ud;
+    if (mu->n >= MAX_MODELS) return;
+    model_row *m = &mu->r[mu->n++];
+    memset(m, 0, sizeof *m);
+    shell_json_str(o, e, "\"id\"", m->id, sizeof m->id);
+    shell_json_str(o, e, "\"name\"", m->name, sizeof m->name);
+    shell_json_str(o, e, "\"kind\"", m->kind, sizeof m->kind);
+    shell_json_str(o, e, "\"engine\"", m->engine, sizeof m->engine);
+    shell_json_str(o, e, "\"license\"", m->license, sizeof m->license);
+    char b[16];
+    memset(b, 0, sizeof b);
+    if (shell_json_str(o, e, "\"bytes\"", b, sizeof b)) m->bytes = atoll(b);
+    m->active = shell_json_str(o, e, "\"active\"", b, sizeof b) && osa_starts(b, "true");
+}
+
+static model_row g_models[MAX_MODELS];
+
+static const char *kind_label(shell_state *s, const char *kind) {
+    if (osa_starts(kind, "asr")) return kl(s, "models.kindasr");
+    if (osa_starts(kind, "lang")) return kl(s, "models.kindlang");
+    return kl(s, "models.kindmt");
+}
+
+/* One row of the download catalogue.
+ *
+ * The row has three bands, laid out per reading direction: a kind badge on the
+ * leading edge, the text column, and the action on the trailing edge. The whole
+ * row is a hit target: a 30-pixel button inside a 68-pixel row is a miss waiting
+ * to happen, so the button is the affordance, not the only clickable part.
+ *
+ * The action depends on what the pack actually is. A bundle that ships with the
+ * application says so and is a pill. A pack with an empty URL is a manual
+ * install, and the row says which button installs it rather than showing a dead
+ * "download" label. Only a real URL gets a download button. */
+static void draw_pack_row(shell_state *s, ui_context *u, osa_rect r, const osa_pack_info *p,
+                          int idx, int *clicked_idx) {
+    bool hov = ui_hit(u, r);
+    if (hov) c_fill_round(u->c, r, u->L.radius_sm, u->t.panel_alt);
+    float pad = 14 * u->L.scale;
+
+    osa_color tint = osa_starts(p->kind, "asr") ? u->t.accent
+                   : osa_starts(p->kind, "lang") ? u->t.warning : u->t.accent2;
+    float badge_w = 58 * u->L.scale;
+    osa_rect badge = rectf(u->L.rtl ? r.x + r.w - pad - badge_w : r.x + pad,
+                           r.y + 9 * u->L.scale, badge_w, 22 * u->L.scale);
+    c_fill_round(u->c, badge, 11 * u->L.scale, col_alpha(tint, 0.16f));
+    ui_label(u, badge, kind_label(s, p->kind), UI_FS_TINY * u->L.scale, tint, 1);
+
+    float side = badge_w + 12 * u->L.scale;
+    float action_w = 104 * u->L.scale;
+    float tx = u->L.rtl ? r.x + pad : r.x + pad + side;
+    float tw = r.w - pad * 2 - side - action_w - 12 * u->L.scale;
+    ui_label(u, rectf(tx, r.y + 6 * u->L.scale, tw, 20 * u->L.scale), p->name,
+             UI_FS_BODY * u->L.scale, u->t.text, u->L.rtl ? 2 : 0);
+
+    char sz[32], meta[256];
+    ui_fmt_bytes(p->size_mb * 1024.0 * 1024.0, sz, sizeof sz);
+    snprintf(meta, sizeof meta, "%s  ·  %s  ·  %s", p->language[0] ? p->language : "—",
+             sz, p->license[0] ? p->license : "—");
+    ui_label(u, rectf(tx, r.y + 25 * u->L.scale, tw, 17 * u->L.scale), meta,
+             UI_FS_TINY * u->L.scale, u->t.text_faint, u->L.rtl ? 2 : 0);
+
+    /* The third line is what the row is for, so it explains the action instead
+     * of repeating the pack's marketing copy. */
+    const char *line3 = p->installed ? kl(s, "models.hintbundled")
+                       : p->url[0]   ? kl(s, "models.hintdownload")
+                                     : kl(s, "models.hintlocalfile");
+    ui_label(u, rectf(tx, r.y + 42 * u->L.scale, tw, 16 * u->L.scale), line3,
+             UI_FS_TINY * u->L.scale, col_alpha(u->t.text_faint, 0.85f),
+             u->L.rtl ? 2 : 0);
+
+    osa_rect ar = rectf(u->L.rtl ? r.x + pad : r.x + r.w - pad - action_w,
+                        r.y + (r.h - 30 * u->L.scale) * 0.5f, action_w, 30 * u->L.scale);
+    if (p->installed) {
+        ui_pill(u, ar, kl(s, "models.installed"), u->t.success, u->t.success_soft);
+    } else if (!p->url[0]) {
+        /* Manual install: this is a real, working action, not a disabled label. */
+        if (ui_button_ghost(u, 5200 + idx, ar, kl(s, "models.locallic")))
+            *clicked_idx = idx;
+    } else if (s->downloading && osa_streq(s->dl_pack, p->id)) {
+        c_fill_round(u->c, ar, u->L.radius_sm, u->t.panel_alt);
+        ui_progress(u, rect_inset(ar, 9 * u->L.scale), (float)s->dl_progress, u->t.accent);
+    } else {
+        bool b = ui_button(u, 5200 + idx, ar, kl(s, "btn.download"), false);
+        if (b || (hov && u->in.clicked && !u->consumed_click)) *clicked_idx = idx;
+    }
 }
 
 static void draw_models(shell_state *s, ui_context *u, osa_rect body) {
-    float pad = 20 * u->L.scale;
+    float pad = 22 * u->L.scale;
     osa_rect inner = rect_inset(body, pad);
-    if (!s->models_json) s->models_json = osa_app_models_json(s->app, NULL);
 
-    static model_rows mr;
-    memset(&mr, 0, sizeof mr);
-    json_each_object(s->models_json, model_visit, &mr);
-    if (mr.n == 0) {
-        ui_card(u, inner);
-        ui_label(u, rect_inset(inner, 24 * u->L.scale), tt(s->lang, "models.empty"),
-                 12 * u->L.scale, u->t.text_faint, 1);
+    static osa_pack_info packs[24];
+    int np = osa_app_packs(s->app, packs, 24);
+    int n_inst = 0;
+    for (int i = 0; i < np; i++) if (packs[i].installed) n_inst++;
+
+    osa_app_status st;
+    osa_app_get_status(s->app, &st);
+
+    /* ---- summary: two columns, because this row answers two questions —
+     * "what is listening?" and "what is translating?". The old version showed
+     * only the ASR model and a count, which read as one huge empty card. ---- */
+    float sum_h = 78 * u->L.scale;
+    osa_rect sum = rectf(inner.x, inner.y, inner.w, sum_h);
+    ui_card(u, sum);
+    {
+        float p = 18 * u->L.scale;
+        float half = sum.w * 0.5f;
+        /* ASR column on the reading-start side */
+        float ax = u->L.rtl ? sum.x + sum.w - half : sum.x;
+        float aw = half - p;
+        char be[96];
+        snprintf(be, sizeof be, "%s %s", kl(s, "models.engine"),
+                 st.asr_backend[0] ? st.asr_backend : "builtin");
+        float bw = text_measure(u->bold, UI_FS_TINY * u->L.scale, be) + 24 * u->L.scale;
+        osa_rect chip = rectf(u->L.rtl ? ax + aw - bw : ax + p, sum.y + 12 * u->L.scale,
+                              bw, 22 * u->L.scale);
+        c_fill_round(u->c, chip, 11 * u->L.scale, u->t.success_soft);
+        ui_label(u, chip, be, UI_FS_TINY * u->L.scale, u->t.success, 1);
+        ui_label(u, rectf(u->L.rtl ? ax + aw - bw - 10 * u->L.scale : ax + p + bw + 10 * u->L.scale,
+                          sum.y + 14 * u->L.scale, sum.w * 0.2f, 18 * u->L.scale),
+                 kl(s, "models.activelabel"), UI_FS_TINY * u->L.scale, u->t.text_faint,
+                 u->L.rtl ? 2 : 0);
+        ui_label(u, rectf(ax + p, sum.y + 36 * u->L.scale, aw - p, 26 * u->L.scale),
+                 st.asr_model[0] ? st.asr_model : kl(s, "models.none"),
+                 UI_FS_H2 * u->L.scale, u->t.text, u->L.rtl ? 2 : 0);
+
+        /* MT column on the trailing side, with the installed count under it */
+        float mx = u->L.rtl ? sum.x : sum.x + half;
+        float mw = half - p;
+        ui_label(u, rectf(mx + p, sum.y + 14 * u->L.scale, mw - p, 18 * u->L.scale),
+                 kl(s, "models.mtlabel"), UI_FS_TINY * u->L.scale, u->t.text_faint,
+                 u->L.rtl ? 2 : 0);
+        ui_label(u, rectf(mx + p, sum.y + 36 * u->L.scale, mw - p, 22 * u->L.scale),
+                 st.mt_model[0] ? st.mt_model : "—", UI_FS_BODY * u->L.scale, u->t.text_dim,
+                 u->L.rtl ? 2 : 0);
+        /* installed count belongs to the whole card, so it sits in the trailing
+         * column's second line where it cannot be mistaken for the MT model's
+         * own metadata */
+        char cnt[96], loc[160];
+        snprintf(cnt, sizeof cnt, "%d %s", st.n_models, kl(s, "models.countunit"));
+        num_fa(s, cnt, loc, sizeof loc);
+        ui_label(u, rectf(mx + p, sum.y + 58 * u->L.scale, mw - p, 16 * u->L.scale), loc,
+                 UI_FS_TINY * u->L.scale, u->t.text_faint, u->L.rtl ? 2 : 0);
+
+        /* one hairline between the two columns, only when there is room for it */
+        if (sum.w > 520 * u->L.scale)
+            c_fill(u->c, rectf(u->L.rtl ? sum.x + half : sum.x + half - 1,
+                               sum.y + 16 * u->L.scale, 1,
+                               sum_h - 32 * u->L.scale), u->t.border_soft);
+    }
+
+    /* ---- toolbar: tabs on the leading edge, import on the trailing one.
+     * Tabs used to start at the trailing edge and so collided with the import
+     * button on any window narrower than the design width. ---- */
+    float tab_h = 34 * u->L.scale;
+    float tab_w = 146 * u->L.scale;
+    float tabs_y = sum.y + sum_h + 14 * u->L.scale;
+    float bx0 = u->L.rtl ? inner.x + inner.w - tab_w : inner.x;
+    float bx1 = u->L.rtl ? inner.x + inner.w - tab_w * 2 - 6 * u->L.scale
+                         : inner.x + tab_w + 6 * u->L.scale;
+    osa_rect t0 = rectf(bx0, tabs_y, tab_w, tab_h);
+    osa_rect t1 = rectf(bx1, tabs_y, tab_w, tab_h);
+    if (ui_tab(u, 5001, t0, kl(s, "models.tabinstalled"), s->models_tab == 0)) {
+        s->models_tab = 0;
+        free(s->models_json);
+        s->models_json = osa_app_models_json(s->app, NULL);
+    }
+    if (ui_tab(u, 5002, t1, kl(s, "models.tabdownload"), s->models_tab == 1))
+        s->models_tab = 1;
+    c_hline(u->c, inner.x, inner.x + inner.w, tabs_y + tab_h, 1, u->t.border_soft);
+
+    float iw = 176 * u->L.scale;
+    osa_rect imp = rectf(u->L.rtl ? inner.x : inner.x + inner.w - iw, tabs_y, iw, tab_h);
+    if (ui_button(u, 5003, imp, kl(s, "models.import"), false))
+        s->request = SHELL_REQ_PICK_PACK;
+
+    float top = tabs_y + tab_h + 12 * u->L.scale;
+    osa_rect list = rectf(inner.x, top, inner.w, inner.y + inner.h - top);
+    ui_card(u, list);
+
+    /* ---- installed tab ---------------------------------------------- */
+    if (s->models_tab == 0) {
+        if (!s->models_json) s->models_json = osa_app_models_json(s->app, NULL);
+        model_ud mu = { g_models, 0 };
+        shell_json_walk(s->models_json, model_visit, &mu);
+        float p = 16 * u->L.scale;
+        float row_h = 62 * u->L.scale;
+        float act_w = 104 * u->L.scale;
+        float foot = 42 * u->L.scale;
+        osa_rect rows = rectf(list.x + p, list.y + p, list.w - p * 2,
+                              list.h - p * 2 - foot);
+        canvas_clip_push(u->c, rows);
+        for (int i = 0; i < mu.n; i++) {
+            osa_rect rr = rectf(rows.x, rows.y + i * row_h, rows.w, row_h - 4 * u->L.scale);
+            if (rr.y + rr.h > rows.y + rows.h) break;
+            bool hov = ui_hit(u, rr);
+            if (hov) c_fill_round(u->c, rr, u->L.radius_sm, u->t.panel_alt);
+
+            osa_color tint = osa_starts(g_models[i].kind, "asr") ? u->t.accent : u->t.accent2;
+            osa_rect badge = rectf(u->L.rtl ? rr.x + rr.w - 58 * u->L.scale : rr.x,
+                                   rr.y + 9 * u->L.scale, 58 * u->L.scale, 22 * u->L.scale);
+            c_fill_round(u->c, badge, 11 * u->L.scale, col_alpha(tint, 0.16f));
+            ui_label(u, badge, kind_label(s, g_models[i].kind), UI_FS_TINY * u->L.scale,
+                     tint, 1);
+
+            float cb = 58 * u->L.scale + 12 * u->L.scale;
+            float cx = u->L.rtl ? rr.x + act_w + 12 * u->L.scale : rr.x + cb;
+            float cw = rr.w - cb - act_w - 24 * u->L.scale;
+            ui_label(u, rectf(cx, rr.y + 6 * u->L.scale, cw, 22 * u->L.scale),
+                     g_models[i].name, UI_FS_BODY * u->L.scale, u->t.text,
+                     u->L.rtl ? 2 : 0);
+            /* id · engine · size: the three things that tell two builds of the
+             * same model apart, which is what "is this the file I installed?" is */
+            char meta[256], sz[32] = "";
+            ui_fmt_bytes((double)g_models[i].bytes, sz, sizeof sz);
+            snprintf(meta, sizeof meta, "%s  ·  %s%s%s", g_models[i].id,
+                     g_models[i].engine[0] ? g_models[i].engine : "—",
+                     sz[0] ? "  ·  " : "", sz);
+            ui_label(u, rectf(cx, rr.y + 26 * u->L.scale, cw, 17 * u->L.scale), meta,
+                     UI_FS_TINY * u->L.scale, u->t.text_faint, u->L.rtl ? 2 : 0);
+
+            osa_rect ar = rectf(u->L.rtl ? rr.x : rr.x + rr.w - act_w,
+                                rr.y + (rr.h - 30 * u->L.scale) * 0.5f, act_w,
+                                30 * u->L.scale);
+            if (g_models[i].active) {
+                ui_pill(u, ar, kl(s, "models.active"), u->t.accent, u->t.accent_soft);
+            } else if (ui_button(u, 5100 + i, ar, kl(s, "btn.activate"), false)) {
+                osa_error err;
+                if (osa_app_activate_model(s->app, g_models[i].id, &err)) {
+                    free(s->models_json);
+                    s->models_json = NULL;
+                    shell_set_message(s, false, "%s", kl(s, "msg.ok"));
+                } else {
+                    shell_set_message(s, true, "%s: %s", kl(s, "msg.failed"), err.msg);
+                }
+            }
+            c_hline(u->c, rr.x, rr.x + rr.w, rr.y + rr.h, 1, u->t.border_soft);
+        }
+        if (mu.n == 0) {
+            ui_label(u, rectf(rows.x, rows.y + rows.h * 0.32f, rows.w, 24 * u->L.scale),
+                     kl(s, "models.none"), UI_FS_BODY * u->L.scale, u->t.text_faint, 1);
+        }
+        canvas_clip_pop(u->c);
+
+        /* footer: where the files live and a shortcut to the folder */
+        float fy = list.y + list.h - foot + 4 * u->L.scale;
+        c_hline(u->c, list.x + p, list.x + list.w - p, fy - 8 * u->L.scale, 1,
+                u->t.border_soft);
+        float ob = 132 * u->L.scale;
+        osa_rect ofr = rectf(u->L.rtl ? list.x + list.w - p - ob : list.x + p,
+                             fy + 2 * u->L.scale, ob, 28 * u->L.scale);
+        float px = u->L.rtl ? list.x + p : ofr.x + ob + 12 * u->L.scale;
+        ui_label(u, rectf(px, fy + 6 * u->L.scale,
+                          list.w - p * 2 - ob - 16 * u->L.scale, 24 * u->L.scale),
+                 osa_path(OSAI_DIR_MODELS), UI_FS_MONO * u->L.scale, u->t.text_faint,
+                 u->L.rtl ? 2 : 0);
+        if (ui_button_ghost(u, 5004, ofr, kl(s, "btn.openfolder")))
+            s->request = SHELL_REQ_OPEN_FOLDER;
         return;
     }
 
-    float card_h = 100 * u->L.scale;
-    float gap = 12 * u->L.scale;
-    for (int i = 0; i < mr.n; i++) {
-        model_row *m = &mr.row[i];
-        osa_rect r = rectf(inner.x, inner.y + i * (card_h + gap), inner.w, card_h);
-        if (r.y + r.h > inner.y + inner.h - 50 * u->L.scale) break;
-        ui_card(u, r);
+    /* ---- downloadable tab ------------------------------------------- */
+    float p = 8 * u->L.scale;
+    float row_h = 68 * u->L.scale;
+    osa_rect rows = rectf(list.x + p, list.y + p, list.w - p * 2,
+                          list.h - p * 2 - 28 * u->L.scale);
+    int visible = (int)(rows.h / row_h);
+    if (visible < 1) visible = 1;
+    int maxs = np - visible;
+    if (maxs < 0) maxs = 0;
+    if (ui_hit(u, rows) && u->in.wheel != 0) s->packs_scroll -= (int)(u->in.wheel * 2);
+    if (s->packs_scroll < 0) s->packs_scroll = 0;
+    if (s->packs_scroll > maxs) s->packs_scroll = maxs;
 
-        float badge = 42 * u->L.scale;
-        float bx = u->L.rtl ? r.x + r.w - badge - 18 * u->L.scale : r.x + 18 * u->L.scale;
-        osa_rect br = rectf(bx, r.y + (card_h - badge) * 0.5f, badge, badge);
-        osa_color tint = osa_streq(m->kind, "mt") ? u->t.accent2 : u->t.accent;
-        c_fill_round(u->c, br, badge * 0.28f, col_alpha(tint, 0.15f));
-        c_circle(u->c, br.x + badge * 0.5f, br.y + badge * 0.5f, badge * 0.19f, tint);
+    int clicked = -1;
+    canvas_clip_push(u->c, rows);
+    for (int i = s->packs_scroll; i < np && i < s->packs_scroll + visible + 1; i++) {
+        osa_rect rr = rectf(rows.x, rows.y + (i - s->packs_scroll) * row_h, rows.w,
+                            row_h - 4 * u->L.scale);
+        if (rr.y + rr.h > rows.y + rows.h) break;
+        draw_pack_row(s, u, rr, &packs[i], i, &clicked);
+        c_hline(u->c, rr.x + 8 * u->L.scale, rr.x + rr.w - 8 * u->L.scale, rr.y + rr.h, 1,
+                u->t.border_soft);
+    }
+    canvas_clip_pop(u->c);
+    if (maxs > 0)
+        ui_scrollbar(u, rectf(list.x + list.w - 10 * u->L.scale, rows.y, 5 * u->L.scale,
+                              rows.h), s->packs_scroll, np, visible);
 
-        float tw = r.w - badge - 224 * u->L.scale;
-        float tx = u->L.rtl ? br.x - 14 * u->L.scale - tw : br.x + badge + 14 * u->L.scale;
-        ui_label(u, rectf(tx, r.y + 16 * u->L.scale, tw, 22 * u->L.scale),
-                 m->name, 14 * u->L.scale, u->t.text, u->L.rtl ? 2 : 0);
-
-        char sz[40];
-        ui_fmt_bytes(m->bytes, sz, sizeof sz);
-        char sub[220];
-        snprintf(sub, sizeof sub, "%s · %s · %s · %s", m->kind[0] ? m->kind : "model",
-                 m->engine[0] ? m->engine : "builtin", m->id, sz);
-        ui_label(u, rectf(tx, r.y + 40 * u->L.scale, tw, 18 * u->L.scale),
-                 sub, 10.5f * u->L.scale, u->t.text_dim, u->L.rtl ? 2 : 0);
-
-        if (m->active) {
-            osa_rect chip = rectf(u->L.rtl ? r.x + 18 * u->L.scale
-                                           : r.x + r.w - 128 * u->L.scale,
-                                  r.y + (card_h - 26 * u->L.scale) * 0.5f,
-                                  110 * u->L.scale, 26 * u->L.scale);
-            ui_status_chip(u, chip, tt(s->lang, "models.active"), u->t.success);
+    if (clicked >= 0 && clicked < np) {
+        if (!packs[clicked].url[0]) {
+            /* Not a dead end: hand the user the picker that does work. */
+            s->request = SHELL_REQ_PICK_PACK;
+            shell_set_message(s, false, "%s", kl(s, "models.hintinstall"));
+        } else if (!osa_http_has_tls()) {
+            shell_set_message(s, true, "%s", kl(s, "models.notls"));
         } else {
-            osa_rect btn = rectf(u->L.rtl ? r.x + 18 * u->L.scale
-                                          : r.x + r.w - 128 * u->L.scale,
-                                 r.y + (card_h - 30 * u->L.scale) * 0.5f,
-                                 110 * u->L.scale, 30 * u->L.scale);
-            if (ui_button(u, 5100 + i, btn, tt(s->lang, "btn.activate"), false)) {
-                osa_error err;
-                if (osa_app_activate_model(s->app, m->id, &err)) {
-                    free(s->models_json);
-                    s->models_json = osa_app_models_json(s->app, NULL);
-                    shell_set_message(s, false, "%s", tt(s->lang, "msg.ok"));
-                } else {
-                    shell_set_message(s, true, "%s: %s", tt(s->lang, "msg.failed"), err.msg);
-                }
-            }
+            osa_error err;
+            osa_strlcpy(s->dl_pack, packs[clicked].id, sizeof s->dl_pack);
+            s->downloading = true;
+            s->dl_progress = 0;
+            int rc = osa_app_download_pack(s->app, packs[clicked].id, NULL, NULL, NULL, &err);
+            s->downloading = false;
+            s->dl_pack[0] = 0;
+            free(s->models_json);
+            s->models_json = NULL;
+            if (rc == 0)
+                shell_set_message(s, false, "%s", kl(s, "msg.ok"));
+            else
+                shell_set_message(s, true, "%s: %s", kl(s, "msg.failed"), err.msg);
         }
     }
 
-    float fy = inner.y + inner.h - 38 * u->L.scale;
-    if (ui_button(u, 5000, rectf(inner.x, fy, 152 * u->L.scale, 34 * u->L.scale),
-                  tt(s->lang, "models.import"), false)) {
-        s->request = 2;
-    }
-    ui_label(u, rectf(inner.x + 168 * u->L.scale, fy + 6 * u->L.scale,
-                      inner.w - 168 * u->L.scale, 22 * u->L.scale),
-             tt(s->lang, "models.note"), 10.5f * u->L.scale, u->t.text_faint,
-             u->L.rtl ? 2 : 0);
+    char head[192], loc2[224];
+    snprintf(head, sizeof head, kl(s, "models.dlhead"), np, n_inst);
+    num_fa(s, head, loc2, sizeof loc2);
+    float half = list.w * 0.5f;
+    ui_label(u, rectf(u->L.rtl ? list.x + list.w - 14 * u->L.scale - half
+                               : list.x + 14 * u->L.scale,
+                      list.y + list.h - 22 * u->L.scale, half, 18 * u->L.scale), loc2,
+             UI_FS_TINY * u->L.scale, u->t.text_dim, u->L.rtl ? 2 : 0);
+    ui_label(u, rectf(u->L.rtl ? list.x + 14 * u->L.scale
+                               : list.x + half, list.y + list.h - 22 * u->L.scale,
+                      half - 14 * u->L.scale, 18 * u->L.scale),
+             kl(s, "models.dlnote"), UI_FS_TINY * u->L.scale, u->t.text_faint,
+             u->L.rtl ? 0 : 2);
 }
 
 /* ---- Training ----------------------------------------------------- */
 
-static int g_epochs = 8;
-static int g_train_lang = 0;   /* 0 = fa, 1 = en */
-static bool g_use_gpu = false;
+/* A labelled control row: caption on the leading side, control on the trailing
+ * side. Used by Training and Settings so both screens share one rhythm. */
+static void setting_row(ui_context *u, osa_rect r, const char *label, const char *hint) {
+    float lw = r.w * 0.52f;
+    ui_label(u, rectf(u->L.rtl ? r.x + r.w - lw : r.x, r.y, lw, 20 * u->L.scale), label,
+             UI_FS_BODY * u->L.scale, u->t.text, u->L.rtl ? 2 : 0);
+    if (hint && *hint)
+        ui_label(u, rectf(u->L.rtl ? r.x + r.w - lw : r.x, r.y + 18 * u->L.scale, lw,
+                          16 * u->L.scale), hint, UI_FS_TINY * u->L.scale,
+                 u->t.text_faint, u->L.rtl ? 2 : 0);
+}
+
+/* One labelled row of the training configuration: caption on the leading side,
+ * control in a fixed-width column on the trailing side. */
+static void train_row(ui_context *u, osa_rect r, const char *label, const char *hint) {
+    float lw = r.w * 0.5f;
+    ui_label(u, rectf(u->L.rtl ? r.x + r.w - lw : r.x, r.y + 2 * u->L.scale, lw,
+                      18 * u->L.scale),
+             label, UI_FS_BODY * u->L.scale, u->t.text, u->L.rtl ? 2 : 0);
+    if (hint && *hint)
+        ui_label(u, rectf(u->L.rtl ? r.x + r.w - lw : r.x, r.y + 20 * u->L.scale,
+                          lw, 15 * u->L.scale),
+                 hint, UI_FS_TINY * u->L.scale, u->t.text_faint, u->L.rtl ? 2 : 0);
+}
 
 static void draw_training(shell_state *s, ui_context *u, osa_rect body) {
-    float pad = 20 * u->L.scale;
+    float pad = 22 * u->L.scale;
     osa_rect inner = rect_inset(body, pad);
-    float card_h = MINF(inner.h * 0.56f, 340 * u->L.scale);
-    osa_rect card = rectf(inner.x, inner.y, inner.w, card_h);
-    ui_card(u, card);
+    float gap = 14 * u->L.scale;
+    float cfg_w = 360 * u->L.scale;
+    if (cfg_w > inner.w * 0.44f) cfg_w = inner.w * 0.44f;
 
-    float lx = card.x + 22 * u->L.scale;                 /* label edge   */
-    float rx = card.x + card.w * 0.46f;                  /* control edge */
-    float ctl_w = card.w * 0.40f;
-    float y = card.y + 20 * u->L.scale;
-    float row_h = 52 * u->L.scale;
+    float cfg_x = u->L.rtl ? inner.x + inner.w - cfg_w : inner.x;
+    float out_x = u->L.rtl ? inner.x : inner.x + cfg_w + gap;
+    /* The configuration card is sized to its controls, and the preparation
+     * checklist becomes its own card underneath. Stretching one card to the
+     * window floor left a column of empty panel next to a full run log, which
+     * reads as controls that failed to load. */
+    float cfg_h = 340 * u->L.scale;
+    if (cfg_h > inner.h) cfg_h = inner.h;
+    osa_rect cfg = rectf(cfg_x, inner.y, cfg_w, cfg_h);
+    osa_rect right = rectf(out_x, inner.y, inner.w - cfg_w - gap, inner.h);
+    float steps_y = inner.y + cfg_h + gap;
+    float steps_h = 44 * u->L.scale + 3 * 25 * u->L.scale + 30 * u->L.scale;
+    osa_rect stepsc = rectf(cfg_x, steps_y, cfg_w, steps_h);
+    bool show_steps = inner.y + inner.h - steps_y >= steps_h;
+    float ver_y = steps_y + (show_steps ? steps_h : 0) + gap;
+    /* The log stops growing once it is tall enough to read; the version list
+     * takes the space underneath it rather than leaving half a screen of empty
+     * panel on the left. */
+    float log_h = right.h;
+    float log_cap = 470 * u->L.scale;
+    if (log_h > log_cap && log_h - log_cap - gap >= 110 * u->L.scale) log_h = log_cap;
+    osa_rect verc;
+    if (log_h < right.h)
+        verc = rectf(right.x, right.y + log_h + gap, right.w, right.h - log_h - gap);
+    else
+        verc = rectf(cfg_x, ver_y, cfg_w, inner.y + inner.h - ver_y);
 
-    osa_app_status st;
-    osa_app_get_status(s->app, &st);
-    char line[256];
-    snprintf(line, sizeof line, "%s: %d   ·   %s: %d",
-             tt(s->lang, "nav.history"), st.n_transcripts,
-             tt(s->lang, "nav.models"), st.n_models);
-    ui_label(u, rectf(lx, y, card.w - 44 * u->L.scale, 22 * u->L.scale), line,
-             12.5f * u->L.scale, u->t.text_dim, u->L.rtl ? 2 : 0);
-    y += 40 * u->L.scale;
+    /* ---- configuration ---- */
+    ui_card(u, cfg);
+    float p = 18 * u->L.scale;
+    c_fill_round(u->c, rectf(cfg.x + p, cfg.y + 16 * u->L.scale, 3 * u->L.scale,
+                             15 * u->L.scale), 1.5f * u->L.scale, u->t.accent);
+    ui_label(u, rectf(cfg.x + p + 10 * u->L.scale, cfg.y + 14 * u->L.scale,
+                      cfg.w - p * 2 - 10 * u->L.scale, 20 * u->L.scale),
+             kl(s, "training.config"), UI_FS_SMALL * u->L.scale, u->t.text_dim,
+             u->L.rtl ? 2 : 0);
+    c_hline(u->c, cfg.x + p, cfg.x + cfg.w - p, cfg.y + 40 * u->L.scale, 1,
+            u->t.border_soft);
+
+    float ctrl_w = cfg.w * 0.46f;
+    float y = cfg.y + 52 * u->L.scale;
+    float row_h = 48 * u->L.scale;
 
     /* language */
-    ui_label(u, rectf(lx, y, card.w * 0.40f, 32 * u->L.scale), tt(s->lang, "training.language"),
-             11.5f * u->L.scale, u->t.text_faint, u->L.rtl ? 2 : 0);
-    ui_segmented(u, 6000, rectf(rx, y, ctl_w, 32 * u->L.scale), "فارسی|English", &g_train_lang, 2);
+    train_row(u, rectf(cfg.x + p, y, cfg.w - p * 2, row_h), kl(s, "training.language"),
+              kl(s, "training.langhint"));
+    {
+        osa_rect dr = rectf(u->L.rtl ? cfg.x + p : cfg.x + cfg.w - p - ctrl_w,
+                            y + 4 * u->L.scale, ctrl_w, 32 * u->L.scale);
+        bool open = (u->popup_id == 6100);
+        if (ui_dropdown(u, 6100, dr, s->train_lang == 0 ? "فارسی" : "English", open)) {
+            u->popup_id = open ? 0 : 6100;
+            u->popup_rect = dr;
+            u->popup_n = 2;
+            osa_strlcpy(u->popup_items[0], "فارسی", sizeof u->popup_items[0]);
+            osa_strlcpy(u->popup_items[1], "English", sizeof u->popup_items[0]);
+            u->popup_sel = s->train_lang;
+        }
+    }
     y += row_h;
 
     /* epochs */
-    ui_label(u, rectf(lx, y, card.w * 0.40f, 32 * u->L.scale), tt(s->lang, "training.epochs"),
-             11.5f * u->L.scale, u->t.text_faint, u->L.rtl ? 2 : 0);
-    ui_stepper(u, 6100, rectf(rx, y, ctl_w * 0.55f, 32 * u->L.scale), &g_epochs, 1, 64);
+    train_row(u, rectf(cfg.x + p, y, cfg.w - p * 2, row_h), kl(s, "training.epochs"),
+              kl(s, "training.epochhint"));
+    {
+        osa_rect sr = rectf(u->L.rtl ? cfg.x + p : cfg.x + cfg.w - p - ctrl_w,
+                            y + 4 * u->L.scale, ctrl_w, 32 * u->L.scale);
+        ui_stepper(u, 6101, sr, &s->train_epochs, 1, 40);
+    }
     y += row_h;
 
-    /* compute device */
-    ui_label(u, rectf(lx, y, card.w * 0.40f, 32 * u->L.scale), tt(s->lang, "training.backend"),
-             11.5f * u->L.scale, u->t.text_faint, u->L.rtl ? 2 : 0);
-    osa_rect tg = rectf(rx, y, 44 * u->L.scale, 24 * u->L.scale);
-    ui_toggle_switch(u, 6200, tg, &g_use_gpu);
-    osa_rect dl = rectf(u->L.rtl ? rx + 54 * u->L.scale : rx - 104 * u->L.scale,
-                        y, 96 * u->L.scale, 24 * u->L.scale);
-    ui_label(u, dl, tt(s->lang, g_use_gpu ? "training.gpu" : "training.cpu"),
-             11 * u->L.scale, u->t.text_dim, u->L.rtl ? 2 : 0);
-    y += row_h;
+    /* device */
+    train_row(u, rectf(cfg.x + p, y, cfg.w - p * 2, row_h), kl(s, "training.backend"),
+              kl(s, "training.backendhint"));
+    {
+        osa_rect sr = rectf(u->L.rtl ? cfg.x + p : cfg.x + cfg.w - p - ctrl_w,
+                            y + 4 * u->L.scale, ctrl_w, 32 * u->L.scale);
+        int v = s->train_gpu ? 1 : 0;
+        if (ui_segmented(u, 6102, sr, "CPU|GPU", &v, 2)) s->train_gpu = v == 1;
+    }
+    y += row_h + 4 * u->L.scale;
 
-    /* run */
-    float by = y + 12 * u->L.scale;
-    if (ui_button(u, 6300, rectf(lx, by, 150 * u->L.scale, 36 * u->L.scale),
-                  tt(s->lang, "btn.run"), true))
-        shell_set_message(s, true, "%s", tt(s->lang, "msg.trainunavail"));
-    ui_label(u, rectf(lx + 168 * u->L.scale, by + 8 * u->L.scale,
-                      card.w - 200 * u->L.scale, 22 * u->L.scale),
-             tt(s->lang, "training.note"), 10.5f * u->L.scale, u->t.text_faint,
-             u->L.rtl ? 2 : 0);
-
-    /* preparation checklist */
-    osa_rect prog = rectf(inner.x, inner.y + card_h + 14 * u->L.scale, inner.w,
-                          inner.h - card_h - 14 * u->L.scale);
-    if (prog.h > 70 * u->L.scale) {
-        ui_card(u, prog);
-        ui_label(u, rectf(prog.x + 18 * u->L.scale, prog.y + 12 * u->L.scale,
-                          prog.w - 36 * u->L.scale, 20 * u->L.scale),
-                 tt(s->lang, "training.plan"), 11.5f * u->L.scale, u->t.text_dim,
+    /* dataset: bundled lexicon or a file the user picked */
+    {
+        osa_rect note = rectf(cfg.x + p, y, cfg.w - p * 2, 74 * u->L.scale);
+        c_fill_round(u->c, note, u->L.radius_sm, u->t.panel_alt);
+        c_stroke_round(u->c, note, u->L.radius_sm, 1.0f, u->t.border_soft);
+        ui_label(u, rectf(note.x + 12 * u->L.scale, note.y + 8 * u->L.scale,
+                          note.w - 24 * u->L.scale, 16 * u->L.scale),
+                 kl(s, "training.dataset"), UI_FS_TINY * u->L.scale, u->t.text_faint,
                  u->L.rtl ? 2 : 0);
-        float ly = prog.y + 40 * u->L.scale;
-        for (int i = 0; i < 3 && ly + 24 * u->L.scale < prog.y + prog.h; i++) {
-            osa_rect row = rectf(prog.x + 18 * u->L.scale, ly, prog.w - 36 * u->L.scale,
-                                 22 * u->L.scale);
-            float dx = u->L.rtl ? row.x + row.w - 5 * u->L.scale : row.x + 5 * u->L.scale;
-            c_circle(u->c, dx, row.y + 10 * u->L.scale, 4 * u->L.scale,
-                     i == 0 ? u->t.success : u->t.border);
-            ui_label(u, rectf(row.x + 20 * u->L.scale, row.y, row.w - 40 * u->L.scale,
-                              22 * u->L.scale),
-                     tt(s->lang, i == 0 ? "training.s1" : i == 1 ? "training.s2" : "training.s3"),
-                     11 * u->L.scale, i == 0 ? u->t.text : u->t.text_dim, u->L.rtl ? 2 : 0);
-            ly += 26 * u->L.scale;
+        const char *name = s->dataset_path[0] ? osa_path_basename(s->dataset_path)
+                                              : kl(s, "training.datasetbuiltin");
+        ui_label(u, rectf(note.x + 12 * u->L.scale, note.y + 24 * u->L.scale,
+                          note.w - 24 * u->L.scale, 20 * u->L.scale),
+                 name, UI_FS_SMALL * u->L.scale, u->t.text, u->L.rtl ? 2 : 0);
+        float bw = note.w - 24 * u->L.scale;
+        if (ui_button_ghost(u, 6110, rectf(note.x + 12 * u->L.scale,
+                                           note.y + 46 * u->L.scale, bw, 22 * u->L.scale),
+                            kl(s, "training.choose")))
+            s->request = SHELL_REQ_PICK_DATASET;
+    }
+    y += 86 * u->L.scale;
+
+    if (y + 40 * u->L.scale > cfg.y + cfg.h - 6 * u->L.scale)
+        y = cfg.y + cfg.h - 46 * u->L.scale;
+    osa_rect run_r = rectf(cfg.x + p, y, cfg.w - p * 2, 40 * u->L.scale);
+    if (ui_button_busy(u, 6200, run_r, kl(s, "btn.train"), true, s->training)) {
+        osa_error err;
+        s->training = true;
+        osa_train_result res;
+        memset(&res, 0, sizeof res);
+        bool ok = osa_app_train(s->app, s->dataset_path[0] ? s->dataset_path : NULL,
+                                s->train_epochs, &res, &err);
+        s->training = false;
+        s->trained = ok;
+        if (ok) {
+            snprintf(s->train_log, sizeof s->train_log, "%s", res.log);
+            shell_set_message(s, false, "%s", kl(s, res.activated ? "training.done"
+                                                                  : "training.donenotactive"));
+            free(s->models_json);
+            s->models_json = osa_app_models_json(s->app, NULL);
+        } else {
+            snprintf(s->train_log, sizeof s->train_log, "%s: %s", kl(s, "msg.failed"),
+                     err.msg);
+            shell_set_message(s, true, "%s: %s", kl(s, "msg.failed"), err.msg);
         }
+    }
+    /* the three preparation steps, so the screen explains itself before a run */
+    ui_card(u, stepsc);
+    ui_label(u, rectf(stepsc.x + p, stepsc.y + 12 * u->L.scale,
+                      stepsc.w - p * 2, 20 * u->L.scale), kl(s, "training.checklist"),
+             UI_FS_SMALL * u->L.scale, u->t.text_dim, u->L.rtl ? 2 : 0);
+    c_hline(u->c, stepsc.x + p, stepsc.x + stepsc.w - p, stepsc.y + 34 * u->L.scale, 1,
+            u->t.border_soft);
+    y = stepsc.y + 44 * u->L.scale;
+    const char *steps[3] = { "training.s1", "training.s2", "training.s3" };
+    for (int i = 0; i < 3; i++) {
+        if (y + 24 * u->L.scale > stepsc.y + stepsc.h - 30 * u->L.scale) break;
+        bool done = s->trained;
+        float dx = u->L.rtl ? stepsc.x + stepsc.w - p - 9 * u->L.scale
+                            : stepsc.x + p + 9 * u->L.scale;
+        c_circle(u->c, dx, y + 8 * u->L.scale, 8 * u->L.scale,
+                 done ? u->t.success_soft : u->t.panel_alt);
+        if (done) {
+            c_line(u->c, dx - 3 * u->L.scale, y + 8 * u->L.scale, dx - 0.5f * u->L.scale,
+                   y + 11 * u->L.scale, 1.7f * u->L.scale, u->t.success);
+            c_line(u->c, dx - 0.5f * u->L.scale, y + 11 * u->L.scale,
+                   dx + 3.5f * u->L.scale, y + 4.5f * u->L.scale, 1.7f * u->L.scale,
+                   u->t.success);
+        } else {
+            char nb[8];
+            snprintf(nb, sizeof nb, "%d", i + 1);
+            ui_label(u, rectf(dx - 8 * u->L.scale, y, 16 * u->L.scale,
+                              18 * u->L.scale), nb, UI_FS_TINY * u->L.scale,
+                     u->t.text_faint, 1);
+        }
+        float tx = u->L.rtl ? stepsc.x + p : stepsc.x + p + 24 * u->L.scale;
+        ui_label(u, rectf(tx, y, stepsc.w - p * 2 - 24 * u->L.scale, 18 * u->L.scale),
+                 kl(s, steps[i]), UI_FS_SMALL * u->L.scale,
+                 done ? u->t.text : u->t.text_dim, u->L.rtl ? 2 : 0);
+        y += 25 * u->L.scale;
+    }
+    if (show_steps)
+        ui_label(u, rectf(stepsc.x + p, stepsc.y + stepsc.h - 22 * u->L.scale,
+                          stepsc.w - p * 2, 18 * u->L.scale),
+                 kl(s, "training.note"), UI_FS_TINY * u->L.scale, u->t.text_faint,
+                 u->L.rtl ? 2 : 0);
+
+    /* ---- run log ---- */
+    osa_rect logcard = rectf(right.x, right.y, right.w, log_h);
+    ui_card(u, logcard);
+    c_fill_round(u->c, rectf(logcard.x + p, logcard.y + 16 * u->L.scale,
+                             3 * u->L.scale, 15 * u->L.scale), 1.5f * u->L.scale,
+                 s->trained ? u->t.success : u->t.text_faint);
+    ui_label(u, rectf(logcard.x + p + 10 * u->L.scale, logcard.y + 14 * u->L.scale,
+                      logcard.w - p * 2 - 120 * u->L.scale, 20 * u->L.scale),
+             kl(s, "training.log"), UI_FS_SMALL * u->L.scale, u->t.text_dim,
+             u->L.rtl ? 2 : 0);
+    if (s->train_log[0]) {
+        osa_rect clr = rectf(u->L.rtl ? logcard.x + p : logcard.x + logcard.w - p - 60 * u->L.scale,
+                             logcard.y + 9 * u->L.scale, 60 * u->L.scale,
+                             26 * u->L.scale);
+        if (ui_button_ghost(u, 6201, clr, kl(s, "btn.copy"))) {
+            osa_clipboard_set(s->train_log);
+            shell_set_message(s, false, "%s", kl(s, "msg.copied"));
+        }
+    }
+    c_hline(u->c, logcard.x + p, logcard.x + logcard.w - p, logcard.y + 42 * u->L.scale,
+            1, u->t.border_soft);
+    osa_rect logr = rectf(logcard.x + p, logcard.y + 52 * u->L.scale,
+                          logcard.w - p * 2, logcard.h - 66 * u->L.scale);
+    c_fill_round(u->c, logr, u->L.radius_sm, u->t.bg_alt);
+    if (s->train_log[0]) {
+        text_opts o = text_default_opts(UI_FS_MONO * u->L.scale);
+        o.max_width = logr.w - 24 * u->L.scale;
+        o.line_height = UI_FS_MONO * u->L.scale * 1.75f;
+        o.align = 0;              /* a log is always read left to right */
+        o.rtl = false;
+        text_draw_box(u->c, u->reg, UI_FS_MONO * u->L.scale, u->t.text_dim,
+                      rect_inset(logr, 12 * u->L.scale), s->train_log, o);
+    } else {
+        ui_label(u, rectf(logr.x, logr.y + logr.h * 0.42f, logr.w, 22 * u->L.scale),
+                 kl(s, "training.nolog"), UI_FS_BODY * u->L.scale, u->t.text_faint, 1);
+    }
+
+    /* ---- version history: every trained model stays installed ---- */
+    osa_rect ver = verc;
+    if (ver.h < 96 * u->L.scale) return;
+    /* Cap the card to its rows: a version list with two entries should not own a
+     * third of the screen. */
+    {
+        int nv = 0;
+        if (s->models_json) {
+            for (const char *q = s->models_json; *q; q++) if (*q == '{') nv++;
+            if (nv > 6) nv = 6;
+        }
+        float need = 66 * u->L.scale + nv * 42 * u->L.scale + 14 * u->L.scale;
+        if (ver.h > need) ver.h = need;
+    }
+    ui_card(u, ver);
+    ui_label(u, rectf(ver.x + p, ver.y + 14 * u->L.scale, ver.w - p * 2, 20 * u->L.scale),
+             kl(s, "training.versions"), UI_FS_SMALL * u->L.scale, u->t.text_dim,
+             u->L.rtl ? 2 : 0);
+    c_hline(u->c, ver.x + p, ver.x + ver.w - p, ver.y + 40 * u->L.scale, 1,
+            u->t.border_soft);
+    ui_label(u, rectf(ver.x + p, ver.y + 44 * u->L.scale, ver.w - p * 2,
+                      16 * u->L.scale),
+             kl(s, "training.versionshint"), UI_FS_TINY * u->L.scale, u->t.text_faint,
+             u->L.rtl ? 2 : 0);
+    {
+        if (!s->models_json) s->models_json = osa_app_models_json(s->app, NULL);
+        model_ud mu = { g_models, 0 };
+        shell_json_walk(s->models_json, model_visit, &mu);
+        float ry = ver.y + 66 * u->L.scale;
+        float rh = 42 * u->L.scale;
+        int shown = 0;
+        canvas_clip_push(u->c, rect_inset(ver, p));
+        for (int i = mu.n - 1; i >= 0; i--) {
+            if (ry + rh > ver.y + ver.h - 10 * u->L.scale) break;
+            osa_rect rr = rectf(ver.x + p, ry, ver.w - p * 2, rh - 4 * u->L.scale);
+            bool hov = ui_hit(u, rr);
+            if (hov) c_fill_round(u->c, rr, u->L.radius_sm, u->t.panel_alt);
+            float aw = 92 * u->L.scale;
+            float tx = u->L.rtl ? rr.x + aw + 10 * u->L.scale : rr.x + 8 * u->L.scale;
+            float tw = rr.w - aw - 26 * u->L.scale;
+            ui_label(u, rectf(tx, rr.y + 3 * u->L.scale, tw, 18 * u->L.scale),
+                     g_models[i].id, UI_FS_SMALL * u->L.scale, u->t.text,
+                     u->L.rtl ? 2 : 0);
+            ui_label(u, rectf(tx, rr.y + 20 * u->L.scale, tw, 15 * u->L.scale),
+                     g_models[i].name, UI_FS_TINY * u->L.scale, u->t.text_faint,
+                     u->L.rtl ? 2 : 0);
+            osa_rect ar = rectf(u->L.rtl ? rr.x : rr.x + rr.w - aw, rr.y + 4 * u->L.scale,
+                                aw, 26 * u->L.scale);
+            if (g_models[i].active) {
+                ui_pill(u, ar, kl(s, "models.active"), u->t.accent, u->t.accent_soft);
+            } else if (ui_button_ghost(u, 6300 + i, ar, kl(s, "btn.activate"))) {
+                osa_error err;
+                if (osa_app_activate_model(s->app, g_models[i].id, &err)) {
+                    free(s->models_json);
+                    s->models_json = NULL;
+                    shell_set_message(s, false, "%s", kl(s, "msg.ok"));
+                } else {
+                    shell_set_message(s, true, "%s: %s", kl(s, "msg.failed"), err.msg);
+                }
+            }
+            ry += rh;
+            shown++;
+        }
+        canvas_clip_pop(u->c);
+        if (shown == 0)
+            ui_label(u, rectf(ver.x + p, ver.y + ver.h * 0.5f, ver.w - p * 2,
+                              20 * u->L.scale),
+                     kl(s, "training.noversions"), UI_FS_SMALL * u->L.scale,
+                     u->t.text_faint, 1);
     }
 }
 
 /* ---- Evaluation --------------------------------------------------- */
 
+typedef struct {
+    double wer, cer, rtf;
+    int    samples;
+} eval_sum;
+
+/* ---- Evaluation --------------------------------------------------- */
+
+/* Evaluation is a measurement screen, so it is built around one rule: never
+ * show a number without saying what it was measured on. The header names the
+ * model and the set; each row shows the reference and the hypothesis it is
+ * compared against, which is what makes a WER of 9.7% believable or suspect. */
 static void draw_evaluation(shell_state *s, ui_context *u, osa_rect body) {
-    float pad = 20 * u->L.scale;
+    float pad = 22 * u->L.scale;
     osa_rect inner = rect_inset(body, pad);
+    float gap = 10 * u->L.scale;
+
+    double wer = 0, cer = 0, rtf = 0, samples = 0, audio_s = 0;
+    char model[160] = "", engine[40] = "";
+    if (s->eval_json) {
+        const char *e = s->eval_json + strlen(s->eval_json);
+        shell_json_num(s->eval_json, e, "\"wer\"", &wer);
+        shell_json_num(s->eval_json, e, "\"cer\"", &cer);
+        shell_json_num(s->eval_json, e, "\"rtf\"", &rtf);
+        shell_json_num(s->eval_json, e, "\"samples\"", &samples);
+        shell_json_num(s->eval_json, e, "\"audio_s\"", &audio_s);
+        shell_json_str(s->eval_json, e, "\"model\"", model, sizeof model);
+        shell_json_str(s->eval_json, e, "\"engine\"", engine, sizeof engine);
+    }
+
+    /* ---- tiles ---- */
+    float tile_h = 70 * u->L.scale;
+    float tw = (inner.w - gap * 3) / 4;
+    const char *labels[4] = {"eval.wer", "eval.cer", "eval.rtf", "eval.samples"};
+    osa_color tints[4] = {u->t.accent, u->t.accent2, u->t.success, u->t.warning};
+    char vals[4][64], vlocs[4][96];
+    for (int i = 0; i < 4; i++) {
+        if (!s->eval_json) { osa_strlcpy(vals[i], "—", sizeof vals[i]); }
+        else if (i == 0) snprintf(vals[i], sizeof vals[i], "%.1f%%", wer * 100.0);
+        else if (i == 1) snprintf(vals[i], sizeof vals[i], "%.1f%%", cer * 100.0);
+        else if (i == 2) snprintf(vals[i], sizeof vals[i], "%.2f×", rtf);
+        else snprintf(vals[i], sizeof vals[i], "%d", (int)(samples + 0.5));
+        num_fa(s, vals[i], vlocs[i], sizeof vlocs[i]);
+    }
+    for (int i = 0; i < 4; i++) {
+        int slot = u->L.rtl ? (3 - i) : i;
+        stat_tile(u, rectf(inner.x + (tw + gap) * i, inner.y, tw, tile_h),
+                  kl(s, labels[slot]), vlocs[slot], tints[slot]);
+    }
+
+    /* ---- result card ---- */
+    float top = inner.y + tile_h + 14 * u->L.scale;
+    float card_h = inner.y + inner.h - top;
+    if (s->eval_json) {
+        /* count the rows first: a card that stops just after its last row reads
+         * as a finished report; one that runs to the window floor reads as a
+         * list that failed to load. */
+        const char *sk = strstr(s->eval_json, "\"skipped\"");
+        const char *ia = sk ? strstr(sk, "\"items\"") : strstr(s->eval_json, "\"items\"");
+        int nrows = 0;
+        for (const char *q = ia ? strchr(ia, '[') : NULL; q && *q && *q != ']'; q++)
+            if (*q == '{') nrows++;
+        if (nrows > 12) nrows = 12;
+        float want = 58 * u->L.scale + nrows * 50 * u->L.scale + 40 * u->L.scale;
+        if (want < card_h) card_h = want;
+    }
+    osa_rect card = rectf(inner.x, top, inner.w, card_h);
+    ui_card(u, card);
+    float p = 16 * u->L.scale;
 
     if (!s->eval_json) {
-        osa_rect card = rectf(inner.x, inner.y, inner.w, inner.h);
-        ui_card(u, card);
-        osa_rect run_r = rectf(card.x + card.w - 150 * u->L.scale,
-                               card.y + 16 * u->L.scale, 130 * u->L.scale, 34 * u->L.scale);
-        if (ui_button(u, 7000, run_r, tt(s->lang, "btn.run"), true))
+        /* Empty state: it says what the run does and what it costs, because
+         * "Run" with no explanation is a button nobody presses twice. */
+        float cy = card.y + card.h * 0.34f;
+        ui_label(u, rectf(card.x + p, cy, card.w - p * 2, 24 * u->L.scale),
+                 kl(s, "eval.emptyhint"), UI_FS_BODY * u->L.scale, u->t.text_dim, 1);
+        ui_label(u, rectf(card.x + p, cy + 26 * u->L.scale, card.w - p * 2, 20 * u->L.scale),
+                 kl(s, "eval.emptysub"), UI_FS_SMALL * u->L.scale, u->t.text_faint, 1);
+        float bw = 140 * u->L.scale;
+        osa_rect run_r = rectf(card.x + (card.w - bw) * 0.5f, cy + 58 * u->L.scale, bw,
+                               34 * u->L.scale);
+        if (ui_button(u, 7000, run_r, kl(s, "btn.run"), true)) {
+            free(s->eval_json);
             s->eval_json = osa_app_evaluate(s->app, NULL);
-        osa_rect msg = rectf(card.x + 24 * u->L.scale, card.y + 24 * u->L.scale,
-                             card.w - 200 * u->L.scale, 22 * u->L.scale);
-        ui_label(u, msg, tt(s->lang, "eval.sub"), 12 * u->L.scale, u->t.text_dim,
-                 u->L.rtl ? 2 : 0);
-        ui_label(u, rect_inset(rectf(card.x, card.y + 80 * u->L.scale, card.w,
-                                     card.h - 80 * u->L.scale), 24 * u->L.scale),
-                 tt(s->lang, "eval.emptyhint"), 12 * u->L.scale, u->t.text_faint, 1);
+            if (s->eval_json) shell_set_message(s, false, "%s", kl(s, "msg.ok"));
+            else shell_set_message(s, true, "%s: %s", kl(s, "msg.failed"),
+                                   kl(s, "eval.nofail"));
+        }
         return;
     }
 
-    /* Aggregates live *after* the items array; scanning forward from
-     * "languages" would find a per-sentence value first. Take the last
-     * occurrence of each key in the language block instead. */
-    double wer = 0, cer = 0;
-    const char *eval_end = s->eval_json + strlen(s->eval_json);
-    const char *p = s->eval_json;
-    for (;;) {
-        const char *hit = strstr(p, "\"wer\"");
-        if (!hit) break;
-        double v = 0;
-        if (json_num(hit, eval_end, "\"wer\"", &v)) wer = v;
-        p = hit + 5;
+    /* header: what was measured, with the run button on the trailing edge */
+    float bw = 124 * u->L.scale;
+    osa_rect run_r = rectf(u->L.rtl ? card.x + p : card.x + card.w - p - bw,
+                           card.y + 10 * u->L.scale, bw, 32 * u->L.scale);
+    if (ui_button_ghost(u, 7000, run_r, kl(s, "eval.rerun"))) {
+        free(s->eval_json);
+        s->eval_json = osa_app_evaluate(s->app, NULL);
+        if (s->eval_json) shell_set_message(s, false, "%s", kl(s, "msg.ok"));
+        else shell_set_message(s, true, "%s", kl(s, "msg.failed"));
     }
-    p = s->eval_json;
-    for (;;) {
-        const char *hit = strstr(p, "\"cer\"");
-        if (!hit) break;
-        double v = 0;
-        if (json_num(hit, eval_end, "\"cer\"", &v)) cer = v;
-        p = hit + 5;
-    }
-    float cw = (inner.w - 28 * u->L.scale) / 3.0f;
-    char v[48], loc[64];
-    snprintf(v, sizeof v, "%.1f%%", wer * 100.0);
-    text_localize_digits(v, s->lang == UI_FA ? "fa" : "en", loc, sizeof loc);
-    draw_stat_card(u, rectf(inner.x, inner.y, cw, 76 * u->L.scale), "WER", loc, u->t.accent);
-    snprintf(v, sizeof v, "%.1f%%", cer * 100.0);
-    text_localize_digits(v, s->lang == UI_FA ? "fa" : "en", loc, sizeof loc);
-    draw_stat_card(u, rectf(inner.x + cw + 14 * u->L.scale, inner.y, cw, 76 * u->L.scale),
-                   "CER", loc, u->t.warning);
-    snprintf(v, sizeof v, "%d", osa_cpu_count());
-    text_localize_digits(v, s->lang == UI_FA ? "fa" : "en", loc, sizeof loc);
-    draw_stat_card(u, rectf(inner.x + (cw + 14 * u->L.scale) * 2, inner.y, cw, 76 * u->L.scale),
-                   tt(s->lang, "settings.threads"), loc, u->t.success);
+    char head[320], hl[360];
+    snprintf(head, sizeof head, kl(s, "eval.headline"), model[0] ? model : "—",
+             engine[0] ? engine : "—");
+    num_fa(s, head, hl, sizeof hl);
+    ui_label(u, rectf(card.x + p, card.y + 10 * u->L.scale,
+                      card.w - p * 2 - bw - 12 * u->L.scale, 20 * u->L.scale), hl,
+             UI_FS_SMALL * u->L.scale, u->t.text, u->L.rtl ? 2 : 0);
+    char sub[192], subloc[224];
+    snprintf(sub, sizeof sub, kl(s, "eval.subline"), (int)(samples + 0.5), audio_s);
+    num_fa(s, sub, subloc, sizeof subloc);
+    ui_label(u, rectf(card.x + p, card.y + 30 * u->L.scale,
+                      card.w - p * 2 - bw - 12 * u->L.scale, 18 * u->L.scale), subloc,
+             UI_FS_TINY * u->L.scale, u->t.text_faint, u->L.rtl ? 2 : 0);
+    c_hline(u->c, card.x + p, card.x + card.w - p, card.y + 50 * u->L.scale, 1,
+            u->t.border_soft);
 
-    osa_rect table = rectf(inner.x, inner.y + 90 * u->L.scale, inner.w,
-                           inner.h - 90 * u->L.scale);
-    ui_card(u, table);
-    ui_label(u, rectf(table.x + 18 * u->L.scale, table.y + 14 * u->L.scale,
-                      table.w - 36 * u->L.scale, 18 * u->L.scale),
-             tt(s->lang, "eval.samples"), 11 * u->L.scale, u->t.text_dim, u->L.rtl ? 2 : 0);
-    float ly = table.y + 40 * u->L.scale;
-    int shown = 0;
-    const char *sp = s->eval_json;
-    const char *end = s->eval_json + strlen(s->eval_json);
-    while (shown < 10 && sp && (sp = strstr(sp, "\"ref\"")) != NULL) {
-        char ref[300], hyp[300];
-        if (!json_str(sp, end, "\"ref\"", ref, sizeof ref)) break;
-        const char *hp = strstr(sp, "\"hyp\"");
-        if (!hp) break;
-        if (!json_str(hp, end, "\"hyp\"", hyp, sizeof hyp)) break;
-        if (ly + 26 * u->L.scale > table.y + table.h - 8) break;
-        osa_color c = osa_streq(ref, hyp) ? u->t.success : u->t.warning;
-        float half = (table.w - 36 * u->L.scale) * 0.47f;
-        float cref = u->L.rtl ? table.x + 18 * u->L.scale + half + 12 * u->L.scale
-                              : table.x + 18 * u->L.scale;
-        ui_label(u, rectf(cref, ly, half, 20 * u->L.scale), ref, 10.5f * u->L.scale,
-                 u->t.text_dim, u->L.rtl ? 2 : 0);
-        float chyp = u->L.rtl ? table.x + 18 * u->L.scale : cref + half + 12 * u->L.scale;
-        ui_label(u, rectf(chyp, ly, half, 20 * u->L.scale), hyp, 10.5f * u->L.scale, c,
-                 u->L.rtl ? 2 : 0);
-        ly += 24 * u->L.scale;
-        shown++;
-        sp = hp + 5;
+    /* A language the active model has no lexicon for is not "0% accurate": it
+     * was not measured. That distinction is the whole point of the line below. */
+    char skip_note[384] = "";
+    {
+        const char *sk = strstr(s->eval_json, "\"skipped\"");
+        if (sk) {
+            const char *ob = strchr(sk, '{');
+            if (ob) {
+                char lang[16] = "", reason[256] = "";
+                shell_json_str(ob, strchr(ob, '}') ? strchr(ob, '}') : ob + 1,
+                               "\"lang\"", lang, sizeof lang);
+                shell_json_str(ob, strchr(ob, '}') ? strchr(ob, '}') : ob + 1,
+                               "\"reason\"", reason, sizeof reason);
+                if (lang[0]) {
+                    /* The language name goes through the same digit
+                     * localiser as the rest of the screen; without it this one
+                     * line kept Latin digits inside a Persian sentence and sat
+                     * in front of its own quote marks. */
+                    /* Keep this line in a markup-free form: the language chip
+                     * in the rows already names the language, so the note only
+                     * has to say it was skipped and why. */
+                    char note[384];
+                    snprintf(note, sizeof note, kl(s, "eval.skipped"),
+                             osa_starts(lang, "fa") ? "FA" : "EN");
+                    osa_strlcpy(skip_note, note, sizeof skip_note);
+                }
+            }
+        }
     }
+
+    /* ---- rows: one per sentence pair, reference above hypothesis ---- */
+    float note_h = skip_note[0] ? 20 * u->L.scale : 0;
+    osa_rect list = rectf(card.x + p, card.y + 58 * u->L.scale + note_h, card.w - p * 2,
+                          card.h - 70 * u->L.scale - note_h);
+    if (skip_note[0])
+        ui_label(u, rectf(card.x + p, card.y + 56 * u->L.scale,
+                          card.w - p * 2, 18 * u->L.scale), skip_note,
+                 UI_FS_TINY * u->L.scale, u->t.warning, u->L.rtl ? 2 : 0);
+    canvas_clip_push(u->c, list);
+    float row_h = 50 * u->L.scale;
+    int shown = 0;
+    const char *json = s->eval_json;
+    /* Two passes over the same arrays would need a real parser; one walk with
+     * the row geometry is enough, and it keeps the brace-in-a-string hazard out
+     * of the screen. */
+    /* The payload nests an "items" array per language *and* a flat one at the
+     * top level. Search from the flat one (it is preceded by "skipped"), or the
+     * screen renders every sample twice — once without its language tag. */
+    const char *flat = strstr(json, "\"skipped\"");
+    const char *arr = flat ? strstr(flat, "\"items\"") : strstr(json, "\"items\"");
+    if (arr) {
+        const char *q = strchr(arr, '[');
+        while (q && *q && shown < 40) {
+            const char *ob = strchr(q, '{');
+            if (!ob) break;
+            const char *end = strchr(ob, '}');
+            if (!end) break;
+            char ref[512] = "", hyp[512] = "", lang[16] = "";
+            shell_json_str(ob, end, "\"ref\"", ref, sizeof ref);
+            shell_json_str(ob, end, "\"hyp\"", hyp, sizeof hyp);
+            shell_json_str(ob, end, "\"lang\"", lang, sizeof lang);
+            if (!ref[0]) break;
+            osa_rect rr = rectf(list.x, list.y + shown * row_h, list.w, row_h - 4 * u->L.scale);
+            c_fill_round(u->c, rr, u->L.radius_sm, shown % 2 ? u->t.bg_alt : u->t.panel);
+            /* reference */
+            ui_label(u, rectf(u->L.rtl ? rr.x + 44 * u->L.scale : rr.x + 12 * u->L.scale,
+                              rr.y + 5 * u->L.scale,
+                              rr.w - 56 * u->L.scale - 44 * u->L.scale, 18 * u->L.scale),
+                     ref, UI_FS_SMALL * u->L.scale, u->t.text, u->L.rtl ? 2 : 0);
+            /* hypothesis: green when it matches, warning tint when it differs */
+            bool same = osa_streq(ref, hyp);
+            ui_label(u, rectf(u->L.rtl ? rr.x + 44 * u->L.scale : rr.x + 12 * u->L.scale,
+                              rr.y + 23 * u->L.scale,
+                              rr.w - 56 * u->L.scale - 44 * u->L.scale, 18 * u->L.scale),
+                     hyp, UI_FS_SMALL * u->L.scale,
+                     same ? u->t.success : u->t.warning, u->L.rtl ? 2 : 0);
+            /* language chip on the trailing edge */
+            osa_rect lc = rectf(u->L.rtl ? rr.x + 8 * u->L.scale : rr.x + rr.w - 36 * u->L.scale,
+                                rr.y + (rr.h - 20 * u->L.scale) * 0.5f, 28 * u->L.scale,
+                                20 * u->L.scale);
+            c_fill_round(u->c, lc, 6 * u->L.scale, u->t.panel_alt);
+            ui_label(u, lc, osa_starts(lang, "fa") ? "FA" : "EN", UI_FS_TINY * u->L.scale,
+                     u->t.text_faint, 1);
+            shown++;
+            q = end + 1;
+        }
+    }
+    canvas_clip_pop(u->c);
+    if (shown == 0) {
+        ui_label(u, rectf(list.x, list.y + list.h * 0.4f, list.w, 22 * u->L.scale),
+                 kl(s, "eval.nofail"), UI_FS_BODY * u->L.scale, u->t.text_faint, 1);
+        return;
+    }
+    /* footer caveat: a number without its scope is a lie */
+    c_hline(u->c, card.x + p, card.x + card.w - p, card.y + card.h - 26 * u->L.scale, 1,
+            u->t.border_soft);
+    ui_label(u, rectf(card.x + p, card.y + card.h - 20 * u->L.scale,
+                      card.w - p * 2, 16 * u->L.scale),
+             kl(s, "eval.caveat"), UI_FS_TINY * u->L.scale, u->t.text_faint,
+             u->L.rtl ? 2 : 0);
 }
 
 /* ---- Settings ----------------------------------------------------- */
 
+static void settings_group(ui_context *u, osa_rect r, const char *title) {
+    ui_card(u, r);
+    float p = 16 * u->L.scale;
+    ui_label(u, rectf(r.x + p, r.y + 12 * u->L.scale, r.w - p * 2, 20 * u->L.scale), title,
+             UI_FS_SMALL * u->L.scale, u->t.text_dim, u->L.rtl ? 2 : 0);
+    c_hline(u->c, r.x + p, r.x + r.w - p, r.y + 36 * u->L.scale, 1, u->t.border_soft);
+}
+
 static void draw_settings(shell_state *s, ui_context *u, osa_rect body) {
-    float pad = 20 * u->L.scale;
+    float pad = 22 * u->L.scale;
     osa_rect inner = rect_inset(body, pad);
-    float cw = inner.w > 760 * u->L.scale ? inner.w * 0.58f : inner.w;
-    osa_rect card = rectf(u->L.rtl ? inner.x + inner.w - cw : inner.x, inner.y, cw, inner.h);
-    ui_card(u, card);
+    float gap = 14 * u->L.scale;
+    float col_w = (inner.w - gap) * 0.5f;
+    float row_h = 50 * u->L.scale;
+    float ctrl_w = 140 * u->L.scale;
+    float sw = 42 * u->L.scale, sh = 23 * u->L.scale;
+    /* Cards are sized to their content, the way a settings page is: stretching
+     * a three-row card to the bottom of a 900-pixel window only creates empty
+     * space that reads as a missing control. */
+    float bottom_h = 178 * u->L.scale;
+    float half_h = 352 * u->L.scale;
+    float total_h = half_h + gap + bottom_h;
+    if (total_h > inner.h) {
+        float f = inner.h / total_h;
+        half_h *= f;
+        bottom_h *= f;
+    }
 
-    float y = card.y + 16 * u->L.scale;
-    float row_h = 46 * u->L.scale;
-    float lx = card.x + 18 * u->L.scale;
-    float lw = card.w - 36 * u->L.scale;
-    float ctrl_w = 150 * u->L.scale;
+    /* Leading column: appearance. Trailing: translation. Mirrored in RTL. */
+    osa_rect a = rectf(u->L.rtl ? inner.x + col_w + gap : inner.x, inner.y, col_w, half_h);
+    osa_rect b = rectf(u->L.rtl ? inner.x : inner.x + col_w + gap, inner.y, col_w, half_h);
+    osa_rect c = rectf(inner.x, inner.y + half_h + gap, inner.w, bottom_h);
 
-    struct { const char *key; bool *val; } toggles[] = {
-        { "settings.dark", &s->dark },
-        { "settings.rtl", NULL },
-        { "settings.autodetect", &s->auto_detect },
-        { "settings.saveaudio", &s->save_audio },
-        { "settings.privacy", &s->privacy_logs },
-    };
-    for (int i = 0; i < 5; i++) {
-        osa_rect row = rectf(lx, y, lw, row_h);
-        ui_label(u, rectf(row.x, row.y + 12 * u->L.scale, row.w - ctrl_w - 10 * u->L.scale,
-                          22 * u->L.scale),
-                 tt(s->lang, toggles[i].key), 12 * u->L.scale, u->t.text, u->L.rtl ? 2 : 0);
-        osa_rect tg = rectf(u->L.rtl ? row.x : row.x + row.w - 44 * u->L.scale,
-                            row.y + 12 * u->L.scale, 44 * u->L.scale, 24 * u->L.scale);
-        bool changed = false;
-        if (toggles[i].val) {
-            bool before = *toggles[i].val;
-            if (ui_toggle_switch(u, 8000 + i, tg, toggles[i].val)) changed = true;
-            if (*toggles[i].val != before) changed = true;
-        } else {
-            bool rtl_on = s->lang == UI_FA;
-            if (ui_toggle_switch(u, 8000 + i, tg, &rtl_on)) {
-                s->lang = rtl_on ? UI_FA : UI_EN;
-                changed = true;
-            }
-        }
-        if (changed) {
-            if (i == 0) ui_set_theme(u, s->dark);
+    /* ================= appearance ================= */
+    settings_group(u, a, kl(s, "settings.appearance"));
+    float p = 18 * u->L.scale;
+    float y = a.y + 50 * u->L.scale;
+
+    setting_row(u, rectf(a.x + p, y, a.w - p * 2, row_h), kl(s, "settings.dark"),
+                kl(s, "settings.darkhint"));
+    {
+        osa_rect t = rectf(u->L.rtl ? a.x + p : a.x + a.w - p - sw, y + 6 * u->L.scale, sw, sh);
+        if (ui_toggle_switch(u, 8000, t, &s->dark)) {
+            ui_set_theme(u, s->dark);
             shell_save_prefs(s);
         }
-        y += row_h;
-        if (i < 4) c_hline(u->c, row.x, row.x + row.w, row.y + row_h - 0.5f, 1, u->t.border_soft);
+    }
+    y += row_h;
+
+    setting_row(u, rectf(a.x + p, y, a.w - p * 2, row_h), kl(s, "settings.rtl"),
+                kl(s, "settings.rtlhint"));
+    {
+        int v = s->lang == UI_FA ? 0 : 1;
+        osa_rect seg = rectf(u->L.rtl ? a.x + p : a.x + a.w - p - ctrl_w,
+                             y + 8 * u->L.scale, ctrl_w, 30 * u->L.scale);
+        if (ui_segmented(u, 8001, seg, "فارسی|English", &v, 2)) {
+            s->lang = v == 0 ? UI_FA : UI_EN;
+            shell_save_prefs(s);
+        }
+    }
+    y += row_h;
+
+    setting_row(u, rectf(a.x + p, y, a.w - p * 2, row_h), kl(s, "settings.scale"),
+                kl(s, "settings.scalehint"));
+    {
+        float frac = (s->scale - 0.85f) / 0.65f;
+        char pct[32];
+        snprintf(pct, sizeof pct, "%d%%", (int)(s->scale * 100.0f + 0.5f));
+        osa_rect sr = rectf(u->L.rtl ? a.x + p : a.x + a.w - p - ctrl_w - 44 * u->L.scale,
+                            y + 8 * u->L.scale, ctrl_w - 40 * u->L.scale, 28 * u->L.scale);
+        (void)frac;
+        if (ui_slider(u, 8002, sr, &s->scale, 0.85f, 1.5f)) shell_save_prefs(s);
+        ui_label(u, rectf(u->L.rtl ? sr.x + sr.w + 4 * u->L.scale
+                                   : a.x + a.w - p - 40 * u->L.scale,
+                          y + 8 * u->L.scale, 40 * u->L.scale, 28 * u->L.scale),
+                 pct, UI_FS_SMALL * u->L.scale, u->t.text_dim, u->L.rtl ? 0 : 2);
+    }
+    y += row_h;
+
+    setting_row(u, rectf(a.x + p, y, a.w - p * 2, row_h), kl(s, "settings.threads"),
+                kl(s, "settings.threadshint"));
+    {
+        osa_rect sr = rectf(u->L.rtl ? a.x + p : a.x + a.w - p - ctrl_w,
+                            y + 6 * u->L.scale, ctrl_w, 32 * u->L.scale);
+        if (ui_stepper(u, 8003, sr, &s->asr_threads, 1, 16)) shell_save_prefs(s);
     }
 
-    /* scale slider */
-    osa_rect srow = rectf(lx, y + 6 * u->L.scale, lw, 56 * u->L.scale);
-    ui_label(u, rectf(srow.x, srow.y, srow.w, 20 * u->L.scale),
-             tt(s->lang, "settings.scale"), 12 * u->L.scale, u->t.text, u->L.rtl ? 2 : 0);
-    osa_rect sl = rectf(srow.x, srow.y + 26 * u->L.scale, srow.w, 22 * u->L.scale);
-    if (ui_slider(u, 8100, sl, &s->scale, 0.8f, 1.6f)) shell_save_prefs(s);
-    y += 66 * u->L.scale;
+    /* ================= translation ================= */
+    settings_group(u, b, kl(s, "settings.translation"));
+    y = b.y + 50 * u->L.scale;
+    float half = (b.w - p * 2 - 10 * u->L.scale) * 0.5f;
 
-    /* threads */
-    osa_rect trow = rectf(lx, y, lw, 44 * u->L.scale);
-    ui_label(u, rectf(trow.x, trow.y + 10 * u->L.scale, trow.w - ctrl_w, 22 * u->L.scale),
-             tt(s->lang, "settings.threads"), 12 * u->L.scale, u->t.text, u->L.rtl ? 2 : 0);
-    osa_rect st = rectf(trow.x + (u->L.rtl ? 0 : trow.w - 130 * u->L.scale),
-                        trow.y + 8 * u->L.scale, 130 * u->L.scale, 28 * u->L.scale);
-    if (ui_stepper(u, 8200, st, &s->asr_threads, 1, osa_cpu_count() * 2)) shell_save_prefs(s);
+    char src_lbl[64], dst_lbl[64];
+    snprintf(src_lbl, sizeof src_lbl, "%s",
+             s->lang_src[0] ? shell_lang_name(s, s->lang_src) : kl(s, "lang.auto"));
+    snprintf(dst_lbl, sizeof dst_lbl, "%s",
+             s->lang_dst[0] ? shell_lang_name(s, s->lang_dst) : kl(s, "lang.auto"));
+    osa_rect src_r = rectf(u->L.rtl ? b.x + p + half + 10 * u->L.scale : b.x + p, y,
+                           half, 48 * u->L.scale);
+    osa_rect dst_r = rectf(u->L.rtl ? b.x + p : b.x + p + half + 10 * u->L.scale, y,
+                           half, 48 * u->L.scale);
+    lang_picker(s, u, src_r, 8100, kl(s, "lang.from"), src_lbl, u->popup_id == 8100);
+    lang_picker(s, u, dst_r, 8101, kl(s, "lang.to"), dst_lbl, u->popup_id == 8101);
+    y += 58 * u->L.scale;
 
-    /* data location footer */
-    osa_app_status stat;
-    osa_app_get_status(s->app, &stat);
-    char data[OSAI_MAX_PATH + 32];
-    snprintf(data, sizeof data, "%s: %s", tt(s->lang, "settings.datalocation"), stat.data_root);
-    ui_label(u, rectf(card.x + 18 * u->L.scale, card.y + card.h - 30 * u->L.scale,
-                      card.w - 36 * u->L.scale, 18 * u->L.scale),
-             data, 9.5f * u->L.scale, u->t.text_faint, u->L.rtl ? 2 : 0);
-    if (ui_button(u, 8300, rectf(u->L.rtl ? card.x + 18 * u->L.scale
-                                          : card.x + card.w - 118 * u->L.scale,
-                                 card.y + card.h - 62 * u->L.scale, 100 * u->L.scale,
-                                 28 * u->L.scale), tt(s->lang, "btn.openfolder"), false))
-        osa_open_in_explorer(stat.data_root);
-
-    /* privacy note card on the left */
-    if (inner.w > 760 * u->L.scale) {
-        osa_rect side = rectf(u->L.rtl ? inner.x : inner.x + cw + 14 * u->L.scale,
-                              inner.y, inner.w - cw - 14 * u->L.scale, inner.h);
-        ui_card(u, side);
-        text_opts o = text_default_opts(12 * u->L.scale);
-        o.max_width = side.w - 40 * u->L.scale;
-        o.line_height = 12 * u->L.scale * 1.9f;
-        o.rtl = u->L.rtl;
-        o.align = u->L.rtl ? 2 : 0;
-        text_draw_box(u->c, u->reg, 12 * u->L.scale, u->t.text_dim,
-                      rectf(side.x + 20 * u->L.scale, side.y + 24 * u->L.scale,
-                            side.w - 40 * u->L.scale, side.h - 48 * u->L.scale),
-                      tt(s->lang, "settings.privacynote"), o);
+    ui_label(u, rectf(b.x + p, y, b.w - p * 2, 16 * u->L.scale), kl(s, "lang.register"),
+             UI_FS_TINY * u->L.scale, u->t.text_faint, u->L.rtl ? 2 : 0);
+    y += 18 * u->L.scale;
+    {
+        osa_rect seg = rectf(b.x + p, y, b.w - p * 2, 34 * u->L.scale);
+        int v = (int)s->style;
+        if (ui_segmented(u, 8102, seg, kl(s, "lang.styles"), &v, MT_STYLE_COUNT)) {
+            s->style = (mt_style)v;
+            osa_app_set_style(s->app, s->style);
+            shell_save_prefs(s);
+            shell_run_translate(s);
+        }
     }
+    y += 38 * u->L.scale;
+    ui_label(u, rectf(b.x + p, y, b.w - p * 2, 16 * u->L.scale), kl(s, "lang.registerhint"),
+             UI_FS_TINY * u->L.scale, u->t.text_faint, u->L.rtl ? 2 : 0);
+    y += 22 * u->L.scale;
+
+    /* RTL: the switch leads the cluster on the right, its label follows on the
+     * left. LTR is the mirror image. */
+    setting_row(u, rectf(u->L.rtl ? b.x + p : b.x + p + sw + 12 * u->L.scale, y,
+                         b.w - p * 2 - sw - 12 * u->L.scale, 42 * u->L.scale),
+                kl(s, "settings.autodetect"), kl(s, "settings.autodetecthint"));
+    {
+        osa_rect t = rectf(u->L.rtl ? b.x + b.w - p - sw : b.x + p,
+                           y + 8 * u->L.scale, sw, sh);
+        if (ui_toggle_switch(u, 8103, t, &s->auto_detect)) {
+            shell_save_prefs(s);
+            shell_run_translate(s);
+        }
+    }
+    y += 42 * u->L.scale;
+    setting_row(u, rectf(u->L.rtl ? b.x + p : b.x + p + sw + 12 * u->L.scale, y,
+                         b.w - p * 2 - sw - 12 * u->L.scale, 42 * u->L.scale),
+                kl(s, "lang.phonetic"), kl(s, "settings.phonetichint"));
+    {
+        osa_rect t = rectf(u->L.rtl ? b.x + b.w - p - sw : b.x + p,
+                           y + 8 * u->L.scale, sw, sh);
+        if (ui_toggle_switch(u, 8104, t, &s->show_phonetic)) {
+            shell_save_prefs(s);
+            shell_run_translate(s);
+        }
+    }
+
+    /* ================= privacy + data ================= */
+    settings_group(u, c, kl(s, "settings.privacy"));
+    y = c.y + 50 * u->L.scale;
+    struct { const char *label, *hint; int id; bool *v; } sws[2] = {
+        { "settings.saveaudio", "settings.saveaudiohint", 8200, &s->save_audio },
+        { "settings.privacy", "settings.privacyhint", 8201, &s->privacy_logs },
+    };
+    /* Two settings side by side. Each half is a cluster read in the direction of
+     * the paragraph: the switch comes first, its label and hint right after it.
+     * Anchoring the switch to the outer edge and the text to the opposite side
+     * left half a window's width between a control and the words describing it. */
+    {
+        float colw = (c.w - p * 2) / 2.0f;
+        float unit_gap = 12 * u->L.scale;
+        for (int i = 0; i < 2; i++) {
+            float sx = u->L.rtl ? c.x + c.w - p - colw * (i + 1) : c.x + p + colw * i;
+            float knob_x = u->L.rtl ? sx + colw - sw : sx;
+            osa_rect t = rectf(knob_x, y + 10 * u->L.scale, sw, sh);
+            if (ui_toggle_switch(u, sws[i].id, t, sws[i].v)) shell_save_prefs(s);
+            float tx = u->L.rtl ? sx : sx + sw + unit_gap;
+            float tw = colw - sw - unit_gap;
+            setting_row(u, rectf(tx, y, tw, 44 * u->L.scale),
+                        kl(s, sws[i].label), kl(s, sws[i].hint));
+        }
+    }
+
+    /* data folder: path + open, on the same row as an explanation */
+    float fy = c.y + c.h - 62 * u->L.scale;
+    c_hline(u->c, c.x + p, c.x + c.w - p, fy - 10 * u->L.scale, 1, u->t.border_soft);
+    ui_label(u, rectf(c.x + p, fy, c.w - p * 2 - 150 * u->L.scale, 18 * u->L.scale),
+             kl(s, "settings.datalocation"), UI_FS_TINY * u->L.scale, u->t.text_faint,
+             u->L.rtl ? 2 : 0);
+    osa_rect path_r = rectf(u->L.rtl ? c.x + p + 132 * u->L.scale : c.x + p,
+                            fy + 20 * u->L.scale,
+                            c.w - p * 2 - 132 * u->L.scale, 30 * u->L.scale);
+    c_fill_round(u->c, path_r, u->L.radius_sm, u->t.panel_alt);
+    c_stroke_round(u->c, path_r, u->L.radius_sm, 1.0f, u->t.border_soft);
+    ui_label(u, rectf(path_r.x + 10 * u->L.scale, path_r.y,
+                      path_r.w - 20 * u->L.scale, path_r.h), osa_path(OSAI_DIR_ROOT),
+             UI_FS_MONO * u->L.scale, u->t.text_dim, u->L.rtl ? 2 : 0);
+    osa_rect open_r = rectf(u->L.rtl ? c.x + p : c.x + c.w - p - 124 * u->L.scale,
+                            fy + 20 * u->L.scale, 124 * u->L.scale, 30 * u->L.scale);
+    if (ui_button(u, 8300, open_r, kl(s, "btn.openfolder"), false))
+        s->request = SHELL_REQ_OPEN_FOLDER;
 }
 
 /* ---- About -------------------------------------------------------- */
 
-static void draw_about(shell_state *s, ui_context *u, osa_rect body) {
-    float pad = 20 * u->L.scale;
-    osa_rect inner = rect_inset(body, pad);
-    osa_rect card = rectf(inner.x, inner.y, inner.w, MINF(inner.h, 320 * u->L.scale));
-    ui_card(u, card);
-    float cx = card.x + card.w * 0.5f;
-    c_fill_round(u->c, rectf(cx - 34 * u->L.scale, card.y + 28 * u->L.scale,
-                             68 * u->L.scale, 68 * u->L.scale),
-                 20 * u->L.scale, u->t.accent);
-    c_circle(u->c, cx, card.y + 62 * u->L.scale, 13 * u->L.scale, rgba(255,255,255,235));
-    ui_label(u, rectf(card.x + 20 * u->L.scale, card.y + 110 * u->L.scale,
-                      card.w - 40 * u->L.scale, 30 * u->L.scale),
-             "OpenSpeech AI", 22 * u->L.scale, u->t.text, 1);
-    ui_label(u, rectf(card.x + 20 * u->L.scale, card.y + 142 * u->L.scale,
-                      card.w - 40 * u->L.scale, 20 * u->L.scale),
-             tt(s->lang, "app.tagline"), 12 * u->L.scale, u->t.text_dim, 1);
-    char ver[96];
-    snprintf(ver, sizeof ver, "%s %s", tt(s->lang, "about.version"), APP_VERSION);
-    ui_label(u, rectf(card.x + 20 * u->L.scale, card.y + 176 * u->L.scale,
-                      card.w - 40 * u->L.scale, 20 * u->L.scale),
-             ver, 11 * u->L.scale, u->t.text_faint, 1);
+static void about_bullet(ui_context *u, osa_rect r, const char *text) {
+    float dx = u->L.rtl ? r.x + r.w - 8 * u->L.scale : r.x + 8 * u->L.scale;
+    c_circle(u->c, dx, r.y + 9 * u->L.scale, 3 * u->L.scale, u->t.accent);
+    float tx = u->L.rtl ? r.x : r.x + 20 * u->L.scale;
+    ui_label(u, rectf(tx, r.y, r.w - 20 * u->L.scale, 20 * u->L.scale), text,
+             UI_FS_BODY * u->L.scale, u->t.text_dim, u->L.rtl ? 2 : 0);
+}
 
-    float fy = card.y + 214 * u->L.scale;
-    const char *notes[3] = { "about.note", "about.offline", "about.models" };
+static void draw_about(shell_state *s, ui_context *u, osa_rect body) {
+    float pad = 22 * u->L.scale;
+    osa_rect inner = rect_inset(body, pad);
+    float hero_h = 132 * u->L.scale;
+    osa_rect hero = rectf(inner.x, inner.y, inner.w, hero_h);
+    ui_card(u, hero);
+
+    float box = 56 * u->L.scale;
+    osa_rect logo = rectf(u->L.rtl ? hero.x + hero.w - 28 * u->L.scale - box
+                                   : hero.x + 28 * u->L.scale,
+                          hero.y + (hero_h - box) * 0.5f, box, box);
+    c_fill_round(u->c, logo, box * 0.28f, u->t.accent);
     for (int i = 0; i < 3; i++) {
-        if (fy + 24 * u->L.scale > card.y + card.h) break;
-        /* The note lines are centred, so a bullet at a fixed offset from the
-         * card centre lands inside the sentence. Measure the line first and
-         * put the dot just outside its leading edge. */
-        const char *line = tt(s->lang, notes[i]);
-        float fs = 11 * u->L.scale;
-        float tw = text_measure(u->reg, fs, line);
-        float avail = card.w - 44 * u->L.scale;
-        if (tw > avail) tw = avail;
-        float lx0 = u->L.rtl ? cx + tw * 0.5f : cx - tw * 0.5f;
-        float dx = u->L.rtl ? lx0 + 10 * u->L.scale : lx0 - 10 * u->L.scale;
-        c_circle(u->c, dx, fy + 9 * u->L.scale, 3 * u->L.scale, u->t.success);
-        float lx = u->L.rtl ? cx + tw * 0.5f - avail : cx - tw * 0.5f;
-        ui_label(u, rectf(lx, fy, avail, 20 * u->L.scale), line, fs,
-                 u->t.text_dim, u->L.rtl ? 2 : 0);
-        fy += 24 * u->L.scale;
+        float h = (i == 1 ? 24.0f : (i == 0 ? 14.0f : 18.0f)) * u->L.scale;
+        c_fill_round(u->c, rectf(logo.x + box * (0.28f + 0.2f * i),
+                                 logo.y + (box - h) * 0.5f, 3.6f * u->L.scale, h),
+                     1.8f * u->L.scale, rgba(255, 255, 255, 235));
+    }
+    float tx = u->L.rtl ? hero.x + 28 * u->L.scale : logo.x + box + 20 * u->L.scale;
+    float tw = hero.w - box - 28 * u->L.scale * 2 - 20 * u->L.scale;
+    ui_label(u, rectf(tx, hero.y + 30 * u->L.scale, tw, 30 * u->L.scale), "OpenSpeech AI",
+             UI_FS_DISPLAY * u->L.scale, u->t.text, u->L.rtl ? 2 : 0);
+    char ver[96];
+    snprintf(ver, sizeof ver, "%s %s  ·  %s", kl(s, "about.version"), OSAI_APP_VERSION,
+             kl(s, "about.tagline"));
+    ui_label(u, rectf(tx, hero.y + 64 * u->L.scale, tw, 20 * u->L.scale), ver,
+             UI_FS_SMALL * u->L.scale, u->t.text_dim, u->L.rtl ? 2 : 0);
+    osa_rect pill = rectf(u->L.rtl ? tx + tw - 88 * u->L.scale : tx, hero.y + 90 * u->L.scale,
+                          88 * u->L.scale, 24 * u->L.scale);
+    ui_pill(u, pill, kl(s, "about.license"), u->t.success, u->t.success_soft);
+
+    /* Two content-sized columns instead of two cards stretched to the window
+     * floor: the second one also has room for the licence notes, which belong on
+     * an About screen and were missing from it. */
+    float top = hero.y + hero_h + 14 * u->L.scale;
+    float col_w = (inner.w - 14 * u->L.scale) * 0.5f;
+    float col_h = inner.y + inner.h - top;
+    float want_h = 118 * u->L.scale + 5 * 34 * u->L.scale;
+    if (col_h > want_h) col_h = want_h;
+    osa_rect a = rectf(u->L.rtl ? inner.x + col_w + 14 * u->L.scale : inner.x, top, col_w, col_h);
+    osa_rect b = rectf(u->L.rtl ? inner.x : inner.x + col_w + 14 * u->L.scale, top, col_w, col_h);
+    ui_card(u, a);
+    ui_card(u, b);
+    float p = 18 * u->L.scale;
+
+    ui_label(u, rectf(a.x + p, a.y + 14 * u->L.scale, a.w - p * 2, 22 * u->L.scale),
+             kl(s, "about.principles"), UI_FS_H2 * u->L.scale, u->t.text, u->L.rtl ? 2 : 0);
+    c_hline(u->c, a.x + p, a.x + a.w - p, a.y + 42 * u->L.scale, 1, u->t.border_soft);
+    const char *bullets[5] = { "about.offline", "about.noupload", "about.models",
+                               "about.privacylogs", "about.rollback" };
+    float y = a.y + 54 * u->L.scale;
+    for (int i = 0; i < 5; i++) {
+        if (y + 22 * u->L.scale > a.y + a.h - 12 * u->L.scale) break;
+        about_bullet(u, rectf(a.x + p, y, a.w - p * 2, 20 * u->L.scale), kl(s, bullets[i]));
+        y += 30 * u->L.scale;
+    }
+
+    ui_label(u, rectf(b.x + p, b.y + 14 * u->L.scale, b.w - p * 2, 22 * u->L.scale),
+             kl(s, "about.system"), UI_FS_H2 * u->L.scale, u->t.text, u->L.rtl ? 2 : 0);
+    c_hline(u->c, b.x + p, b.x + b.w - p, b.y + 42 * u->L.scale, 1, u->t.border_soft);
+    osa_app_status st;
+    osa_app_get_status(s->app, &st);
+    struct { const char *k; char v[192]; } rows[5];
+    osa_strlcpy(rows[0].v, st.asr_model[0] ? st.asr_model : "—", sizeof rows[0].v);
+    rows[0].k = "about.asr";
+    osa_strlcpy(rows[1].v, st.mt_model[0] ? st.mt_model : "—", sizeof rows[1].v);
+    rows[1].k = "about.mt";
+    snprintf(rows[2].v, sizeof rows[2].v, "%d", st.n_models);
+    rows[2].k = "about.modelcount";
+    snprintf(rows[3].v, sizeof rows[3].v, "%.0f MB", st.ram_used_mb);
+    rows[3].k = "about.ram";
+    osa_strlcpy(rows[4].v, st.data_root, sizeof rows[4].v);
+    rows[4].k = "about.dataroot";
+    y = b.y + 54 * u->L.scale;
+    for (int i = 0; i < 5; i++) {
+        if (y + 30 * u->L.scale > b.y + b.h - 10 * u->L.scale) break;
+        ui_label(u, rectf(b.x + p, y, b.w - p * 2, 16 * u->L.scale), kl(s, rows[i].k),
+                 UI_FS_TINY * u->L.scale, u->t.text_faint, u->L.rtl ? 2 : 0);
+        ui_label(u, rectf(b.x + p, y + 14 * u->L.scale, b.w - p * 2, 18 * u->L.scale),
+                 rows[i].v, UI_FS_SMALL * u->L.scale, u->t.text_dim, u->L.rtl ? 2 : 0);
+        y += 34 * u->L.scale;
+    }
+
+    /* ---- licence footer: shipped components, with their obligations ----
+     * Each row is a Persian caption plus the licence identifier as its own
+     * LTR value. Mixing Latin and Persian in one paragraph reorders the Latin
+     * run on its punctuation ("GPL-3.0-or-later" came out reversed), so the two
+     * languages never share a string here. */
+    float fy = top + col_h + 14 * u->L.scale;
+    float rows_h = 3 * 22 * u->L.scale;
+    float fh = 42 * u->L.scale + rows_h + 26 * u->L.scale;
+    if (inner.y + inner.h - fy < fh) fh = inner.y + inner.h - fy;
+    if (fh >= 80 * u->L.scale) {
+        osa_rect foot = rectf(inner.x, fy, inner.w, fh);
+        ui_card(u, foot);
+        ui_label(u, rectf(foot.x + p, foot.y + 11 * u->L.scale, foot.w - p * 2,
+                          20 * u->L.scale), kl(s, "about.licenses"),
+                 UI_FS_SMALL * u->L.scale, u->t.text_dim, u->L.rtl ? 2 : 0);
+        c_hline(u->c, foot.x + p, foot.x + foot.w - p, foot.y + 36 * u->L.scale, 1,
+                u->t.border_soft);
+
+        static const char *cap_keys[3] = { "about.lic.capp", "about.lic.capf",
+                                           "about.lic.capl" };
+        static const char *val_keys[3] = { "about.lic.app", "about.lic.font",
+                                           "about.lic.libs" };
+        float ry = foot.y + 44 * u->L.scale;
+        for (int i = 0; i < 3; i++) {
+            ui_label(u, rectf(foot.x + p, ry, foot.w * 0.30f, 18 * u->L.scale),
+                     kl(s, cap_keys[i]), UI_FS_TINY * u->L.scale, u->t.text_faint,
+                     u->L.rtl ? 2 : 0);
+            float cap_w = foot.w * 0.30f;
+            float vgap = 14 * u->L.scale;
+            float vx = foot.x + p + cap_w + vgap;
+            ui_label(u, rectf(vx, ry, foot.x + foot.w - p - vx, 18 * u->L.scale),
+                     kl(s, val_keys[i]), UI_FS_TINY * u->L.scale, u->t.text_dim, 0);
+            ry += 22 * u->L.scale;
+        }
+        ui_label(u, rectf(foot.x + p, ry + 2 * u->L.scale, foot.w - p * 2,
+                          18 * u->L.scale), kl(s, "about.lic.offline"),
+                 UI_FS_TINY * u->L.scale, u->t.text_faint, u->L.rtl ? 2 : 0);
     }
 }
 
@@ -1008,13 +1965,12 @@ static const char *screen_sub_key(shell_screen sc) {
     }
 }
 
-/* Draws the title bar for `sc` and returns the content rect below it. The
- * transcribe screen keeps its own title bar in shell.c, but going through one
- * function keeps the chrome identical on every screen. */
+/* Draws the title bar for `sc` and returns the content rect below it, so every
+ * screen gets the identical header. */
 osa_rect shell_screen_chrome(shell_state *s, ui_context *u, osa_rect content,
                              shell_screen sc) {
     osa_rect rest = content;
-    float top_h = 62 * u->L.scale;
+    float top_h = 64 * u->L.scale;
     osa_rect topbar = rect_split_top(&rest, top_h);
     shell_draw_chrome(s, u, topbar, screen_title_key(sc), screen_sub_key(sc));
     return rest;
@@ -1032,5 +1988,53 @@ void shell_draw_screen(shell_state *s, ui_context *u, osa_rect body, const ui_in
         case SCREEN_SETTINGS:   draw_settings(s, u, body); break;
         case SCREEN_ABOUT:      draw_about(s, u, body); break;
         default: break;
+    }
+
+    /* One preferences write per frame, whichever settings control changed.
+     * Without this a stepper or a slider only persisted when the user happened
+     * to press something else afterwards. */
+    if (u->value_changed) {
+        if (s->screen == SCREEN_SETTINGS) {
+            ui_set_scale(u, s->scale);
+            shell_save_prefs(s);
+        } else if (s->screen == SCREEN_TRAINING) {
+            shell_save_prefs(s);
+        }
+    }
+}
+
+/* Applies a drop-down selection. `popup_id` must be captured *before*
+ * ui_popup_draw(), because the widget clears the id when it returns a choice. */
+void shell_popup_commit(shell_state *s, int popup_id, int sel) {
+    if (sel < 0) return;
+    switch (popup_id) {
+        case 3100: case 8100: {         /* source language */
+            static const char *codes[3] = { "", "fa", "en" };
+            if (sel < 3) osa_strlcpy(s->lang_src, codes[sel], sizeof s->lang_src);
+            osa_app_set_languages(s->app, s->lang_src, s->lang_dst, NULL);
+            shell_save_prefs(s);
+            shell_run_translate(s);
+            break;
+        }
+        case 3101: case 8101: {         /* target language */
+            osa_strlcpy(s->lang_dst, sel == 0 ? "fa" : "en", sizeof s->lang_dst);
+            osa_app_set_languages(s->app, s->lang_src, s->lang_dst, NULL);
+            shell_save_prefs(s);
+            shell_run_translate(s);
+            break;
+        }
+        case 3102:                      /* register */
+            if (sel < MT_STYLE_COUNT) {
+                s->style = (mt_style)sel;
+                osa_app_set_style(s->app, s->style);
+                shell_save_prefs(s);
+                shell_run_translate(s);
+            }
+            break;
+        case 6100:                      /* training language */
+            s->train_lang = sel;
+            break;
+        default:
+            break;
     }
 }

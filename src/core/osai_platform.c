@@ -14,6 +14,8 @@
 #endif
 #include <psapi.h>
 #include <direct.h>
+#include <winhttp.h>
+#include <mmsystem.h>
 #else
 #include <sys/stat.h>
 #include <sys/statvfs.h>
@@ -544,6 +546,196 @@ void osa_sys_stats_sample(osa_sys_stats *out) {
     out->gpu_percent = g_stats.gpu_name[0] ? 0.0f : -1.0f;
 }
 
+/* ============================== network ==============================
+ * A download manager, and nothing else. The engines never open a socket; the
+ * only callers are the model/language-pack downloads the user explicitly asks
+ * for, and every download is verified against the SHA-256 in the catalogue
+ * before it is installed.
+ *
+ * Windows uses WinHTTP (no libcurl, no OpenSSL: certificates come from the OS
+ * store). Other targets return "not available" so the portable build keeps
+ * compiling and the UI can say so honestly instead of hanging.
+ * ==================================================================== */
+int osa_http_download(const char *url, const char *dest_path, bool resume,
+                      osa_download_progress cb, void *ud, volatile int *cancel,
+                      osa_error *err) {
+    if (!url || !dest_path) { osa_err_set(err, "bad arguments"); return -1; }
+    if (!osa_http_has_tls() && osa_starts(url, "https")) {
+        osa_err_set(err, "TLS is not available in this build");
+        return -1;
+    }
+#ifdef _WIN32
+    /* ---- WinHTTP ------------------------------------------------- */
+    wchar_t wurl[2048];
+    if (!MultiByteToWideChar(CP_UTF8, 0, url, -1, wurl, 2048)) {
+        osa_err_set(err, "cannot convert the URL");
+        return -1;
+    }
+    URL_COMPONENTS uc;
+    memset(&uc, 0, sizeof uc);
+    uc.dwStructSize = sizeof uc;
+    uc.dwSchemeLength = (DWORD)-1;
+    uc.dwHostNameLength = (DWORD)-1;
+    uc.dwUrlPathLength = (DWORD)-1;
+    uc.dwExtraInfoLength = (DWORD)-1;
+    if (!WinHttpCrackUrl(wurl, 0, 0, &uc)) {
+        osa_err_set(err, "malformed URL");
+        return -1;
+    }
+    wchar_t host[512];
+    size_t hl = uc.dwHostNameLength < 511 ? uc.dwHostNameLength : 511;
+    memcpy(host, uc.lpszHostName, hl * sizeof(wchar_t));
+    host[hl] = 0;
+    wchar_t path[2048];
+    size_t pl = uc.dwUrlPathLength;
+    if (pl >= 2047) pl = 2047;
+    memcpy(path, uc.lpszUrlPath, pl * sizeof(wchar_t));
+    path[pl] = 0;
+
+    HINTERNET ses = WinHttpOpen(L"OpenSpeechAI/1.0", WINHTTP_ACCESS_TYPE_AUTOMATIC_PROXY,
+                                WINHTTP_NO_PROXY_NAME, WINHTTP_NO_PROXY_BYPASS, 0);
+    if (!ses) { osa_err_set(err, "cannot start WinHTTP (%lu)", GetLastError()); return -1; }
+    HINTERNET con = WinHttpConnect(ses, host, uc.nPort, 0);
+    if (!con) {
+        WinHttpCloseHandle(ses);
+        osa_err_set(err, "cannot connect (%lu)", GetLastError());
+        return -1;
+    }
+    DWORD flags = uc.nScheme == INTERNET_SCHEME_HTTPS ? WINHTTP_FLAG_SECURE : 0;
+    HINTERNET req = WinHttpOpenRequest(con, L"GET", path, NULL, WINHTTP_NO_REFERER,
+                                       WINHTTP_DEFAULT_ACCEPT_TYPES, flags);
+    if (!req) {
+        WinHttpCloseHandle(con); WinHttpCloseHandle(ses);
+        osa_err_set(err, "cannot create the request (%lu)", GetLastError());
+        return -1;
+    }
+    /* resume at the end of a partial file when asked to */
+    int64_t have = 0;
+    char part[OSAI_MAX_PATH];
+    snprintf(part, sizeof part, "%s.part", dest_path);
+    if (resume && osa_file_exists(part)) have = osa_file_size(part);
+    if (have > 0) {
+        wchar_t range[64];
+        swprintf(range, 64, L"bytes=%lld-", (long long)have);
+        WinHttpAddRequestHeaders(req, range, (DWORD)-1L,
+                                 WINHTTP_ADDREQ_FLAG_ADD | WINHTTP_ADDREQ_FLAG_REPLACE);
+    }
+    BOOL sent = WinHttpSendRequest(req, WINHTTP_NO_ADDITIONAL_HEADERS, 0,
+                                   WINHTTP_NO_REQUEST_DATA, 0, 0, 0);
+    if (!sent || !WinHttpReceiveResponse(req, NULL)) {
+        osa_err_set(err, "request failed (%lu)", GetLastError());
+        WinHttpCloseHandle(req); WinHttpCloseHandle(con); WinHttpCloseHandle(ses);
+        return -1;
+    }
+    DWORD status = 0, len = sizeof status;
+    WinHttpQueryHeaders(req, WINHTTP_QUERY_STATUS_CODE | WINHTTP_QUERY_FLAG_NUMBER,
+                        WINHTTP_HEADER_NAME_BY_INDEX, &status, &len, WINHTTP_NO_HEADER_INDEX);
+    if (status == 416) {                     /* already complete */
+        osa_file_rename(part, dest_path);
+        WinHttpCloseHandle(req); WinHttpCloseHandle(con); WinHttpCloseHandle(ses);
+        osa_err_ok(err);
+        return 0;
+    }
+    if (status != 200 && status != 206) {
+        osa_err_set(err, "server returned HTTP %lu", (unsigned long)status);
+        WinHttpCloseHandle(req); WinHttpCloseHandle(con); WinHttpCloseHandle(ses);
+        return -1;
+    }
+    /* total size for the progress bar */
+    int64_t total = 0;
+    {
+        wchar_t clen[64];
+        DWORD cl = sizeof clen;
+        if (WinHttpQueryHeaders(req, WINHTTP_QUERY_CONTENT_LENGTH, WINHTTP_HEADER_NAME_BY_INDEX,
+                                clen, &cl, WINHTTP_NO_HEADER_INDEX) && cl)
+            total = _wtoi64(clen) + have;
+    }
+    FILE *f = fopen(part, have > 0 ? "ab" : "wb");
+    if (!f) {
+        osa_err_set(err, "cannot write %s", part);
+        WinHttpCloseHandle(req); WinHttpCloseHandle(con); WinHttpCloseHandle(ses);
+        return -1;
+    }
+    int64_t got = have;
+    int rc = 0;
+    for (;;) {
+        if (cancel && *cancel) { rc = -2; break; }
+        DWORD avail = 0, read = 0;
+        if (!WinHttpQueryDataAvailable(req, &avail)) { rc = -1; break; }
+        if (avail == 0) break;
+        char buf[65536];
+        DWORD chunk = avail < sizeof buf ? avail : (DWORD)sizeof buf;
+        if (!WinHttpReadData(req, buf, chunk, &read)) { rc = -1; break; }
+        if (read == 0) break;
+        if (fwrite(buf, 1, read, f) != read) {
+            osa_err_set(err, "disk full while writing %s", part);
+            rc = -1;
+            break;
+        }
+        got += read;
+        if (cb) cb(got, total, ud);
+        osa_sleep_ms(0);
+    }
+    fflush(f);
+    fclose(f);
+    WinHttpCloseHandle(req);
+    WinHttpCloseHandle(con);
+    WinHttpCloseHandle(ses);
+    if (rc == 0) {
+        if (!osa_file_rename(part, dest_path)) {
+            osa_err_set(err, "cannot finalize %s", dest_path);
+            return -1;
+        }
+        osa_err_ok(err);
+        return 0;
+    }
+    if (rc == -2) { if (err) osa_err_set(err, "cancelled"); return -2; }
+    if (err && !err->msg[0]) osa_err_set(err, "network error (%lu)", GetLastError());
+    return -1;
+#else
+    (void)resume; (void)cb; (void)ud; (void)cancel;
+    osa_err_set(err, "downloading is not available in this build");
+    return -1;
+#endif
+}
+
+int osa_http_get_text(const char *url, osa_buf *out, int timeout_ms, osa_error *err) {
+    if (!url || !out) { osa_err_set(err, "bad arguments"); return -1; }
+    (void)timeout_ms;
+#ifdef _WIN32
+    /* Reuse the downloader into a temporary file, then read it back: catalog
+     * files are small (tens of KB) and this avoids a second WinHTTP path. */
+    char tmp[OSAI_MAX_PATH];
+    snprintf(tmp, sizeof tmp, "%sosa-catalog-%ld.json", osa_path(OSAI_DIR_DOWNLOADS),
+             (long)osa_now_ms());
+    int rc = osa_http_download(url, tmp, false, NULL, NULL, NULL, err);
+    if (rc != 0) return rc;
+    if (!osa_file_read(tmp, out)) {
+        osa_file_remove(tmp);
+        osa_err_set(err, "cannot read the downloaded catalogue");
+        return -1;
+    }
+    osa_file_remove(tmp);
+    if (out->len > 200000) {
+        osa_err_set(err, "catalogue too large");
+        return -1;
+    }
+    osa_err_ok(err);
+    return 0;
+#else
+    osa_err_set(err, "downloading is not available in this build");
+    return -1;
+#endif
+}
+
+bool osa_http_has_tls(void) {
+#ifdef _WIN32
+    return true;      /* WinHTTP validates against the Windows certificate store */
+#else
+    return false;
+#endif
+}
+
 /* ============================== desktop helpers ============================== */
 bool osa_open_in_explorer(const char *path) {
 #ifdef _WIN32
@@ -553,6 +745,40 @@ bool osa_open_in_explorer(const char *path) {
     (void)path;
     return false;
 #endif
+}
+
+/* A single asynchronous playback slot. The shell may start a second clip while
+ * the first is still running (pressing "listen" twice), and PlaySound with
+ * SND_ASYNC stops the previous sound for us. */
+static bool g_playing;
+
+bool osa_audio_play_file(const char *wav_path) {
+#ifdef _WIN32
+    if (!wav_path || !*wav_path) return false;
+    /* PlaySound needs a system code page path, so convert from UTF-8. */
+    int wl = MultiByteToWideChar(CP_UTF8, 0, wav_path, -1, NULL, 0);
+    if (wl <= 0) return false;
+    wchar_t *w = (wchar_t *)malloc((size_t)wl * sizeof(wchar_t));
+    if (!w) return false;
+    MultiByteToWideChar(CP_UTF8, 0, wav_path, -1, w, wl);
+    BOOL ok = PlaySoundW(w, NULL, SND_FILENAME | SND_ASYNC | SND_NODEFAULT);
+    free(w);
+    g_playing = ok ? true : false;
+    return ok ? true : false;
+#else
+    /* The headless build has no output device; the UI says so rather than
+     * pretending a clip was played. */
+    (void)wav_path;
+    return false;
+#endif
+}
+
+bool osa_audio_is_playing(void) { return g_playing; }
+void osa_audio_stop(void) {
+#ifdef _WIN32
+    PlaySoundW(NULL, NULL, 0);
+#endif
+    g_playing = false;
 }
 
 bool osa_clipboard_set(const char *utf8) {

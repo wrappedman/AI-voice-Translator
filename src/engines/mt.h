@@ -33,6 +33,22 @@
 
 typedef enum mt_lang { MT_AUTO = 0, MT_FA = 1, MT_EN = 2 } mt_lang;
 
+/* Register of the produced translation. The phrasebook keeps one entry per
+ * phrase in each register; a phrase with no variant for the requested register
+ * falls back to the neutral one, so the setting can never produce an empty
+ * result. */
+typedef enum mt_style {
+    MT_STYLE_NEUTRAL = 0,   /* plain, bookish: what the phrase table lists  */
+    MT_STYLE_FORMAL  = 1,   /* formal / literary: شما، خواهشمندم، نمی‌باشد  */
+    MT_STYLE_CASUAL  = 2    /* everyday speech: تو، ممنون، نمیشه           */
+} mt_style;
+
+#define MT_STYLE_COUNT 3
+
+/* UI names (Persian + English) of a style, by index. */
+const char *mt_style_label(mt_style s, bool persian);
+const char *mt_style_key(mt_style s);
+
 typedef struct mt_model mt_model;
 
 /* One translated unit. `start`/`end` are character offsets into the source
@@ -81,6 +97,23 @@ const char *mt_model_backend(const mt_model *m);
  * `out` is fully overwritten; the caller must not free its contents. */
 bool mt_translate(const mt_model *m, const char *text, mt_lang src,
                   mt_result *out, osa_error *err);
+
+/* Same, with an explicit register. */
+bool mt_translate_styled(const mt_model *m, const char *text, mt_lang src,
+                         mt_style style, mt_result *out, osa_error *err);
+
+/* ---- pronunciation -------------------------------------------------
+ * Persian transliteration of the produced text (and of any input), written in
+ * Persian letters with full diacritics (اعراب) and a syllable separator, e.g.
+ *   "nice to meet you"  ->  «نایس تُو میت یُو»
+ * The result is produced for a Persian reader, not for a phonetician: it is
+ * what the Persian interface shows under a translation so the user can say the
+ * sentence out loud.
+ *
+ * `text` is the language the romanisation should start from; when it is MT_AUTO
+ * the script of `text` decides. Returns false only for empty input.
+ */
+bool mt_pronounce(const char *text, mt_lang from, char *out, size_t cap);
 
 /* Language of a text, by script detection. Never MT_AUTO. */
 mt_lang mt_detect_lang(const char *text);
