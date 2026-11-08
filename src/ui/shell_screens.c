@@ -879,7 +879,8 @@ static void draw_pack_row(shell_state *s, ui_context *u, osa_rect r, const osa_p
     float side = badge_w + 12 * u->L.scale;
     float action_w = 104 * u->L.scale;
     float tx = u->L.rtl ? r.x + pad : r.x + pad + side;
-    float tw = r.w - pad * 2 - side - action_w - 12 * u->L.scale;
+    float reserve = (s->downloading && osa_streq(s->dl_pack, p->id)) ? 244 * u->L.scale : action_w;
+    float tw = r.w - pad * 2 - side - reserve - 12 * u->L.scale;
     ui_label(u, rectf(tx, r.y + 6 * u->L.scale, tw, 20 * u->L.scale), p->name,
              UI_FS_BODY * u->L.scale, u->t.text, u->L.rtl ? 2 : 0);
 
@@ -898,32 +899,37 @@ static void draw_pack_row(shell_state *s, ui_context *u, osa_rect r, const osa_p
              UI_FS_TINY * u->L.scale, col_alpha(u->t.text_faint, 0.85f),
              u->L.rtl ? 2 : 0);
 
-    osa_rect ar = rectf(u->L.rtl ? r.x + pad : r.x + r.w - pad - action_w,
-                        r.y + (r.h - 30 * u->L.scale) * 0.5f, action_w, 30 * u->L.scale);
-    if (p->installed) {
-        ui_pill(u, ar, kl(s, "models.installed"), u->t.success, u->t.success_soft);
-    } else if (p->installable) {
-        /* All catalog entries are real downloads; none are generated fixtures. */
-        if (s->downloading && osa_streq(s->dl_pack, p->id)) {
-            c_fill_round(u->c, ar, u->L.radius_sm, u->t.panel_alt);
-            ui_progress(u, rect_inset(ar, 9 * u->L.scale), (float)s->dl_progress, u->t.accent);
-        } else if (ui_button(u, 5200 + idx, ar, kl(s, "models.get"), !s->job)) {
-            *clicked_idx = idx;
-        } else if (hov && u->in.clicked && !u->consumed_click) {
-            u->consumed_click = true;
-            *clicked_idx = idx;
+    bool busy = s->downloading && osa_streq(s->dl_pack, p->id);
+    /* While this pack downloads, the action area grows: a progress bar, the
+     * percentage beside it, and a cancel button. */
+    float act_w = busy ? 232 * u->L.scale : action_w;
+    osa_rect ar = rectf(u->L.rtl ? r.x + pad : r.x + r.w - pad - act_w,
+                        r.y + (r.h - 30 * u->L.scale) * 0.5f, act_w, 30 * u->L.scale);
+    if (busy) {
+        float cancel_w = 62 * u->L.scale, pct_w = 52 * u->L.scale;
+        osa_rect bar = rectf(u->L.rtl ? ar.x + cancel_w + pct_w + 12 * u->L.scale : ar.x,
+                             ar.y + 4 * u->L.scale,
+                             ar.w - cancel_w - pct_w - 12 * u->L.scale, 22 * u->L.scale);
+        osa_rect pct = rectf(u->L.rtl ? ar.x + cancel_w + 6 * u->L.scale : bar.x + bar.w + 6 * u->L.scale,
+                             ar.y, pct_w, ar.h);
+        osa_rect cx = rectf(u->L.rtl ? ar.x : ar.x + ar.w - cancel_w, ar.y, cancel_w, ar.h);
+        c_fill_round(u->c, bar, u->L.radius_sm, u->t.panel_alt);
+        ui_progress(u, rect_inset(bar, 7 * u->L.scale), (float)s->dl_progress, u->t.accent);
+        char raw[48], loc[96];
+        if (s->dl_total > 0) {
+            snprintf(raw, sizeof raw, "%d%%", (int)(s->dl_progress * 100.0 + 0.5));
+        } else {
+            /* No Content-Length yet: show what arrived instead of a fake 0%. */
+            ui_fmt_bytes((double)s->dl_got, raw, sizeof raw);
         }
-    } else if (!p->url[0]) {
-        /* Honest dead end: the file is not in the binary, so the only real
-         * action is the picker. */
-        if (ui_button_ghost(u, 5200 + idx, ar, kl(s, "models.locallic")))
-            *clicked_idx = idx;
-    } else if (s->downloading && osa_streq(s->dl_pack, p->id)) {
-        c_fill_round(u->c, ar, u->L.radius_sm, u->t.panel_alt);
-        ui_progress(u, rect_inset(ar, 9 * u->L.scale), (float)s->dl_progress, u->t.accent);
+        text_localize_digits(raw, s->lang == UI_FA ? "fa" : "en", loc, sizeof loc);
+        ui_label(u, pct, loc, UI_FS_SMALL * u->L.scale, u->t.accent, 1);
+        if (ui_button_ghost(u, 5400 + idx, cx, kl(s, "btn.cancel"))) shell_cancel_jobs(s);
+    } else if (p->installed) {
+        ui_pill(u, ar, kl(s, "models.installed"), u->t.success, u->t.success_soft);
     } else {
-        bool b = ui_button(u, 5200 + idx, ar, kl(s, "models.get"), !s->job);
-        if (b || (hov && u->in.clicked && !u->consumed_click)) *clicked_idx = idx;
+        /* Every catalogue row is a real, hash-verified official download. */
+        if (ui_button(u, 5200 + idx, ar, kl(s, "models.get"), !s->job)) *clicked_idx = idx;
     }
 }
 
@@ -973,10 +979,17 @@ static void draw_models(shell_state *s, ui_context *u, osa_rect body) {
         s->models_tab = 1;
     c_hline(u->c, inner.x, inner.x + inner.w, tabs_y + tab_h, 1, u->t.border_soft);
 
-    float iw = 176 * u->L.scale;
-    osa_rect imp = rectf(u->L.rtl ? inner.x : inner.x + inner.w - iw, tabs_y, iw, tab_h);
-    if (ui_button(u, 5003, imp, kl(s, "models.import"), false))
-        s->request = SHELL_REQ_PICK_PACK;
+    /* No local-file import: models come only from the verified official
+     * catalogue, so a random file can never become the active engine. */
+    {
+        float nw = inner.w - tab_w * 2 - 24 * u->L.scale;
+        if (nw > 120 * u->L.scale) {
+            osa_rect note = rectf(u->L.rtl ? inner.x : inner.x + tab_w * 2 + 18 * u->L.scale,
+                                  tabs_y, nw, tab_h);
+            ui_label(u, note, kl(s, "models.removedimport"), UI_FS_TINY * u->L.scale,
+                     u->t.text_faint, u->L.rtl ? 2 : 0);
+        }
+    }
 
     float top = tabs_y + tab_h + 12 * u->L.scale;
     osa_rect list = rectf(inner.x, top, inner.w, inner.y + inner.h - top);
@@ -1451,12 +1464,48 @@ static void draw_about(shell_state *s, ui_context *u, osa_rect body) {
         y += 34 * u->L.scale;
     }
 
+    /* ---- developer: who built this, and how to reach them ---- */
+    {
+        float dy = top + col_h + 12 * u->L.scale;
+        float dh = 104 * u->L.scale;
+        osa_rect dev = rectf(inner.x, dy, inner.w, dh);
+        ui_card(u, dev);
+        ui_label(u, rectf(dev.x + p, dev.y + 10 * u->L.scale, dev.w - p * 2, 22 * u->L.scale),
+                 kl(s, "about.developer"), UI_FS_H2 * u->L.scale, u->t.text, u->L.rtl ? 2 : 0);
+        c_hline(u->c, dev.x + p, dev.x + dev.w - p, dev.y + 38 * u->L.scale, 1, u->t.border_soft);
+        float lx = dev.x + p, rw = dev.w - p * 2;
+        ui_label(u, rectf(lx, dev.y + 46 * u->L.scale, rw * 0.34f, 20 * u->L.scale),
+                 "behnam ehsani", UI_FS_BODY * u->L.scale, u->t.text, u->L.rtl ? 2 : 0);
+        osa_rect mail = rectf(u->L.rtl ? lx + rw * 0.36f : lx + rw * 0.30f,
+                              dev.y + 44 * u->L.scale, rw * 0.30f, 24 * u->L.scale);
+        bool mh = ui_hit(u, mail);
+        ui_label(u, mail, "inbox.ehsani@gmail.com", UI_FS_SMALL * u->L.scale,
+                 mh ? u->t.accent2 : u->t.accent, 1);
+        if (mh) c_hline(u->c, mail.x + 6 * u->L.scale, mail.x + mail.w - 6 * u->L.scale,
+                        mail.y + mail.h - 3 * u->L.scale, 1, u->t.accent);
+        if (mh && u->in.clicked && !u->consumed_click) {
+            u->consumed_click = true;
+            osa_strlcpy(s->request_url, "mailto:inbox.ehsani@gmail.com", sizeof s->request_url);
+            s->request = SHELL_REQ_OPEN_URL;
+        }
+        osa_rect repo = rectf(lx, dev.y + 70 * u->L.scale, rw, 24 * u->L.scale);
+        bool rh = ui_hit(u, repo);
+        ui_label(u, repo, "https://github.com/wrappedman/AI-voice-Translator",
+                 UI_FS_SMALL * u->L.scale, rh ? u->t.accent2 : u->t.accent, u->L.rtl ? 2 : 0);
+        if (rh && u->in.clicked && !u->consumed_click) {
+            u->consumed_click = true;
+            osa_strlcpy(s->request_url, "https://github.com/wrappedman/AI-voice-Translator",
+                        sizeof s->request_url);
+            s->request = SHELL_REQ_OPEN_URL;
+        }
+    }
+
     /* ---- licence footer: shipped components, with their obligations ----
      * Each row is a Persian caption plus the licence identifier as its own
      * LTR value. Mixing Latin and Persian in one paragraph reorders the Latin
      * run on its punctuation ("GPL-3.0-or-later" came out reversed), so the two
      * languages never share a string here. */
-    float fy = top + col_h + 14 * u->L.scale;
+    float fy = top + col_h + 12 * u->L.scale + 104 * u->L.scale + 12 * u->L.scale;
     float rows_h = 3 * 22 * u->L.scale;
     float fh = 42 * u->L.scale + rows_h + 26 * u->L.scale;
     if (inner.y + inner.h - fy < fh) fh = inner.y + inner.h - fy;

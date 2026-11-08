@@ -261,10 +261,12 @@ $(BUILD)/win/ft.a: $(FT_CORE_SRC)
 $(SRC)/platform/win32/app_version.h: $(SRC)/core/osai_common.h tools/make_dist.py
 	$(PYTHON) tools/make_dist.py --rc-only
 
+# The app resource embeds the worker binary, so the worker must be linked first.
 $(BUILD)/win/res.o: $(SRC)/platform/win32/app.rc $(SRC)/platform/win32/app.manifest \
-                    $(SRC)/platform/win32/app.ico $(SRC)/platform/win32/app_version.h
+                    $(SRC)/platform/win32/app.ico $(SRC)/platform/win32/app_version.h \
+                    $(WORKER_WIN)
 	@mkdir -p $(dir $@)
-	$(ZIG) rc /fo $@ /I $(SRC)/platform/win32 $(SRC)/platform/win32/app.rc
+	$(ZIG) rc /fo $@ /I $(SRC)/platform/win32 /I $(DIST)/bin $(SRC)/platform/win32/app.rc
 
 # -Wl,--subsystem,windows is what actually sets PE subsystem 2 (GUI); the -mwindows
 # driver flag is accepted by zig but does not change the header.

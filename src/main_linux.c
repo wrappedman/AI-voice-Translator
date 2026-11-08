@@ -8,7 +8,7 @@
  *  src/platform/win32.
  *
  *  Usage:
- *    osai --snapshots DIR [--width W] [--height H] [--lang fa|en] [--light]
+ *    osai --snapshots DIR [--width W] [--height H] [--lang fa|en] [--dark]
  *    osai --transcribe FILE [--json]
  *    osai --selftest
  *    osai --version
@@ -51,10 +51,11 @@ static void usage(void) {
            "  --train [FILE]    reports that neural fine-tuning is unsupported\n"
            "  --epochs N        training passes (default 6)\n"
            "  --models-json     print the registered models as JSON\n"
+           "  --paths-json      print the resolved data folders as JSON\n"
            "  --version         print the version\n"
            "  --width/--height  snapshot size (default 1440x900)\n"
            "  --lang fa|en      interface language (default fa)\n"
-           "  --light           light theme (default dark)\n",
+           "  --dark            dark theme (default light, matching the app)\n",
            OSAI_VERSION);
 }
 
@@ -163,7 +164,7 @@ static int run_snapshots(const char *dir, int w, int h, shell_lang lang, bool da
     }
     shell.models_tab = 0;
 
-    /* English + light theme, so both directions of the layout are covered */
+    /* English + the other theme, so both directions of the layout are covered */
     shell.lang = lang == UI_FA ? UI_EN : UI_FA;
     shell.dark = !dark;
     shell.screen = SCREEN_TRANSCRIBE;
@@ -240,6 +241,19 @@ static int run_transcribe(const char *path, bool json) {
     return 0;
 }
 
+/* ---- paths --------------------------------------------------------
+ * Reports where the program actually writes. The contract is that every folder
+ * lives under <exe dir>/data, so CI can assert it instead of trusting a comment. */
+static int run_paths_json(void) {
+    if (!osa_paths_init()) { fprintf(stderr, "data folder is not writable\n"); return 1; }
+    printf("{\"exe_dir\":\"%s\",\"root\":\"%s\",\"models\":\"%s\",\"downloads\":\"%s\","
+           "\"database\":\"%s\",\"logs\":\"%s\",\"cache\":\"%s\"}\n",
+           osa_exe_dir(), osa_path(OSAI_DIR_ROOT), osa_path(OSAI_DIR_MODELS),
+           osa_path(OSAI_DIR_DOWNLOADS), osa_path(OSAI_DIR_DB), osa_path(OSAI_DIR_LOGS),
+           osa_path(OSAI_DIR_CACHE));
+    return 0;
+}
+
 /* ---- selftest ----------------------------------------------------- */
 
 static int failures;
@@ -263,9 +277,9 @@ static int run_selftest(void) {
     check(!st.asr_ready&&!st.mt_ready&&!st.lid_ready,"no models active on fresh install");
     check(st.n_models==0,"no models installed on fresh install");
     check(!osa_app_ready(app),"functionality gated until all three models are active");
-    osa_pack_info packs[8]; int np=osa_app_packs(app,packs,8); bool kinds[3]={false,false,false};bool verified=true;
-    for(int i=0;i<np;i++){verified&=packs[i].url[0]&&strlen(packs[i].sha256)==64&&packs[i].size_mb>1; if(osa_streq(packs[i].kind,"asr"))kinds[0]=true;if(osa_streq(packs[i].kind,"mt"))kinds[1]=true;if(osa_streq(packs[i].kind,"lang"))kinds[2]=true;}
-    check(np>=3&&kinds[0]&&kinds[1]&&kinds[2],"catalog offers speech, translation and language models");
+    osa_pack_info packs[32]; int np=osa_app_packs(app,packs,32); int kinds[3]={0,0,0};bool verified=true;
+    for(int i=0;i<np;i++){verified&=packs[i].url[0]&&strlen(packs[i].sha256)==64&&packs[i].size_mb>0; if(osa_streq(packs[i].kind,"asr"))kinds[0]++;if(osa_streq(packs[i].kind,"mt"))kinds[1]++;if(osa_streq(packs[i].kind,"lang"))kinds[2]++;}
+    check(np>=6&&kinds[0]>=2&&kinds[1]>=2&&kinds[2]>=2,"catalog offers several speech, translation and language models");
     check(verified,"every catalog entry has URL, SHA-256 and real size");
     osa_app_translation mt; check(!osa_app_translate(app,"سلام","fa",&mt,&err),"translation refused before activation");
     check(!osa_app_install_builtin_pack(app,"anything",&err),"no synthetic/builtin model installation");
@@ -279,7 +293,7 @@ static int run_selftest(void) {
 int main(int argc, char **argv) {
     const char *snapdir = NULL;
     const char *file = NULL;
-    bool json = false, light = false, selftest = false, models_json = false;
+    bool json = false, dark = false, selftest = false, models_json = false, paths_json = false;
     int w = 1440, h = 900;
     shell_lang lang = UI_FA;
     const char *train_data = NULL;
@@ -296,9 +310,11 @@ int main(int argc, char **argv) {
         else if (osa_streq(a, "--width") && i + 1 < argc) w = atoi(argv[++i]);
         else if (osa_streq(a, "--height") && i + 1 < argc) h = atoi(argv[++i]);
         else if (osa_streq(a, "--json")) json = true;
-        else if (osa_streq(a, "--light")) light = true;
+        else if (osa_streq(a, "--dark")) dark = true;
+        else if (osa_streq(a, "--light")) dark = false;
         else if (osa_streq(a, "--selftest")) selftest = true;
         else if (osa_streq(a, "--models-json")) models_json = true;
+        else if (osa_streq(a, "--paths-json")) paths_json = true;
         else if (osa_streq(a, "--train")) {
             /* `--train` on its own trains on the bundled lexicon; a following
              * argument that is not a switch is a dataset file. */
@@ -316,7 +332,8 @@ int main(int argc, char **argv) {
     if (!snapdir && !selftest)
         osa_crash_log_init(false);
 
-    if (snapdir) return run_snapshots(snapdir, w, h, lang, !light);
+    if (paths_json) return run_paths_json();
+    if (snapdir) return run_snapshots(snapdir, w, h, lang, dark);
     if (file) return run_transcribe(file, json);
     if (selftest) return run_selftest();
     if (train) {

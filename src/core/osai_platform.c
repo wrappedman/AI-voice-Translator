@@ -65,40 +65,154 @@ static bool mkdirs_impl(const char *path) {
 
 bool osa_mkdirs(const char *path) { return mkdirs_impl(path); }
 
-bool osa_paths_init(void) {
-    if (g_paths_ready) return true;
-    char base[OSAI_MAX_PATH] = {0};
+/* The executable's own directory, in UTF-8. Everything the program writes lives
+ * under <exe dir>/data, so a portable copy carries its models and history with
+ * it and nothing is left behind in the user profile. */
+static void exe_dir_impl(char *out, size_t cap) {
+    out[0] = 0;
+#ifdef _WIN32
+    wchar_t w[OSAI_MAX_PATH];
+    DWORD n = GetModuleFileNameW(NULL, w, (DWORD)(sizeof w / sizeof w[0]));
+    if (n == 0 || n >= (DWORD)(sizeof w / sizeof w[0])) return;
+    char utf8[OSAI_MAX_PATH * 3];
+    if (!WideCharToMultiByte(CP_UTF8, 0, w, -1, utf8, (int)sizeof utf8, NULL, NULL)) return;
+    char *bs = strrchr(utf8, '\\'), *fs = strrchr(utf8, '/');
+    if (fs > bs) bs = fs;
+    if (bs) *bs = 0;
+    osa_strlcpy(out, utf8, cap);
+#else
+    char buf[OSAI_MAX_PATH];
+    ssize_t n = readlink("/proc/self/exe", buf, sizeof buf - 1);
+    if (n > 0) {
+        buf[n] = 0;
+        char *sl = strrchr(buf, '/');
+        if (sl) *sl = 0;
+        osa_strlcpy(out, buf, cap);
+        return;
+    }
+    if (!getcwd(out, (int)cap)) osa_strlcpy(out, ".", cap);
+#endif
+}
+
+/* True when a file can actually be created in `dir`. A portable app on a
+ * read-only medium must say so instead of silently writing somewhere else. */
+static bool dir_writable(const char *dir) {
+    char probe[OSAI_MAX_PATH];
+    snprintf(probe, sizeof probe, "%s%s.write-test", dir, OSAI_PATH_SEP);
+    bool ok = osa_file_write(probe, "", 0);
+    if (ok) osa_file_remove(probe);
+    return ok;
+}
+
+/* ---- one-time move of the old profile folders into <exe dir>/data ----
+ * Earlier builds wrote to %LOCALAPPDATA%\OpenSpeechAI (or ~/.local/share).
+ * The user asked for everything to live beside the exe, so an existing install
+ * is moved, not copied-and-forgotten: models, database, audio and settings are
+ * relocated once, and the old root is removed only when it is empty. */
+static bool copy_tree(const char *from, const char *to);
+
+static bool move_entry(const char *from, const char *to) {
+    if (osa_file_exists(to) || osa_dir_exists(to)) return false;
+    if (osa_file_rename(from, to)) return true;
+    /* rename fails across volumes: fall back to copy + delete. */
+    if (osa_dir_exists(from)) {
+        if (!copy_tree(from, to)) return false;
+        return osa_dir_remove_recursive(from);
+    }
+    if (!osa_file_copy(from, to)) return false;
+    return osa_file_remove(from);
+}
+
+static bool copy_tree(const char *from, const char *to) {
+    if (!osa_mkdirs(to)) return false;
+    bool ok = true;
+#ifdef _WIN32
+    char pattern[OSAI_MAX_PATH];
+    snprintf(pattern, sizeof pattern, "%s\\*", from);
+    WIN32_FIND_DATAA fd;
+    HANDLE h = FindFirstFileA(pattern, &fd);
+    if (h == INVALID_HANDLE_VALUE) return false;
+    do {
+        if (!strcmp(fd.cFileName, ".") || !strcmp(fd.cFileName, "..")) continue;
+        char src[OSAI_MAX_PATH], dst[OSAI_MAX_PATH];
+        osa_path_join(src, sizeof src, from, fd.cFileName);
+        osa_path_join(dst, sizeof dst, to, fd.cFileName);
+        if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) ok = copy_tree(src, dst) && ok;
+        else ok = osa_file_copy(src, dst) && ok;
+    } while (FindNextFileA(h, &fd));
+    FindClose(h);
+#else
+    DIR *d = opendir(from);
+    if (!d) return false;
+    struct dirent *e;
+    while ((e = readdir(d))) {
+        if (!strcmp(e->d_name, ".") || !strcmp(e->d_name, "..")) continue;
+        char src[OSAI_MAX_PATH], dst[OSAI_MAX_PATH];
+        osa_path_join(src, sizeof src, from, e->d_name);
+        osa_path_join(dst, sizeof dst, to, e->d_name);
+        if (osa_dir_exists(src)) ok = copy_tree(src, dst) && ok;
+        else ok = osa_file_copy(src, dst) && ok;
+    }
+    closedir(d);
+#endif
+    return ok;
+}
+
+static void migrate_legacy_root(const char *base) {
+    char legacy[OSAI_MAX_PATH] = {0};
 #ifdef _WIN32
     const char *lad = getenv("LOCALAPPDATA");
-    if (lad && *lad) snprintf(base, sizeof base, "%s\\%s", lad, OSAI_APP_ID);
-    else snprintf(base, sizeof base, "C:\\%s", OSAI_APP_ID);
-    /* exe dir */
-    GetModuleFileNameA(NULL, g_exe_dir, sizeof g_exe_dir);
-    char *bs = strrchr(g_exe_dir, '\\');
-    if (bs) *bs = 0;
+    if (lad && *lad) snprintf(legacy, sizeof legacy, "%s\\%s", lad, OSAI_APP_ID);
 #else
-    const char *ovr = getenv("OSAI_DATA_DIR");
     const char *home = getenv("HOME");
-    if (ovr && *ovr) snprintf(base, sizeof base, "%s", ovr);
-    else if (home && *home) snprintf(base, sizeof base, "%s/.local/share/%s", home, OSAI_APP_ID);
-    else snprintf(base, sizeof base, "/tmp/%s", OSAI_APP_ID);
-    if (!getcwd(g_exe_dir, sizeof g_exe_dir)) osa_strlcpy(g_exe_dir, ".", sizeof g_exe_dir);
+    if (home && *home) snprintf(legacy, sizeof legacy, "%s/.local/share/%s", home, OSAI_APP_ID);
 #endif
-    osa_strlcpy(g_paths[OSAI_DIR_ROOT], base, OSAI_MAX_PATH);
-    mkdirs_impl(base);
+    if (!legacy[0] || osa_streq(legacy, base) || !osa_dir_exists(legacy)) return;
     for (int i = 1; i < OSAI_DIR_COUNT; i++) {
-#ifdef _WIN32
-        snprintf(g_paths[i], OSAI_MAX_PATH, "%s\\%s\\", base, dir_names[i]);
-#else
-        snprintf(g_paths[i], OSAI_MAX_PATH, "%s/%s/", base, dir_names[i]);
-#endif
+        char src[OSAI_MAX_PATH], dst[OSAI_MAX_PATH];
+        snprintf(src, sizeof src, "%s%s%s", legacy, OSAI_PATH_SEP, dir_names[i]);
+        snprintf(dst, sizeof dst, "%s%s%s", base, OSAI_PATH_SEP, dir_names[i]);
+        if (osa_dir_exists(src)) {
+            /* the fresh root already created empty folders: drop them first so
+             * the move can take their place, but only when they are empty. */
+            if (osa_dir_exists(dst) && osa_dir_size(dst) == 0) osa_dir_remove_recursive(dst);
+            move_entry(src, dst);
+            if (!osa_dir_exists(dst)) osa_mkdirs(dst);
+        }
+    }
+    static const char *files[] = { "settings.ini", "last-fault.log" };
+    for (size_t i = 0; i < sizeof files / sizeof files[0]; i++) {
+        char src[OSAI_MAX_PATH], dst[OSAI_MAX_PATH];
+        snprintf(src, sizeof src, "%s%s%s", legacy, OSAI_PATH_SEP, files[i]);
+        snprintf(dst, sizeof dst, "%s%s%s", base, OSAI_PATH_SEP, files[i]);
+        if (osa_file_exists(src)) move_entry(src, dst);
+    }
+    if (osa_dir_size(legacy) == 0) osa_dir_remove_recursive(legacy);
+}
+
+bool osa_paths_init(void) {
+    if (g_paths_ready) return true;
+    exe_dir_impl(g_exe_dir, sizeof g_exe_dir);
+    if (!g_exe_dir[0]) osa_strlcpy(g_exe_dir, ".", sizeof g_exe_dir);
+
+    char base[OSAI_MAX_PATH] = {0};
+    /* OSAI_DATA_DIR exists for the test/snapshot harness only. A normal run
+     * always uses <exe dir>/data and never touches the user profile. */
+    const char *ovr = getenv("OSAI_DATA_DIR");
+    if (ovr && *ovr) osa_strlcpy(base, ovr, sizeof base);
+    else {
+        snprintf(base, sizeof base, "%s%sdata", g_exe_dir, OSAI_PATH_SEP);
+        migrate_legacy_root(base);
+    }
+    if (!mkdirs_impl(base) || !osa_dir_exists(base) || !dir_writable(base)) return false;
+
+    osa_strlcpy(g_paths[OSAI_DIR_ROOT], base, OSAI_MAX_PATH);
+    for (int i = 1; i < OSAI_DIR_COUNT; i++) {
+        snprintf(g_paths[i], OSAI_MAX_PATH, "%s%s%s%s", base, OSAI_PATH_SEP,
+                 dir_names[i], OSAI_PATH_SEP);
         mkdirs_impl(g_paths[i]);
     }
-#ifdef _WIN32
-    snprintf(g_paths[OSAI_DIR_ROOT], OSAI_MAX_PATH, "%s\\", base);
-#else
-    snprintf(g_paths[OSAI_DIR_ROOT], OSAI_MAX_PATH, "%s/", base);
-#endif
+    snprintf(g_paths[OSAI_DIR_ROOT], OSAI_MAX_PATH, "%s%s", base, OSAI_PATH_SEP);
     g_paths_ready = true;
     return true;
 }
@@ -784,6 +898,81 @@ bool osa_http_has_tls(void) {
 }
 
 /* ============================== desktop helpers ============================== */
+/* ============================== model worker ==============================
+ * The Windows build carries the worker inside its own resources, so a copy of
+ * OpenSpeechAI.exe alone is enough: the worker is materialised into
+ * <exe>/data/Cache and started from there. That removes the whole class of
+ * "keep OpenSpeechWorker.exe beside the exe" activation failures. */
+bool osa_worker_path(char *out, size_t cap, osa_error *err) {
+    if (!out || !cap) return false;
+    out[0] = 0;
+    if (!osa_paths_init()) {
+        osa_err_set(err, "the data folder beside the program is not writable");
+        return false;
+    }
+#ifdef _WIN32
+    char target[OSAI_MAX_PATH], beside[OSAI_MAX_PATH];
+    snprintf(target, sizeof target, "%sOpenSpeechWorker.exe", osa_path(OSAI_DIR_CACHE));
+    osa_path_join(beside, sizeof beside, osa_exe_dir(), "OpenSpeechWorker.exe");
+
+    HRSRC rs = FindResourceW(NULL, L"OSAI_WORKER", (LPCWSTR)RT_RCDATA);
+    if (rs) {
+        HGLOBAL hg = LoadResource(NULL, rs);
+        const void *data = hg ? LockResource(hg) : NULL;
+        DWORD n = SizeofResource(NULL, rs);
+        if (data && n) {
+            char want[65], have[65] = {0};
+            uint64_t fsz = 0;
+            osa_sha256_hex(data, n, want);
+            if (osa_file_exists(target)) osa_sha256_file(target, have, &fsz);
+            if (fsz == n && osa_streq(want, have)) { osa_strlcpy(out, target, cap); return true; }
+            char tmp[OSAI_MAX_PATH + 8];
+            snprintf(tmp, sizeof tmp, "%s.part", target);
+            if (osa_file_write(tmp, data, n)) {
+                char hex[65] = {0};
+                osa_sha256_file(tmp, hex, NULL);
+                if (osa_streq(hex, want) && osa_file_rename(tmp, target)) {
+                    osa_strlcpy(out, target, cap);
+                    return true;
+                }
+                osa_file_remove(tmp);
+            }
+            /* Another running instance may hold the file open: fall through to
+             * an already extracted or shipped copy instead of failing. */
+            if (osa_file_exists(target)) { osa_strlcpy(out, target, cap); return true; }
+        }
+    }
+    if (osa_file_exists(beside)) { osa_strlcpy(out, beside, cap); return true; }
+    osa_err_set(err, "the model worker is missing from %s and %s", target, beside);
+    return false;
+#else
+    osa_path_join(out, cap, osa_exe_dir(), "OpenSpeechWorker");
+    if (osa_file_exists(out)) return true;
+    osa_err_set(err, "OpenSpeechWorker is missing beside the program (build it with `make worker`)");
+    return false;
+#endif
+}
+
+/* Opens a link the About screen shows. Only http(s) and mailto are accepted, so
+ * a model name or a path can never turn into a shell command. */
+bool osa_open_url(const char *url) {
+    if (!url || !*url) return false;
+    if (!osa_starts(url, "https://") && !osa_starts(url, "http://") &&
+        !osa_starts(url, "mailto:")) return false;
+#ifdef _WIN32
+    int n = MultiByteToWideChar(CP_UTF8, 0, url, -1, NULL, 0);
+    if (n <= 0) return false;
+    wchar_t *w = (wchar_t *)malloc((size_t)n * sizeof(wchar_t));
+    if (!w) return false;
+    MultiByteToWideChar(CP_UTF8, 0, url, -1, w, n);
+    HINSTANCE r = ShellExecuteW(NULL, L"open", w, NULL, NULL, SW_SHOWNORMAL);
+    free(w);
+    return (INT_PTR)r > 32;
+#else
+    return false;
+#endif
+}
+
 bool osa_open_in_explorer(const char *path) {
 #ifdef _WIN32
     HINSTANCE h = ShellExecuteA(NULL, "open", path, NULL, NULL, SW_SHOWNORMAL);

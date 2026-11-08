@@ -18,7 +18,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 
-#define OSAI_VERSION        "1.2.0"
+#define OSAI_VERSION        "1.3.0"
 #define OSAI_APP_NAME       "OpenSpeech AI"
 #define OSAI_APP_ID         "OpenSpeechAI"
 
@@ -27,6 +27,11 @@
  * so the codebase uses its own constant. */
 #define OSAI_PI 3.14159265358979323846
 
+#ifdef _WIN32
+#define OSAI_PATH_SEP       "\\"
+#else
+#define OSAI_PATH_SEP       "/"
+#endif
 #define OSAI_MAX_PATH       1024
 #define OSAI_MAX_LINE       4096
 #define OSAI_MAX_TEXT       65536

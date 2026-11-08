@@ -68,17 +68,18 @@ static void test_catalog_and_gate(void){
     CHECK_MSG(st.n_models==0,"fresh install has zero installed models (got %d)",st.n_models);
     CHECK(!st.asr_ready&&!st.mt_ready&&!st.lid_ready);
     CHECK(!osa_app_ready(app));
-    osa_pack_info packs[16]; int np=osa_app_packs(app,packs,16);
-    bool asr=false,mt=false,lid=false,all_verified=true,no_tiny=true;
+    osa_pack_info packs[32]; int np=osa_app_packs(app,packs,32);
+    int asr=0,mt=0,lid=0; bool all_verified=true,no_tiny=true;
     for(int i=0;i<np;i++){
-        if(osa_streq(packs[i].kind,"asr"))asr=true;
-        if(osa_streq(packs[i].kind,"mt"))mt=true;
-        if(osa_streq(packs[i].kind,"lang"))lid=true;
-        if(!packs[i].url[0]||strlen(packs[i].sha256)!=64||packs[i].size_mb<=1)all_verified=false;
+        if(osa_streq(packs[i].kind,"asr"))asr++;
+        if(osa_streq(packs[i].kind,"mt"))mt++;
+        if(osa_streq(packs[i].kind,"lang"))lid++;
+        if(!packs[i].url[0]||strlen(packs[i].sha256)!=64||packs[i].size_mb<=0)all_verified=false;
+        if(!osa_starts(packs[i].url,"https://"))all_verified=false;
         if(strstr(packs[i].id,"tiny")||strstr(packs[i].id,"base")||strstr(packs[i].id,"phrase"))no_tiny=false;
         CHECK_MSG(!packs[i].installed,"catalog %s is not installed on fresh state",packs[i].id);
     }
-    CHECK_MSG(np>=3&&asr&&mt&&lid,"catalog has ASR+MT+LID (%d entries)",np);
+    CHECK_MSG(np>=6&&asr>=2&&mt>=2&&lid>=2,"catalog offers a choice in every category (asr=%d mt=%d lid=%d)",asr,mt,lid);
     CHECK(all_verified); CHECK(no_tiny);
     osa_app_translation tr; CHECK(!osa_app_translate(app,"سلام","fa",&tr,&err));
     osa_app_transcript ts; CHECK(!osa_app_transcribe_file(app,"/nonexistent.wav",&ts,&err));
@@ -173,6 +174,70 @@ static void test_shell_gate(void){
     shell_shutdown(&sh); osa_app_destroy(app); clean_root();
 }
 
+static void test_worker_path(void){
+    suite("worker resolution");
+    char path[OSAI_MAX_PATH]={0}; osa_error err;
+    bool ok=osa_worker_path(path,sizeof path,&err);
+    CHECK_MSG(ok,"worker path resolved: %s",ok?path:err.msg);
+    CHECK_MSG(ok&&osa_file_exists(path),"the resolved worker actually exists");
+}
+
+/* The product writes only under <exe dir>/data. This runs the real host in a
+ * child process with OSAI_DATA_DIR removed and a throwaway HOME that holds an
+ * old-style profile, so both the new location and the one-time move are proved
+ * rather than asserted in a comment. */
+static void test_portable_data_dir(void){
+    suite("portable data folder + profile migration");
+    const char *host="build/openspeech";
+    if(!osa_file_exists(host)){printf("  SKIP headless host not built\n");return;}
+    char home[256]; snprintf(home,sizeof home,"/tmp/osai-home-XXXXXX");
+    if(!mkdtemp(home)){CHECK_MSG(false,"mkdtemp");return;}
+    char legacy[512],models[600],probe[700],prefs[600];
+    snprintf(legacy,sizeof legacy,"%s/.local/share/OpenSpeechAI",home);
+    snprintf(models,sizeof models,"%s/Models",legacy);
+    snprintf(probe,sizeof probe,"%s/portable-probe.txt",models);
+    snprintf(prefs,sizeof prefs,"%s/settings.ini",legacy);
+    CHECK(osa_mkdirs(models));
+    CHECK(osa_file_write(probe,"moved",5));
+    CHECK(osa_file_write(prefs,"lang=fa\ndark=0\n",14));
+
+    const char *old_home=getenv("HOME");
+    char saved_home[512]={0}; if(old_home)osa_strlcpy(saved_home,old_home,sizeof saved_home);
+    setenv("HOME",home,1);
+    unsetenv("OSAI_DATA_DIR");
+    const char *argv[]={host,"--paths-json",NULL};
+    osa_error err; osa_process *p=osa_process_start(argv,&err);
+    CHECK_MSG(p!=NULL,"host starts: %s",p?"ok":err.msg);
+    char root[OSAI_MAX_PATH]={0},exedir[OSAI_MAX_PATH]={0};
+    if(p){
+        char *line=NULL;
+        if(osa_process_line(p,15000,NULL,&line,&err)){
+            osa_json_get_string(line,"root",root,sizeof root);
+            osa_json_get_string(line,"exe_dir",exedir,sizeof exedir);
+            free(line);
+        }
+        osa_process_stop(p);
+    }
+    char want[OSAI_MAX_PATH+16]; snprintf(want,sizeof want,"%s/data/",exedir);
+    CHECK_MSG(root[0]&&osa_streq(root,want),"data root is <exe dir>/data (%s)",root);
+    char moved[OSAI_MAX_PATH+64],movedprefs[OSAI_MAX_PATH+32];
+    snprintf(moved,sizeof moved,"%sModels/portable-probe.txt",root);
+    snprintf(movedprefs,sizeof movedprefs,"%ssettings.ini",root);
+    CHECK_MSG(osa_file_exists(moved),"old profile models were moved beside the exe");
+    CHECK_MSG(!osa_file_exists(probe),"nothing is left in the old profile model folder");
+    CHECK_MSG(!osa_dir_exists(legacy),"the emptied profile folder is removed");
+    /* clean the probe out of the build tree; keep any real developer data */
+    osa_file_remove(moved);
+    if(osa_file_exists(movedprefs)){
+        osa_buf b; osa_buf_init(&b);
+        if(osa_file_read(movedprefs,&b)&&b.len==14&&!memcmp(b.data,"lang=fa\ndark=0\n",14))osa_file_remove(movedprefs);
+        osa_buf_free(&b);
+    }
+    osa_dir_remove_recursive(home);
+    if(saved_home[0])setenv("HOME",saved_home,1);
+    if(g_root[0])setenv("OSAI_DATA_DIR",g_root,1);
+}
+
 static void test_optional_real_models(void){
     suite("optional real-model smoke (user-supplied weights)");
     const char *asr=getenv("OSAI_TEST_ASR"),*mt=getenv("OSAI_TEST_MT"),*lid=getenv("OSAI_TEST_LID"),*wav=getenv("OSAI_TEST_WAV");
@@ -206,6 +271,8 @@ int main(void){
     test_audio_wav();
     test_worker_isolation();
     test_shell_gate();
+    test_worker_path();
+    test_portable_data_dir();
     test_optional_real_models();
     printf("\n%d passed, %d failed\n",g_pass,g_fail);
     return g_fail?1:0;

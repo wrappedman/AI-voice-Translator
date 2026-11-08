@@ -43,5 +43,5 @@ int   shell_parse_history(const char *json);
 
 /* Background job kinds shared by shell.c and screen event handlers. */
 typedef enum shell_job_kind { SHELL_JOB_RESTORE, SHELL_JOB_LOAD_AUDIO, SHELL_JOB_TRANSCRIBE,
-    SHELL_JOB_TRANSLATE, SHELL_JOB_DOWNLOAD, SHELL_JOB_ACTIVATE, SHELL_JOB_EVALUATE, SHELL_JOB_IMPORT } shell_job_kind;
+    SHELL_JOB_TRANSLATE, SHELL_JOB_DOWNLOAD, SHELL_JOB_ACTIVATE, SHELL_JOB_EVALUATE } shell_job_kind;
 bool shell_start_job(shell_state *s, shell_job_kind kind, const char *arg);

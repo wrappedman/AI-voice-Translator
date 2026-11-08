@@ -1,3 +1,0 @@
-4afd6fcbf99617c60f24ee014ba82e0faa60f9c9136b1912608ba3274f3a5628  bin/OpenSpeechAI.exe
-2bd864f2e5356f4b121439386390842dba079ef8f3785b0c6f05479fc1bdf51f  bin/OpenSpeechWorker.exe
-eac0358fcab4b3b684a2b69c497a97fa74b2520111d0d7b78ce9cf44e8acfcbf  OpenSpeechAI-1.2.0-win64.zip

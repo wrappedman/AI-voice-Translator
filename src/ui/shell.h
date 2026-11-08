@@ -41,10 +41,10 @@ typedef enum shell_lang { UI_FA = 0, UI_EN = 1 } shell_lang;
 typedef enum shell_request {
     SHELL_REQ_NONE = 0,
     SHELL_REQ_PICK_AUDIO,      /* open the audio file picker          */
-    SHELL_REQ_PICK_PACK,       /* open the language pack / model picker */
     SHELL_REQ_PICK_DATASET,    /* open the training dataset picker     */
     SHELL_REQ_OPEN_FOLDER,     /* show the data folder in Explorer    */
-    SHELL_REQ_SAVE_TRANSCRIPT  /* save the current transcript to a file */
+    SHELL_REQ_SAVE_TRANSCRIPT, /* save the current transcript to a file */
+    SHELL_REQ_OPEN_URL         /* open request_url in the browser/mail client */
 } shell_request;
 
 typedef struct shell_state {
@@ -94,11 +94,13 @@ typedef struct shell_state {
     int           models_tab;            /* 0 installed, 1 downloadable */
     int           packs_scroll;
     double        dl_progress;           /* 0..1 while downloading      */
+    int64_t       dl_got, dl_total;      /* bytes, for the row's percentage */
     char          dl_pack[64];
     bool          downloading;
     struct dl_job *dl;                   /* legacy alias: same as job for downloads */
     struct shell_job *job;               /* one cancellable background action */
     bool          restoring;
+    bool          activating;            /* a model is being loaded right now */
     bool          models_ready;
 
     /* training */
@@ -148,6 +150,7 @@ typedef struct shell_state {
      * The host consumes the request, fills in the result and clears it; the UI
      * itself never touches the filesystem dialog APIs. */
     shell_request request;
+    char          request_url[512];      /* payload for SHELL_REQ_OPEN_URL */
     char          request_path[OSAI_MAX_PATH];
 
     /* ui bookkeeping */
@@ -171,7 +174,6 @@ bool shell_load_waveform(shell_state *s, const char *path);
 bool shell_run_transcribe(shell_state *s);
 bool shell_select_audio(shell_state *s, const char *path);
 bool shell_activate_model(shell_state *s, const char *id);
-bool shell_import_model(shell_state *s, const char *path);
 void shell_job_tick(shell_state *s);
 void shell_cancel_jobs(shell_state *s);
 void shell_live_shutdown(shell_state *s);

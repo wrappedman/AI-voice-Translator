@@ -49,29 +49,42 @@ No installer, no account, no bundled model weights.
 Run
     OpenSpeechAI.exe
 
-Keep the whole folder together
+Put the folder somewhere writable
+    C:\\OpenSpeechAI or your Desktop is fine. Do not run it from inside the
+    ZIP, and avoid C:\\Program Files unless you have write access there.
+
     OpenSpeechAI.exe
-    OpenSpeechWorker.exe
+    OpenSpeechWorker.exe        (also embedded inside OpenSpeechAI.exe)
     assets\\fonts\\Vazirmatn-*.ttf
     assets\\catalog.json
 
-    OpenSpeechWorker.exe must sit next to OpenSpeechAI.exe. It runs the
-    neural translation / language-identification engines in a separate
-    process so a model failure cannot take down the window.
+    The worker runs the neural translation / language-identification engines
+    in a separate process. It is embedded in OpenSpeechAI.exe and extracted
+    to data\\Cache on first use, so activation works even if you copy the
+    exe on its own. Worker diagnostics go to data\\Logs\\worker.log.
 
 First run
+    The interface opens in Persian with the light theme.
     The application starts with NO installed models. Open Models, download
-    one speech model (Whisper), one translation model (Qwen GGUF) and the
+    one speech model (Whisper), one translation model (Qwen GGUF) and one
     language-identification model (fastText LID 176), then activate each.
     Transcription, translation and live features stay disabled until all
-    three categories have an active model. Downloads are verified against
-    pinned SHA-256 hashes and installed inactive; activation is explicit.
+    three categories have an active model. The window header always names
+    the active model in each category.
 
-The program creates its data folder on first start:
-    %LOCALAPPDATA%\\OpenSpeechAI
+    The catalogue offers 5 Whisper variants, 5 Qwen2.5 translation quants and
+    2 fastText language-identification models (including the 0.9 MB .ftz).
+    Downloads show their percentage, can be cancelled, and are verified
+    against pinned sizes and SHA-256 hashes before being installed inactive.
+    There is no local-file import: only the official catalogue installs.
 
-Everything (downloaded models, transcripts, audio copies) stays there.
-Settings are stored in settings.ini inside the data root.
+Everything the program writes lives next to the executable:
+    <folder with OpenSpeechAI.exe>\\data\\
+        Models\\  Downloads\\  Database\\  Logs\\  Licenses\\  Audio\\  Cache\\ ...
+        settings.ini
+
+Nothing is created in AppData. An older %LOCALAPPDATA%\\OpenSpeechAI profile
+is moved into data\\ once on first start, and removed when it is empty.
 
 Requirements
     Windows 10 version 1903 or newer / Windows 11, 64-bit.
@@ -83,6 +96,10 @@ Verified
     SHA-256 of OpenSpeechAI.exe, OpenSpeechWorker.exe and the zip are listed
     in checksums-{ver}.txt. Model downloads are verified separately against
     the catalog hashes before installation.
+
+Developer
+    behnam ehsani — inbox.ehsani@gmail.com
+    https://github.com/wrappedman/AI-voice-Translator
 
 Licence
     GPL-3.0-or-later. Bundled fonts: Vazirmatn (SIL OFL 1.1).

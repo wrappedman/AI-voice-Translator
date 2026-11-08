@@ -27,8 +27,19 @@ APP_REQUIRED = [
     ("Media Foundation is unavailable", "the AAC/M4A decoder is linked in"),
     ("ترجمه انجام شد", "the translate confirmation"),
     ("ابتدا مدل گفتار", "the model-required gate message"),
+    ("درباره نرم‌افزار", "the renamed About section"),
+    ("تشخیص گفتار و ترجمه آفلاین", "the offline tagline"),
+    ("behnam ehsani", "the developer card"),
+    ("inbox.ehsani@gmail.com", "the developer contact"),
+    ("cannot start the model worker", "the diagnosable spawn failure"),
+    ("worker.log", "worker stderr logging"),
+    ("OSAI_WORKER", "the embedded worker resource name"),
 ]
-FORBIDDEN = ["no AAC decoder on this platform"]
+FORBIDDEN = [
+    "no AAC decoder on this platform",
+    "افزودن مدل از فایل",          # local-file import was removed
+    "keep it beside OpenSpeechAI.exe",
+]
 EXPECT_MACHINE = 0x8664
 EXPECT_MAGIC_PE32P = 0x020B
 
@@ -83,12 +94,25 @@ def check(path: str, console: bool) -> int:
                              (b"permonitorv2", "DPI manifest")):
             if needle not in data:
                 fails.append("missing %s resource" % what)
-        stale = [v for v in ("1.0.0.0", "0.9.0.0", "1.1.0.0")
+        stale = [v for v in ("1.0.0.0", "0.9.0.0", "1.1.0.0", "1.2.0.0")
                  if v != ver and v.encode("utf-16-le") in data]
         for v in stale:
             fails.append("file properties still report version %s" % v)
         if ver.encode("utf-16-le") not in data:
             fails.append("version resource does not carry %s" % ver)
+        # The worker must travel inside the app resource, otherwise activation
+        # fails on a machine where only OpenSpeechAI.exe was copied.
+        worker = os.path.join(os.path.dirname(os.path.abspath(path)), "OpenSpeechWorker.exe")
+        if os.path.exists(worker):
+            with open(worker, "rb") as f:
+                payload = f.read()
+            if payload[:8192] not in data or payload[-8192:] not in data:
+                fails.append("the embedded worker payload does not match OpenSpeechWorker.exe")
+            else:
+                print("  ok   inference worker embedded as RCDATA (%d bytes)" % len(payload))
+        else:
+            fails.append("OpenSpeechWorker.exe not found next to the app; cannot check the embedded copy")
+        print("  ok   subsystem %d (GUI, no console window)" % subsystem)
     return report(fails, path, data)
 
 

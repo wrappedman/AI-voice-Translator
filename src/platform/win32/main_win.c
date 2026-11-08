@@ -49,17 +49,17 @@
  * enum instead of re-declaring integers makes that impossible. */
 #define REQ_NONE        SHELL_REQ_NONE
 #define REQ_PICK_AUDIO  SHELL_REQ_PICK_AUDIO
-#define REQ_PICK_MODEL  SHELL_REQ_PICK_PACK
 #define REQ_PICK_DATA   SHELL_REQ_PICK_DATASET
 #define REQ_OPEN_FOLDER SHELL_REQ_OPEN_FOLDER
 #define REQ_SAVE_TEXT   SHELL_REQ_SAVE_TRANSCRIPT
+#define REQ_OPEN_URL    SHELL_REQ_OPEN_URL
 /* Compile-time proof that the two enums still line up. They drifted once and the
  * result was a button that did nothing, so this cannot be left to review. */
 _Static_assert(REQ_PICK_AUDIO  == 1, "shell_request order changed");
-_Static_assert(REQ_PICK_MODEL  == 2, "shell_request order changed");
-_Static_assert(REQ_PICK_DATA   == 3, "shell_request order changed");
-_Static_assert(REQ_OPEN_FOLDER == 4, "shell_request order changed");
-_Static_assert(REQ_SAVE_TEXT   == 5, "shell_request order changed");
+_Static_assert(REQ_PICK_DATA   == 2, "shell_request order changed");
+_Static_assert(REQ_OPEN_FOLDER == 3, "shell_request order changed");
+_Static_assert(REQ_SAVE_TEXT   == 4, "shell_request order changed");
+_Static_assert(REQ_OPEN_URL    == 5, "shell_request order changed");
 
 typedef struct host {
     HWND         hwnd;
@@ -144,12 +144,6 @@ static void finish_pick_audio(host *h, const wchar_t *file) {
     shell_select_audio(&h->shell,path);
 }
 
-static void finish_pick_model(host *h, const wchar_t *file) {
-    char path[OSAI_MAX_PATH];
-    if (!WideCharToMultiByte(CP_UTF8, 0, file, -1, path, sizeof path, NULL, NULL)) return;
-    if(!shell_import_model(&h->shell,path))shell_set_message(&h->shell,true,"%s",tt(h->shell.lang,"msg.failed"));
-}
-
 /* Training data: either a tab-separated "audio<TAB>text" file or a folder of
  * recordings. The picker offers both, so a user with a folder of clips is not
  * forced to assemble a manifest by hand. */
@@ -214,10 +208,10 @@ static bool start_dialog(host *h, int kind) {
             L"All files\0*.*\0";
         h->ofn.lpstrTitle = L"انتخاب فایل صوتی / Choose an audio file";
     } else {
-        h->ofn.lpstrFilter =
-            L"Verified models (*.gguf;*.bin)\0*.gguf;*.bin\0"
-            L"All files\0*.*\0";
-        h->ofn.lpstrTitle = L"نصب مدل تأییدشده / Install a verified model";
+        /* Model import from a local file was removed on purpose: models are
+         * installed only from the verified official catalogue. */
+        h->dialog_open = false;
+        return false;
     }
     BOOL ok = GetOpenFileNameW(&h->ofn);
     /* Read the result *after* the dialog has closed, and clear the flag before
@@ -226,7 +220,6 @@ static bool start_dialog(host *h, int kind) {
     if (ok) {
         if (kind == REQ_PICK_AUDIO) finish_pick_audio(h, h->ofn_file);
         else if (kind == REQ_PICK_DATA) finish_pick_dataset(h, h->ofn_file);
-        else finish_pick_model(h, h->ofn_file);
     }
     return ok ? true : false;
 }
@@ -293,6 +286,7 @@ static void host_frame(host *h) {
     if (req != REQ_NONE) {
         h->shell.request = REQ_NONE;
         if (req == REQ_OPEN_FOLDER) osa_open_in_explorer(osa_path(OSAI_DIR_ROOT));
+        else if (req == REQ_OPEN_URL) osa_open_url(h->shell.request_url);
         else if (start_dialog(h, req)) {
             /* handled (or the user cancelled) */
         } else {

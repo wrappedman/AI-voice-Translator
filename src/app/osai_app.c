@@ -18,26 +18,67 @@
 
 typedef struct pack_def {
     const char *id, *name, *kind, *languages, *license, *url, *sha256, *notes, *ext;
+    const char *langs;          /* capability list for translation models */
     int64_t bytes;
 } pack_def;
-static const char *QWEN_LANGS="en;fa;ar;zh;fr;es;pt;de;it;ru;ja;ko;vi;th;id;tr;hi;he;nl;pl;uk";
+/* Conservative, documented subset of the languages Qwen2.5 Instruct covers.
+ * The list belongs to the model, not to the application: the active pack's own
+ * capability list is what the pickers and the gate use. */
+static const char QWEN_LANGS[]="en;fa;ar;zh;fr;es;pt;de;it;ru;ja;ko;vi;th;id;tr;hi;he;nl;pl;uk";
 static const pack_def PACKS[] = {
+ /* ---- speech: whisper.cpp ggml containers, MIT, multilingual ---- */
  {"whisper-medium-q5","Whisper Medium Q5_0","asr","multilingual","MIT",
   "https://huggingface.co/ggerganov/whisper.cpp/resolve/f281eb45af861ab5e5297d23694b7d46e090c02c/ggml-medium-q5_0.bin",
   "19fea4b380c3a618ec4723c3eef2eb785ffba0d0538cf43f8f235e7b3b34220f",
-  "769M parameters; multilingual CPU recognition; balanced quality/memory.","bin",539212467},
+  "769M parameters; balanced quality/memory; ~4 GB RAM.","bin",NULL,539212467},
  {"whisper-turbo-q5","Whisper Large v3 Turbo Q5_0","asr","multilingual","MIT",
   "https://huggingface.co/ggerganov/whisper.cpp/resolve/98aa99a0a9db05ae2342309f5096248665f7cba3/ggml-large-v3-turbo-q5_0.bin",
   "394221709cd5ad1f40c46e6031ca61bce88931e6e088c188294c6d5a55ffa7e2",
-  "809M parameters; multilingual; faster decoder, higher speech quality target.","bin",574041195},
+  "809M parameters; fast decoder, high accuracy; ~4 GB RAM.","bin",NULL,574041195},
+ {"whisper-medium-q8","Whisper Medium Q8_0","asr","multilingual","MIT",
+  "https://huggingface.co/ggerganov/whisper.cpp/resolve/5359861c739e955e79d9a303bcbc70fb988958b1/ggml-medium-q8_0.bin",
+  "42a1ffcbe4167d224232443396968db4d02d4e8e87e213d3ee2e03095dea6502",
+  "769M parameters at 8-bit; closer to the original weights; ~6 GB RAM.","bin",NULL,823369779},
+ {"whisper-turbo-q8","Whisper Large v3 Turbo Q8_0","asr","multilingual","MIT",
+  "https://huggingface.co/ggerganov/whisper.cpp/resolve/5359861c739e955e79d9a303bcbc70fb988958b1/ggml-large-v3-turbo-q8_0.bin",
+  "317eb69c11673c9de1e1f0d459b253999804ec71ac4c23c17ecf5fbe24e259a1",
+  "809M parameters at 8-bit; best turbo quality; ~6 GB RAM.","bin",NULL,874188075},
+ {"whisper-large-v3-q5","Whisper Large v3 Q5_0","asr","multilingual","MIT",
+  "https://huggingface.co/ggerganov/whisper.cpp/resolve/5359861c739e955e79d9a303bcbc70fb988958b1/ggml-large-v3-q5_0.bin",
+  "d75795ecff3f83b5faa89d1900604ad8c780abd5739fae406de19f23ecd98ad1",
+  "1550M parameters; highest accuracy, slower; ~8 GB RAM.","bin",NULL,1081140203},
+
+ /* ---- translation: official Qwen GGUF, Apache-2.0, multilingual ---- */
+ {"qwen25-1.5b-q4km","Qwen2.5 1.5B Instruct Q4_K_M","mt","multilingual","Apache-2.0",
+  "https://huggingface.co/Qwen/Qwen2.5-1.5B-Instruct-GGUF/resolve/main/qwen2.5-1.5b-instruct-q4_k_m.gguf",
+  "6a1a2eb6d15622bf3c96857206351ba97e1af16c30d7a74ee38970e434e9407e",
+  "1.5B neural translator for low-memory PCs; ~4 GB RAM.","gguf",QWEN_LANGS,1117320736},
  {"qwen25-3b-q4km","Qwen2.5 3B Instruct Q4_K_M","mt","multilingual","Apache-2.0",
   "https://huggingface.co/Qwen/Qwen2.5-3B-Instruct-GGUF/resolve/cc1e68eea5f05f88f41a6de1fc73110178f23715/qwen2.5-3b-instruct-q4_k_m.gguf",
   "626b4a6678b86442240e33df819e00132d3ba7dddfe1cdc4fbb18e0a9615c62d",
-  "3.09B neural instruction model; local GGUF inference; 8 GB RAM minimum.","gguf",2104932768},
+  "3.09B neural translator; balanced quality/memory; ~8 GB RAM.","gguf",QWEN_LANGS,2104932768},
+ {"qwen25-3b-q6k","Qwen2.5 3B Instruct Q6_K","mt","multilingual","Apache-2.0",
+  "https://huggingface.co/Qwen/Qwen2.5-3B-Instruct-GGUF/resolve/main/qwen2.5-3b-instruct-q6_k.gguf",
+  "12da1a5d3fa6905111d8798b00ed49e0f6425441598c8c41bb37a2c36d49d0f3",
+  "3.09B at 6-bit; noticeably fewer quantization artefacts; ~8 GB RAM.","gguf",QWEN_LANGS,2793410976},
+ {"qwen25-3b-q8","Qwen2.5 3B Instruct Q8_0","mt","multilingual","Apache-2.0",
+  "https://huggingface.co/Qwen/Qwen2.5-3B-Instruct-GGUF/resolve/main/qwen2.5-3b-instruct-q8_0.gguf",
+  "6dcc22694c8654b045ec40bbe350212b88893fd9010e8474bae5b19a43578ba1",
+  "3.09B at 8-bit; near-original quality; ~10 GB RAM.","gguf",QWEN_LANGS,3616088480},
+ {"qwen25-7b-q3km","Qwen2.5 7B Instruct Q3_K_M","mt","multilingual","Apache-2.0",
+  "https://huggingface.co/Qwen/Qwen2.5-7B-Instruct-GGUF/resolve/main/qwen2.5-7b-instruct-q3_k_m.gguf",
+  "a96b16179dc6cc9afdf0cf7a96a80c199cbd00b9be207c3465be21cb721cca5e",
+  "7.6B neural translator; strongest wording, slower; ~12 GB RAM.","gguf",QWEN_LANGS,3808391072},
+
+ /* ---- language identification: official fastText, CC-BY-SA-3.0 ---- */
  {"fasttext-lid176","fastText LID 176 (full)","lang","multilingual","CC-BY-SA-3.0",
   "https://dl.fbaipublicfiles.com/fasttext/supervised-models/lid.176.bin",
   "7e69ec5451bc261cc7844e49e4792a85d7f09c06789ec800fc4a44aec362764e",
-  "Full 176-label supervised classifier; not the reduced/quantized FTZ file.","bin",131266198}
+  "176 languages, full precision; most accurate; ~200 MB RAM.","bin",NULL,131266198},
+ {"fasttext-lid176-ftz","fastText LID 176 (compressed)","lang","multilingual","CC-BY-SA-3.0",
+  "https://dl.fbaipublicfiles.com/fasttext/supervised-models/lid.176.ftz",
+  "8f3472cfe8738a7b6099e8e999c3cbfae0dcd15696aac7d7738a8039db603e83",
+  "Same 176 languages, quantized; tiny download, slightly lower accuracy.","ftz",NULL,938013}
 };
 #define NPACKS ((int)(sizeof PACKS/sizeof PACKS[0]))
 
@@ -47,6 +88,7 @@ struct osa_app {
     wsp_ctx *asr; char asr_id[40], asr_name[128];
     osa_process *mt, *lid;
     char mt_id[40], mt_name[128], mt_path[OSAI_MAX_PATH];
+    char mt_langs[512];         /* capability list of the active MT model */
     char lid_id[40], lid_name[128], lid_path[OSAI_MAX_PATH];
     bool mt_loaded, lid_loaded;
     char models_dir[OSAI_MAX_PATH], audio_dir[OSAI_MAX_PATH];
@@ -57,16 +99,18 @@ struct osa_app {
 static const pack_def *find_pack(const char *id){if(!id)return NULL;for(int i=0;i<NPACKS;i++)if(osa_streq(id,PACKS[i].id))return PACKS+i;return NULL;}
 static void json_str(osa_buf *b,const char *s){osa_arena a;osa_arena_init(&a);char*q=osa_json_escape(&a,s);osa_buf_puts(b,q);osa_arena_free(&a);}
 static bool has_token(const char *list,const char *code){if(!code||!*code||!list)return false;size_t n=strlen(code);for(const char*p=list;*p;){const char*e=strchr(p,';');if(!e)e=p+strlen(p);if((size_t)(e-p)==n&&!strncmp(p,code,n))return true;p=*e?e+1:e;}return false;}
+static const char *mt_langs(osa_app*a);
 static void lockd(osa_app*a){osa_mutex_lock(&a->db_mu);} static void unlockd(osa_app*a){osa_mutex_unlock(&a->db_mu);}
 static void locke(osa_app*a){osa_mutex_lock(&a->engine_mu);} static void unlocke(osa_app*a){osa_mutex_unlock(&a->engine_mu);}
 
+static const char *mt_langs(osa_app*a){return a&&a->mt_langs[0]?a->mt_langs:QWEN_LANGS;}
 static bool get_model(osa_app*a,const char*id,osa_model*m,osa_error*err){
     memset(m,0,sizeof*m);osa_arena ar;osa_arena_init(&ar);char *sql=osa_arena_printf(&ar,"SELECT * FROM Models WHERE id='%s'",osa_sql_escape(&ar,id));osa_rs rs;lockd(a);bool ok=osa_sql_query(a->db,sql,&rs,err);
     if(ok&&rs.nrows){const char*fields[]={"id","name","kind","engine","base_model","source_url","license","sha256","path","version","status","notes","created_at"};char*dst[]={m->id,m->name,m->kind,m->engine,m->base_model,m->source_url,m->license,m->sha256,m->path,m->version,m->status,m->notes,m->created_at};size_t caps[]={sizeof m->id,sizeof m->name,sizeof m->kind,sizeof m->engine,sizeof m->base_model,sizeof m->source_url,sizeof m->license,sizeof m->sha256,sizeof m->path,sizeof m->version,sizeof m->status,sizeof m->notes,sizeof m->created_at};for(int i=0;i<13;i++)osa_strlcpy(dst[i],osa_rs_val(&rs,0,fields[i]),caps[i]);m->size_bytes=osa_rs_i64(&rs,0,"size_bytes");}else if(ok){osa_err_set(err,"model is not installed");ok=false;}
     osa_rs_free(&rs);unlockd(a);osa_arena_free(&ar);return ok;
 }
 static bool verify(const char*path,const pack_def*p,osa_error*err){char h[65];uint64_t n=0;osa_sha256_file(path,h,&n);if(!osa_file_exists(path)||(int64_t)n!=p->bytes||!osa_strieq(h,p->sha256)){osa_err_set(err,"model integrity check failed (size or SHA-256 mismatch)");return false;}return true;}
-static bool register_pack(osa_app*a,const pack_def*p,const char*path,osa_error*err){osa_model m;memset(&m,0,sizeof m);osa_strlcpy(m.id,p->id,sizeof m.id);osa_strlcpy(m.name,p->name,sizeof m.name);osa_strlcpy(m.kind,p->kind,sizeof m.kind);osa_strlcpy(m.engine,osa_streq(p->kind,"asr")?"whisper":osa_streq(p->kind,"mt")?"llama.cpp":"fastText",sizeof m.engine);osa_strlcpy(m.license,p->license,sizeof m.license);osa_strlcpy(m.source_url,p->url,sizeof m.source_url);osa_strlcpy(m.path,path,sizeof m.path);osa_strlcpy(m.version,"verified",sizeof m.version);osa_strlcpy(m.status,"installed",sizeof m.status);osa_strlcpy(m.sha256,p->sha256,sizeof m.sha256);m.size_bytes=p->bytes;osa_iso_time(osa_now_ms(),m.created_at);if(osa_streq(p->kind,"mt"))snprintf(m.notes,sizeof m.notes,"languages=%s",QWEN_LANGS);else osa_strlcpy(m.notes,p->notes,sizeof m.notes);lockd(a);bool ok=osa_store_model_add(a->db,&m,err);unlockd(a);return ok;}
+static bool register_pack(osa_app*a,const pack_def*p,const char*path,osa_error*err){osa_model m;memset(&m,0,sizeof m);osa_strlcpy(m.id,p->id,sizeof m.id);osa_strlcpy(m.name,p->name,sizeof m.name);osa_strlcpy(m.kind,p->kind,sizeof m.kind);osa_strlcpy(m.engine,osa_streq(p->kind,"asr")?"whisper":osa_streq(p->kind,"mt")?"llama.cpp":"fastText",sizeof m.engine);osa_strlcpy(m.license,p->license,sizeof m.license);osa_strlcpy(m.source_url,p->url,sizeof m.source_url);osa_strlcpy(m.path,path,sizeof m.path);osa_strlcpy(m.version,"verified",sizeof m.version);osa_strlcpy(m.status,"installed",sizeof m.status);osa_strlcpy(m.sha256,p->sha256,sizeof m.sha256);m.size_bytes=p->bytes;osa_iso_time(osa_now_ms(),m.created_at);if(osa_streq(p->kind,"mt")&&p->langs)snprintf(m.notes,sizeof m.notes,"languages=%s",p->langs);else osa_strlcpy(m.notes,p->notes,sizeof m.notes);lockd(a);bool ok=osa_store_model_add(a->db,&m,err);unlockd(a);return ok;}
 
 static char *worker_reply(osa_process*p,const char*request,volatile int*cancel,osa_error*err){
     if(!p||!osa_process_write(p,request,err))return NULL;
@@ -75,13 +119,9 @@ static char *worker_reply(osa_process*p,const char*request,volatile int*cancel,o
     bool ok=false;osa_json_get_bool(line,"ok",&ok);if(!ok){char msg[512];if(!osa_json_get_string(line,"error",msg,sizeof msg))osa_strlcpy(msg,"model worker failed",sizeof msg);osa_err_set(err,"%s",msg);free(line);return NULL;}return line;
 }
 static osa_process *start_worker(const char*kind,const char*path,volatile int*cancel,osa_error*err){
-    char exe[OSAI_MAX_PATH];osa_path_join(exe,sizeof exe,osa_exe_dir(),
-#ifdef _WIN32
-        "OpenSpeechWorker.exe"
-#else
-        "OpenSpeechWorker"
-#endif
-    );char threads[8];snprintf(threads,sizeof threads,"%d",osa_clampi(osa_cpu_count()/2,1,8));const char*argv[]={exe,"--kind",kind,"--model",path,"--threads",threads,NULL};
+    char exe[OSAI_MAX_PATH];
+    if(!osa_worker_path(exe,sizeof exe,err))return NULL;
+    char threads[8];snprintf(threads,sizeof threads,"%d",osa_clampi(osa_cpu_count()/2,1,8));const char*argv[]={exe,"--kind",kind,"--model",path,"--threads",threads,NULL};
     osa_process*p=osa_process_start(argv,err);if(!p)return NULL;char*line=NULL;if(!osa_process_line(p,WORKER_TIMEOUT_MS,cancel,&line,err)){osa_process_stop(p);return NULL;}
     bool ok=false;char event[32]={0};osa_json_get_bool(line,"ok",&ok);osa_json_get_string(line,"event",event,sizeof event);free(line);if(!ok||!osa_streq(event,"ready")){osa_process_stop(p);osa_err_set(err,"model did not become ready");return NULL;}return p;
 }
@@ -96,7 +136,7 @@ static void migrate_legacy(osa_app*a){
     static const char*old[]={"builtin-asr-fa.osam","builtin-mt.osmt"};for(int i=0;i<2;i++){char p[OSAI_MAX_PATH];osa_path_join(p,sizeof p,a->models_dir,old[i]);if(osa_file_exists(p))osa_file_remove(p);}
 }
 osa_app *osa_app_create(osa_error*err){
-    osa_err_ok(err);if(!osa_paths_init()){osa_err_set(err,"cannot create application data directories");return NULL;}
+    osa_err_ok(err);if(!osa_paths_init()){osa_err_set(err,"cannot write to the data folder beside the program; move the app to a writable folder (for example your Desktop) and run it again");return NULL;}
     osa_app*a=calloc(1,sizeof*a);if(!a){osa_err_set(err,"out of memory");return NULL;}osa_mutex_init(&a->db_mu);osa_mutex_init(&a->engine_mu);osa_mutex_init(&a->life_mu);
     osa_strlcpy(a->models_dir,osa_path(OSAI_DIR_MODELS),sizeof a->models_dir);osa_strlcpy(a->audio_dir,osa_path(OSAI_DIR_AUDIO),sizeof a->audio_dir);
     char dbp[OSAI_MAX_PATH];osa_path_join(dbp,sizeof dbp,osa_path(OSAI_DIR_DB),"openspeech.db");a->db=osa_db_open(dbp,err);if(!a->db){osa_mutex_destroy(&a->db_mu);osa_mutex_destroy(&a->engine_mu);osa_mutex_destroy(&a->life_mu);free(a);return NULL;}a->db_ready=true;migrate_legacy(a);
@@ -110,7 +150,7 @@ bool osa_app_refresh(osa_app*a,osa_error*err){(void)a;osa_err_ok(err);return tru
 static bool activate(osa_app*a,const char*id,osa_error*err){
     osa_model m;if(!get_model(a,id,&m,err))return false;const pack_def*p=find_pack(id);if(!p||!osa_streq(p->kind,m.kind)||!verify(m.path,p,err)){osa_err_set(err,"installed model is missing, unsupported or failed integrity verification");return false;}
     if(osa_streq(m.kind,"asr")){char e[512]={0};wsp_ctx*n=wsp_load(m.path,e,sizeof e);if(!n){osa_err_set(err,"%s",e);return false;}wsp_set_cancel(n,&a->cancel);lockd(a);bool ok=osa_store_model_set_active(a->db,id,err);unlockd(a);if(!ok){wsp_free(n);return false;}locke(a);wsp_ctx*old=a->asr;a->asr=n;osa_strlcpy(a->asr_id,id,sizeof a->asr_id);osa_strlcpy(a->asr_name,m.name,sizeof a->asr_name);unlocke(a);wsp_free(old);return true;}
-    osa_process*n=start_worker(m.kind,m.path,&a->cancel,err);if(!n)return false;lockd(a);bool ok=osa_store_model_set_active(a->db,id,err);unlockd(a);if(!ok){osa_process_stop(n);return false;}locke(a);osa_process*old=NULL;if(osa_streq(m.kind,"mt")){old=a->mt;a->mt=n;a->mt_loaded=true;osa_strlcpy(a->mt_id,id,sizeof a->mt_id);osa_strlcpy(a->mt_name,m.name,sizeof a->mt_name);osa_strlcpy(a->mt_path,m.path,sizeof a->mt_path);}else{old=a->lid;a->lid=n;a->lid_loaded=true;osa_strlcpy(a->lid_id,id,sizeof a->lid_id);osa_strlcpy(a->lid_name,m.name,sizeof a->lid_name);osa_strlcpy(a->lid_path,m.path,sizeof a->lid_path);}unlocke(a);osa_process_stop(old);return true;
+    osa_process*n=start_worker(m.kind,m.path,&a->cancel,err);if(!n)return false;lockd(a);bool ok=osa_store_model_set_active(a->db,id,err);unlockd(a);if(!ok){osa_process_stop(n);return false;}locke(a);osa_process*old=NULL;if(osa_streq(m.kind,"mt")){old=a->mt;a->mt=n;a->mt_loaded=true;osa_strlcpy(a->mt_id,id,sizeof a->mt_id);osa_strlcpy(a->mt_name,m.name,sizeof a->mt_name);osa_strlcpy(a->mt_path,m.path,sizeof a->mt_path);const pack_def*pd=find_pack(id);osa_strlcpy(a->mt_langs,pd&&pd->langs?pd->langs:QWEN_LANGS,sizeof a->mt_langs);}else{old=a->lid;a->lid=n;a->lid_loaded=true;osa_strlcpy(a->lid_id,id,sizeof a->lid_id);osa_strlcpy(a->lid_name,m.name,sizeof a->lid_name);osa_strlcpy(a->lid_path,m.path,sizeof a->lid_path);}unlocke(a);osa_process_stop(old);return true;
 }
 bool osa_app_activate_model(osa_app*a,const char*id,osa_error*err){if(!a||!id){osa_err_set(err,"bad arguments");return false;}osa_mutex_lock(&a->life_mu);bool ok=activate(a,id,err);osa_mutex_unlock(&a->life_mu);return ok;}
 bool osa_app_restore_saved(osa_app*a,osa_error*err){if(!a)return false;osa_err_ok(err);osa_mutex_lock(&a->life_mu);osa_rs rs;lockd(a);bool ok=osa_sql_query(a->db,"SELECT id FROM Models WHERE active=1 ORDER BY CASE kind WHEN 'lang' THEN 0 WHEN 'mt' THEN 1 ELSE 2 END",&rs,err);char ids[3][40]={{0}};int n=ok?osa_clampi(rs.nrows,0,3):0;for(int i=0;i<n;i++)osa_strlcpy(ids[i],osa_rs_val(&rs,i,"id"),40);osa_rs_free(&rs);unlockd(a);for(int i=0;i<n;i++){osa_error e={0};if(!activate(a,ids[i],&e)){osa_err_set(err,"%s",e.msg);ok=false;}}osa_mutex_unlock(&a->life_mu);return ok;}
@@ -122,9 +162,9 @@ static const struct{const char*c,*fa,*en;} LANG_NAMES[]={
  {"fa","فارسی","Persian"},{"en","انگلیسی","English"},{"ar","عربی","Arabic"},{"zh","چینی","Chinese"},{"fr","فرانسوی","French"},{"de","آلمانی","German"},{"es","اسپانیایی","Spanish"},{"it","ایتالیایی","Italian"},{"pt","پرتغالی","Portuguese"},{"ru","روسی","Russian"},{"ja","ژاپنی","Japanese"},{"ko","کره‌ای","Korean"},{"tr","ترکی","Turkish"},{"hi","هندی","Hindi"},{"ur","اردو","Urdu"},{"id","اندونزیایی","Indonesian"},{"vi","ویتنامی","Vietnamese"},{"th","تایلندی","Thai"},{"nl","هلندی","Dutch"},{"pl","لهستانی","Polish"},{"uk","اوکراینی","Ukrainian"},{"he","عبری","Hebrew"},{"sv","سوئدی","Swedish"},{"da","دانمارکی","Danish"},{"fi","فنلاندی","Finnish"},{"no","نروژی","Norwegian"},{"el","یونانی","Greek"},{"cs","چکی","Czech"},{"hu","مجاری","Hungarian"},{"ro","رومانیایی","Romanian"},{"bg","بلغاری","Bulgarian"},{"bn","بنگالی","Bengali"},{"ta","تامیلی","Tamil"},{"te","تلوگویی","Telugu"},{"mr","مراتی","Marathi"},{"gu","گجراتی","Gujarati"},{"pa","پنجابی","Punjabi"},{"ml","مالایالامی","Malayalam"},{"kn","کانادایی","Kannada"},{"si","سینهالی","Sinhala"},{"ne","نپالی","Nepali"},{"ms","مالایی","Malay"},{"tl","تاگالوگ","Tagalog"},{"sw","سواحیلی","Swahili"},{"af","آفریکانس","Afrikaans"},{"az","آذربایجانی","Azerbaijani"},{"kk","قزاقی","Kazakh"},{"uz","ازبکی","Uzbek"},{"hy","ارمنی","Armenian"},{"ka","گرجی","Georgian"},{"et","استونیایی","Estonian"},{"lv","لتونیایی","Latvian"},{"lt","لیتوانیایی","Lithuanian"},{"hr","کرواتی","Croatian"},{"sr","صربی","Serbian"},{"sk","اسلواکی","Slovak"},{"sl","اسلوونیایی","Slovenian"},{"is","ایسلندی","Icelandic"},{"ga","ایرلندی","Irish"},{"cy","ولزی","Welsh"},{"ca","کاتالان","Catalan"},{"eu","باسکی","Basque"},{"gl","گالیسی","Galician"},{"la","لاتین","Latin"},{"yi","ییدی","Yiddish"},{"ps","پشتو","Pashto"},{"ku","کردی","Kurdish"},{"sd","سندی","Sindhi"},{"my","برمه‌ای","Burmese"},{"km","خمر","Khmer"},{"lo","لائو","Lao"},{"bo","تبتی","Tibetan"},{"mn","مغولی","Mongolian"},{"am","امهری","Amharic"},{"so","سومالیایی","Somali"},{"ha","هوسایی","Hausa"},{"yo","یوروبایی","Yoruba"},{"zu","زولویی","Zulu"},{"be","بلاروسی","Belarusian"},{"mk","مقدونی","Macedonian"},{"sq","آلبانیایی","Albanian"},{"bs","بوسنیایی","Bosnian"},{"mt","مالتی","Maltese"},{"eo","اسپرانتو","Esperanto"},{"haw","هاوائی","Hawaiian"},{"mi","مائوری","Maori"},{"jw","جاوه‌ای","Javanese"},{"su","سوندایی","Sundanese"},{"sa","سانسکریت","Sanskrit"},{"oc","اکسیتان","Occitan"},{"br","برتون","Breton"},{"fo","فارویی","Faroese"},{"lb","لوکزامبورگی","Luxembourgish"},{"nn","نینوشک","Nynorsk"},{"tt","تاتاری","Tatar"},{"ba","باشقیری","Bashkir"},{"ky","قرقیزی","Kyrgyz"},{"tg","تاجیکی","Tajik"},{"tk","ترکمنی","Turkmen"}
 };
 const char*osa_lang_name(const char*c,bool persian){if(!c||!*c)return persian?"تشخیص خودکار":"Auto-detect";if(osa_streq(c,"auto"))return persian?"تشخیص خودکار":"Auto-detect";for(unsigned i=0;i<sizeof LANG_NAMES/sizeof LANG_NAMES[0];i++)if(osa_streq(c,LANG_NAMES[i].c))return persian?LANG_NAMES[i].fa:LANG_NAMES[i].en;return c;}
-int osa_app_languages(osa_app*a,osa_lang_info*out,int max){if(!a||!out||max<=0)return 0;locke(a);bool ready=a->mt_loaded;unlocke(a);if(!ready)return 0;int n=0;for(const char*p=QWEN_LANGS;*p&&n<max;){const char*e=strchr(p,';');if(!e)e=p+strlen(p);osa_lang_info*x=out+n++;memset(x,0,sizeof*x);osa_strlcpy(x->code,p,(size_t)(e-p)+1<8?(size_t)(e-p)+1:8);osa_strlcpy(x->name_fa,osa_lang_name(x->code,true),sizeof x->name_fa);osa_strlcpy(x->name_en,osa_lang_name(x->code,false),sizeof x->name_en);x->installed=true;x->paired=true;p=*e?e+1:e;}return n;}
+int osa_app_languages(osa_app*a,osa_lang_info*out,int max){if(!a||!out||max<=0)return 0;locke(a);bool ready=a->mt_loaded;char langs[512];osa_strlcpy(langs,a->mt_langs[0]?a->mt_langs:QWEN_LANGS,sizeof langs);unlocke(a);if(!ready)return 0;int n=0;for(const char*p=langs;*p&&n<max;){const char*e=strchr(p,';');if(!e)e=p+strlen(p);osa_lang_info*x=out+n++;memset(x,0,sizeof*x);osa_strlcpy(x->code,p,(size_t)(e-p)+1<8?(size_t)(e-p)+1:8);osa_strlcpy(x->name_fa,osa_lang_name(x->code,true),sizeof x->name_fa);osa_strlcpy(x->name_en,osa_lang_name(x->code,false),sizeof x->name_en);x->installed=true;x->paired=true;p=*e?e+1:e;}return n;}
 int osa_app_asr_languages(osa_app*a,osa_lang_info*out,int max){if(!a||!out||max<=0)return 0;locke(a);const char*codes[128];int n=a->asr?wsp_languages(a->asr,codes,osa_clampi(max,0,128)):0;for(int i=0;i<n;i++){memset(out+i,0,sizeof*out);osa_strlcpy(out[i].code,codes[i],8);osa_strlcpy(out[i].name_fa,osa_lang_name(codes[i],true),48);osa_strlcpy(out[i].name_en,osa_lang_name(codes[i],false),48);out[i].installed=true;}unlocke(a);return n;}
-bool osa_app_set_languages(osa_app*a,const char*src,const char*dst,osa_error*err){if(!a||!dst||!*dst||osa_streq(dst,"auto")){osa_err_set(err,"choose a target language");return false;}char s[8]={0},d[8]={0};osa_strlcpy(s,src&&*src?src:"auto",8);osa_strlcpy(d,dst,8);if(!osa_app_ready(a)){osa_err_set(err,"download and activate speech, translation and language models first");return false;}if(!has_token(QWEN_LANGS,d)||(!osa_streq(s,"auto")&&!has_token(QWEN_LANGS,s))){osa_err_set(err,"language is not supported by the active translation model");return false;}locke(a);osa_strlcpy(a->lang_src,s,8);osa_strlcpy(a->lang_dst,d,8);unlocke(a);lockd(a);osa_db_set_setting(a->db,"lang_src",s);osa_db_set_setting(a->db,"lang_dst",d);unlockd(a);osa_err_ok(err);return true;}
+bool osa_app_set_languages(osa_app*a,const char*src,const char*dst,osa_error*err){if(!a||!dst||!*dst||osa_streq(dst,"auto")){osa_err_set(err,"choose a target language");return false;}char s[8]={0},d[8]={0};osa_strlcpy(s,src&&*src?src:"auto",8);osa_strlcpy(d,dst,8);if(!osa_app_ready(a)){osa_err_set(err,"download and activate speech, translation and language models first");return false;}const char*langs=mt_langs(a);if(!has_token(langs,d)||(!osa_streq(s,"auto")&&!has_token(langs,s))){osa_err_set(err,"language is not supported by the active translation model");return false;}locke(a);osa_strlcpy(a->lang_src,s,8);osa_strlcpy(a->lang_dst,d,8);unlocke(a);lockd(a);osa_db_set_setting(a->db,"lang_src",s);osa_db_set_setting(a->db,"lang_dst",d);unlockd(a);osa_err_ok(err);return true;}
 void osa_app_get_languages(osa_app*a,char*s,size_t sc,char*d,size_t dc){if(!a)return;locke(a);if(s&&sc)osa_strlcpy(s,a->lang_src,sc);if(d&&dc)osa_strlcpy(d,a->lang_dst,dc);unlocke(a);}
 void osa_app_set_style(osa_app*a,mt_style st){if(!a)return;st=(mt_style)osa_clampi((int)st,0,2);locke(a);a->style=st;unlocke(a);lockd(a);char v[8];snprintf(v,sizeof v,"%d",(int)st);osa_db_set_setting(a->db,"mt_style",v);unlockd(a);} mt_style osa_app_style(const osa_app*a){return a?a->style:MT_STYLE_NEUTRAL;}
 
@@ -142,16 +182,16 @@ static bool detect(osa_app*a,const char*text,char code[8],float*conf,osa_error*e
 static bool translate_all(osa_app*a,const char*text,const char*src,const char*dst,mt_style style,char*out,size_t cap,osa_error*err){
     if(!ensure_worker(a,"mt",err))return false;
     size_t pos=0,used=0;out[0]=0;char code[8]={0};float confidence=0;
-    if(osa_streq(src,"auto")){if(!detect(a,text,code,&confidence,err))return false;if(confidence<0.35f){osa_err_set(err,"language detection is uncertain; choose the source language explicitly");return false;}if(!has_token(QWEN_LANGS,code)){osa_err_set(err,"detected language '%s' is not supported by the active translation model",code);return false;}src=code;}
+    if(osa_streq(src,"auto")){if(!detect(a,text,code,&confidence,err))return false;if(confidence<0.35f){osa_err_set(err,"language detection is uncertain; choose the source language explicitly");return false;}if(!has_token(mt_langs(a),code)){osa_err_set(err,"detected language '%s' is not supported by the active translation model",code);return false;}src=code;}
     while(text[pos]){if(osa_atomic_load(&a->cancel)){osa_err_set(err,"cancelled");return false;}char sep[3]={0};size_t n=split_chunk(text,pos,sep);if(!n){pos++;continue;}char*chunk=osa_strndup(text+pos,n);if(!chunk){osa_err_set(err,"out of memory");return false;}osa_arena ar;osa_arena_init(&ar);osa_buf req;osa_buf_init(&req);osa_buf_printf(&req,"{\"op\":\"translate\",\"src\":%s,\"dst\":%s,\"style\":%d,\"max_tokens\":2048,\"text\":%s}",osa_json_escape(&ar,src),osa_json_escape(&ar,dst),(int)style,osa_json_escape(&ar,chunk));char*line=worker_reply(a->mt,req.data,&a->cancel,err);osa_buf_free(&req);osa_arena_free(&ar);free(chunk);if(!line){if(a->mt){osa_process_stop(a->mt);a->mt=NULL;}a->mt_loaded=false;return false;}char*part=osa_json_string_dup(line,"text");bool complete=false;osa_json_get_bool(line,"complete",&complete);free(line);if(!part||!complete){free(part);osa_err_set(err,"translation was incomplete; nothing was saved");return false;}size_t pn=strlen(part),sn=strlen(sep);if(used+pn+sn>=cap){free(part);osa_err_set(err,"translation exceeds 64 KiB; split the input");return false;}memcpy(out+used,part,pn);used+=pn;free(part);if(text[pos+n]&&sn){memcpy(out+used,sep,sn);used+=sn;}out[used]=0;pos+=n+(sep[0]?1:0);}
     return used>0;
 }
-static bool translate_core(osa_app*a,const char*text,const char*src,osa_app_translation*out,bool store,osa_error*err){if(!a||!text||!out){osa_err_set(err,"bad arguments");return false;}if(!osa_app_ready(a)){osa_err_set(err,"download and activate speech, translation and language models first");return false;}size_t len=strlen(text);if(!len||len>=TEXT_LIMIT||!osa_utf8_valid(text,len)){osa_err_set(err,"enter valid UTF-8 text under 64 KiB");return false;}locke(a);char s[8],d[8];osa_strlcpy(s,src&&*src?src:a->lang_src,8);osa_strlcpy(d,a->lang_dst,8);mt_style style=a->style;if(!has_token(QWEN_LANGS,d)||(!osa_streq(s,"auto")&&!has_token(QWEN_LANGS,s))){unlocke(a);osa_err_set(err,"language pair is not supported by the active translation model");return false;}memset(out,0,sizeof*out);int64_t t=osa_now_us();bool ok;if(osa_streq(s,d)){osa_strlcpy(out->text,text,sizeof out->text);osa_strlcpy(out->source_lang,s,8);out->confidence=1;ok=true;}else{
+static bool translate_core(osa_app*a,const char*text,const char*src,osa_app_translation*out,bool store,osa_error*err){if(!a||!text||!out){osa_err_set(err,"bad arguments");return false;}if(!osa_app_ready(a)){osa_err_set(err,"download and activate speech, translation and language models first");return false;}size_t len=strlen(text);if(!len||len>=TEXT_LIMIT||!osa_utf8_valid(text,len)){osa_err_set(err,"enter valid UTF-8 text under 64 KiB");return false;}locke(a);char s[8],d[8];osa_strlcpy(s,src&&*src?src:a->lang_src,8);osa_strlcpy(d,a->lang_dst,8);mt_style style=a->style;const char*alangs=a->mt_langs[0]?a->mt_langs:QWEN_LANGS;if(!has_token(alangs,d)||(!osa_streq(s,"auto")&&!has_token(alangs,s))){unlocke(a);osa_err_set(err,"language pair is not supported by the active translation model");return false;}memset(out,0,sizeof*out);int64_t t=osa_now_us();bool ok;if(osa_streq(s,d)){osa_strlcpy(out->text,text,sizeof out->text);osa_strlcpy(out->source_lang,s,8);out->confidence=1;ok=true;}else{
         if(osa_streq(s,"auto")){
             char detected[8]={0};float c=0;
             if(!detect(a,text,detected,&c,err)){unlocke(a);return false;}
             if(c<0.35f){unlocke(a);osa_err_set(err,"language detection is uncertain; choose the source language explicitly");return false;}
-            if(!has_token(QWEN_LANGS,detected)){unlocke(a);osa_err_set(err,"detected language '%s' is not supported by the active translation model",detected);return false;}
+            if(!has_token(alangs,detected)){unlocke(a);osa_err_set(err,"detected language '%s' is not supported by the active translation model",detected);return false;}
             osa_strlcpy(s,detected,8);
         }
         ok=translate_all(a,text,s,d,style,out->text,sizeof out->text,err);
@@ -171,7 +211,7 @@ bool osa_app_delete_transcript(osa_app*a,const char*id,osa_error*err){if(!a||!id
 bool osa_app_add_correction(osa_app*a,const char*id,const char*corrected,osa_error*err){if(!a||!corrected)return false;osa_arena ar;osa_arena_init(&ar);char*original=osa_arena_strdup(&ar,"");if(id&&*id){char*sql=osa_arena_printf(&ar,"SELECT text FROM Transcriptions WHERE id='%s'",osa_sql_escape(&ar,id));lockd(a);osa_rs rs;if(osa_sql_query(a->db,sql,&rs,NULL)&&rs.nrows)original=osa_arena_strdup(&ar,osa_rs_val(&rs,0,"text"));osa_rs_free(&rs);unlockd(a);}lockd(a);bool ok=osa_store_correction_add(a->db,id,original,corrected,0,err);unlockd(a);osa_arena_free(&ar);return ok;}
 
 /* ---- verified downloads / installation, never automatic activation ---- */
-int osa_app_packs(osa_app*a,osa_pack_info*out,int max){if(!a||!out||max<=0)return 0;osa_rs rs;lockd(a);bool q=osa_store_model_list(a->db,&rs,NULL,NULL);int n=0;for(int i=0;i<NPACKS&&n<max;i++){const pack_def*p=PACKS+i;osa_pack_info*x=out+n++;memset(x,0,sizeof*x);osa_strlcpy(x->id,p->id,sizeof x->id);osa_strlcpy(x->name,p->name,sizeof x->name);osa_strlcpy(x->kind,p->kind,sizeof x->kind);osa_strlcpy(x->language,osa_streq(p->kind,"mt")?QWEN_LANGS:p->languages,sizeof x->language);osa_strlcpy(x->license,p->license,sizeof x->license);osa_strlcpy(x->url,p->url,sizeof x->url);osa_strlcpy(x->sha256,p->sha256,sizeof x->sha256);osa_strlcpy(x->notes,p->notes,sizeof x->notes);x->size_mb=(double)p->bytes/1048576.0;x->installable=true;if(q)for(int r=0;r<rs.nrows;r++)if(osa_streq(osa_rs_val(&rs,r,"id"),p->id))x->installed=true;}osa_rs_free(&rs);unlockd(a);return n;}
+int osa_app_packs(osa_app*a,osa_pack_info*out,int max){if(!a||!out||max<=0)return 0;osa_rs rs;lockd(a);bool q=osa_store_model_list(a->db,&rs,NULL,NULL);int n=0;for(int i=0;i<NPACKS&&n<max;i++){const pack_def*p=PACKS+i;osa_pack_info*x=out+n++;memset(x,0,sizeof*x);osa_strlcpy(x->id,p->id,sizeof x->id);osa_strlcpy(x->name,p->name,sizeof x->name);osa_strlcpy(x->kind,p->kind,sizeof x->kind);osa_strlcpy(x->language,p->languages,sizeof x->language);osa_strlcpy(x->license,p->license,sizeof x->license);osa_strlcpy(x->url,p->url,sizeof x->url);osa_strlcpy(x->sha256,p->sha256,sizeof x->sha256);osa_strlcpy(x->notes,p->notes,sizeof x->notes);x->size_mb=(double)p->bytes/1048576.0;x->installable=true;if(q)for(int r=0;r<rs.nrows;r++)if(osa_streq(osa_rs_val(&rs,r,"id"),p->id))x->installed=true;}osa_rs_free(&rs);unlockd(a);return n;}
 int osa_app_fetch_pack(const char*id,void(*progress)(int64_t,int64_t,void*),void*ud,volatile int*cancel,char*file_out,size_t cap,osa_error*err){const pack_def*p=find_pack(id);if(!p||!file_out||!cap){osa_err_set(err,"unknown model or invalid output buffer");return -1;}if(!osa_paths_init()){osa_err_set(err,"cannot initialize download directory");return -1;}char dst[OSAI_MAX_PATH];snprintf(dst,sizeof dst,"%s%s.%s",osa_path(OSAI_DIR_DOWNLOADS),p->id,p->ext);int64_t need=p->bytes*2+268435456;if(osa_disk_free(osa_path(OSAI_DIR_DOWNLOADS))<need){osa_err_set(err,"not enough free disk space for download plus installed copy");return -1;}int rc=osa_http_download(p->url,dst,true,progress,ud,cancel,err);if(rc)return rc;if(!verify(dst,p,err)){osa_file_remove(dst);return -1;}osa_strlcpy(file_out,dst,cap);return 0;}
 static bool install_verified(osa_app*a,const char*path,const pack_def*p,osa_error*err){
     if(!verify(path,p,err))return false;
