@@ -88,6 +88,8 @@ typedef struct osa_sys_stats {
 
 void osa_sys_stats_init(void);
 void osa_sys_stats_sample(osa_sys_stats *out);
+/* Replace the live CPU/RAM readings with fixed values (snapshot determinism). */
+void osa_sys_stats_freeze(bool frozen);
 
 /* ---------------- desktop helpers ---------------- */
 bool osa_open_in_explorer(const char *path);   /* opens folder/file with the OS shell */

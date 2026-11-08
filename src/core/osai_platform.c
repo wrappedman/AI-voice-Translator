@@ -442,8 +442,27 @@ void osa_sys_stats_init(void) {
     g_stats.inited = true;
 }
 
+/* Set by the snapshot harness. System metrics are live by nature, so a still
+ * rendered twice would differ in its RAM figure and the visual-regression job
+ * would report a change that is not one. */
+static bool g_stats_frozen = false;
+void osa_sys_stats_freeze(bool frozen) { g_stats_frozen = frozen; }
+
 void osa_sys_stats_sample(osa_sys_stats *out) {
     memset(out, 0, sizeof *out);
+    if (g_stats_frozen) {
+        /* A plausible, fixed machine. Nothing in the UI is judged by these. */
+        out->cpu_percent = 12.0f;
+        out->ram_used_mb = 512.0f;
+        out->ram_total_mb = 8192.0f;
+        out->ram_percent = 6.25f;
+        out->proc_ram_mb = 196.0f;
+        out->proc_cpu_percent = 0.4f;
+        out->gpu_percent = -1.0f;
+        out->vram_used_mb = -1.0f;
+        osa_strlcpy(out->gpu_name, "none", sizeof out->gpu_name);
+        return;
+    }
     out->gpu_percent = -1;
     out->vram_used_mb = -1;
 #ifndef _WIN32

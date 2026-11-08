@@ -87,6 +87,10 @@ static int run_snapshots(const char *dir, int w, int h, shell_lang lang, bool da
      * On the first run the sample transcription below therefore produces the
      * only history row, and the images are byte-identical every time. */
     osa_time_freeze(OSAI_SNAPSHOT_EPOCH_MS);
+    /* CPU/RAM figures are read live from /proc; pin them so two renders of the
+     * same screen are byte-identical (the About screen prints the RAM figure). */
+    osa_sys_stats_freeze(true);
+    osa_sys_stats_init();
     {
         /* A fixed path, not one derived from the output directory: the Settings
          * screen prints the data root, so a per-run path would change the
