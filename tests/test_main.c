@@ -722,6 +722,59 @@ static void test_app(void) {
     }
     osa_file_remove(wav);
 
+    /* ---- packs are built offline, and installing one changes the engine ----
+     * The Models screen's rows used to be dead labels: every entry needed a file
+     * the user had to find by hand. A catalogue entry must now have a working
+     * offline install that actually alters translation output. */
+    {
+        suite("catalogue");
+        static osa_pack_info packs[32];
+        int np = osa_app_packs(app, packs, 32);
+        CHECK_MSG(np > 0, "catalogue entries: %d", np);
+        int installable = 0, manual = 0, installed = 0;
+        for (int i = 0; i < np; i++) {
+            if (packs[i].installable) installable++;
+            else manual++;
+            if (packs[i].installed) installed++;
+            CHECK_MSG(packs[i].id[0] && packs[i].name[0] && packs[i].license[0],
+                      "entry %d is complete", i);
+        }
+        CHECK_MSG(installable >= 8, "offline-installable entries: %d", installable);
+        CHECK_MSG(installed >= 2, "already installed: %d", installed);
+        CHECK(manual > 0);            /* and the rest says why, honestly */
+
+        const char *src = "بیمار در بیمارستان";
+        osa_app_translation tr_a, tr_b;
+        memset(&tr_a, 0, sizeof tr_a);
+        osa_app_translate(app, src, "", &tr_a, NULL);
+        CHECK_MSG(tr_a.text[0] != 0, "translation before the pack: %s", tr_a.text);
+
+        osa_error pe = {0};
+        bool ok = osa_app_install_builtin_pack(app, "lang-pack-medical", &pe);
+        CHECK_MSG(ok, "install the medical pack: %s", pe.msg);
+        /* the file is a real, inspectable artifact in the data folder */
+        char ppath[OSAI_MAX_PATH];
+        osa_path_join(ppath, sizeof ppath, osa_path(OSAI_DIR_PACKS), "lang-pack-medical.words.tsv");
+        CHECK_MSG(osa_file_exists(ppath), "pack file written: %s", ppath);
+        /* and the engine now knows the words */
+        memset(&tr_b, 0, sizeof tr_b);
+        osa_app_translate(app, src, "", &tr_b, NULL);
+        CHECK_MSG(strstr(tr_b.text, "patient") != NULL,
+                  "pack translated the word: %s -> %s", tr_a.text, tr_b.text);
+        /* it is listed as installed from then on */
+        osa_pack_info again[32];
+        int np2 = osa_app_packs(app, again, 32);
+        bool seen = false;
+        for (int i = 0; i < np2; i++)
+            if (osa_streq(again[i].id, "lang-pack-medical")) seen = again[i].installed;
+        CHECK(seen);
+        /* an entry whose material is not in the binary refuses, with a reason */
+        osa_error re = {0};
+        CHECK(!osa_app_install_builtin_pack(app, "ggml-tiny", &re));
+        CHECK_MSG(re.msg[0] != 0, "refusal reason: %s", re.msg);
+        CHECK(!osa_app_install_builtin_pack(app, "no-such-pack", &re));
+    }
+
     osa_app_destroy(app);
 }
 
@@ -741,6 +794,25 @@ static void test_platform(void) {
     osa_sys_stats_sample(&stats);
     CHECK_MSG(stats.ram_total_mb > 0, "ram total %.0f MB", (double)stats.ram_total_mb);
     CHECK_MSG(stats.ram_used_mb <= stats.ram_total_mb + 1, "ram used is sane");
+    /* The About screen shows this process, not the machine: the machine figure
+     * moves with every other program, which is what made an idle window look
+     * like it was leaking. */
+    CHECK_MSG(stats.proc_ram_mb > 0, "process ram %.1f MB", (double)stats.proc_ram_mb);
+    CHECK_MSG(stats.proc_ram_mb < stats.ram_total_mb, "process ram is below the machine total");
+    float live_pr = osa_process_ram_mb();
+    CHECK_MSG(live_pr > 0, "live process ram %.1f MB", (double)live_pr);
+    osa_sys_stats_freeze(true);
+    CHECK(osa_sys_stats_frozen());
+    osa_sys_stats frozen;
+    osa_sys_stats_sample(&frozen);
+    CHECK(frozen.proc_ram_mb > 0);                 /* the harness still has a value */
+    CHECK_MSG(osa_process_ram_mb() > 0, "even frozen, the real process size is readable");
+    osa_sys_stats_freeze(false);
+    CHECK(!osa_sys_stats_frozen());
+
+    /* the fault log names a file in the data folder and can be armed quietly */
+    osa_crash_log_init(true);
+    CHECK_MSG(osa_crash_log_path()[0] != 0, "fault log path: %s", osa_crash_log_path());
 
     /* mkdirs is idempotent */
     CHECK(osa_mkdirs("/tmp/osai_test_dir_nested_a/b/c"));

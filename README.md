@@ -23,7 +23,7 @@ call at any point — not at start-up, not while transcribing, not for updates.
 | **Translate** | Bidirectional Persian ⇄ English, using a local phrasebook with proper normalisation of Arabic/Persian character variants, optional transliteration and Persian/Arabic digit handling. |
 | **Live** | Microphone capture with a level meter, a session timer and streaming partial results; the target language and the running translation update as you speak. |
 | **History** | Every transcript is stored locally in SQLite with its audio, and can be searched, replayed, copied or deleted. |
-| **Models** | Two tabs: what is installed (activate / roll back, never deleted) and the offline catalogue of 17 packs and models with licence, size and one working action each — download when a verified URL exists, install-from-file otherwise. Import `.osam` / `.osmt` files here too. |
+| **Models** | Two tabs: what is installed (activate / roll back, never deleted) and the offline catalogue of 17 packs and models with licence, size and one working action each. Eight of them are **built on this computer and installed with one press** — no network, no file picker: the word packs extend the translation lexicon, and the pack file they write is a plain, readable `word<TAB>translation` list. The rest say honestly why they need a file. Import `.osam` / `.osmt` files here too. |
 | **Training** | Trains on a dataset of `audio<TAB>text` pairs, or on the bundled lexicon when none is chosen; the run saves a **new** model version, activates it, and leaves the previous one installed for rollback. |
 | **Evaluation** | WER and CER measured in the app, per sentence, with each reference and hypothesis shown side by side. A language the active model has no lexicon for is reported as *not measured*, not as an error rate of 100%. |
 | **Bilingual UI** | The whole interface is available in Persian (default, right-to-left) and English, with correct bidirectional text rendering, mirrored layouts and Persian digits. |
@@ -61,6 +61,16 @@ On first start it creates
 ```
 
 If the folder is not writable the app says so instead of failing silently.
+
+### The folder is self-contained
+
+`dist/` holds everything the program opens: the exe, `assets/fonts` (Vazirmatn),
+`assets/catalog.json` and `models/` with the two models the build ships. Copy the
+folder and it runs on a machine that has never seen the program — the first start
+copies the shipped models into the data folder above and then never writes next
+to the exe again. If a file is missing the program names the path it looked in
+instead of opening an empty window, and a fault leaves `last-fault.log` in the
+data folder with the address and the frame list, so a crash report is actionable.
 
 ---
 
@@ -127,14 +137,20 @@ Visual Studio requirement and no NuGet.
 ```sh
 make bootstrap          # fetch pinned zig 0.17.1 (one time, ~40 MB)
 make win                # dist/bin/OpenSpeechAI.exe
-make dist               # + release zip and SHA-256 sums
+make dist               # + shipped models, release zip and SHA-256 sums
 ```
+
+`make dist` also runs `tools/export_models.py`, which asks the headless build for
+the two containers the program ships and copies them into `dist/models/`. The
+zip is not considered shippable if any file the program opens at run time is
+missing from the layout (`tools/make_dist.py` fails the build instead of shipping
+a folder that only works after some manual copying).
 
 Host-side development and tests need only gcc:
 
 ```sh
 make linux              # portable core + headless host
-make tests              # 173 assertions, no display, no network
+make tests              # 237 assertions, no display, no network
 make snapshots          # re-render dist/screenshots/
 ```
 

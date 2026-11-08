@@ -107,6 +107,13 @@ typedef struct shell_state {
     /* evaluation */
     char         *eval_json;
 
+    /* Cached status for the slow-changing machine readings (the About rows).
+     * osa_app_get_status() runs three SQL counts plus /proc reads, which is not
+     * something to do 60 times a second for a number the eye reads twice. */
+    osa_app_status status_cache;
+    double         status_ms;
+    bool           status_valid;
+
     /* settings */
     bool          auto_detect;
     bool          save_audio;

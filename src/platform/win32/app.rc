@@ -1,12 +1,11 @@
 /* OpenSpeech AI — Windows resources */
 #include <winver.h>
+/* Version numbers come from src/core/osai_common.h through the header that
+ * `make dist` generates; hard-coding them here is how the binary ended up
+ * reporting 1.0.0.0 for a 1.1.0 release. */
+#include "app_version.h"
 
-#define OSAI_VER_MAJOR 1
-#define OSAI_VER_MINOR 0
-#define OSAI_VER_PATCH 0
-#define OSAI_VER_BUILD 0
 #define OSAI_VERSION OSAI_VER_MAJOR,OSAI_VER_MINOR,OSAI_VER_PATCH,OSAI_VER_BUILD
-#define OSAI_VERSION_STR "1.0.0.0"
 
 1 ICON "app.ico"
 

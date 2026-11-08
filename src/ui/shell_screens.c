@@ -806,6 +806,7 @@ static void draw_pack_row(shell_state *s, ui_context *u, osa_rect r, const osa_p
     /* The third line is what the row is for, so it explains the action instead
      * of repeating the pack's marketing copy. */
     const char *line3 = p->installed ? kl(s, "models.hintbundled")
+                       : p->installable ? kl(s, "models.hintbuild")
                        : p->url[0]   ? kl(s, "models.hintdownload")
                                      : kl(s, "models.hintlocalfile");
     ui_label(u, rectf(tx, r.y + 42 * u->L.scale, tw, 16 * u->L.scale), line3,
@@ -816,8 +817,21 @@ static void draw_pack_row(shell_state *s, ui_context *u, osa_rect r, const osa_p
                         r.y + (r.h - 30 * u->L.scale) * 0.5f, action_w, 30 * u->L.scale);
     if (p->installed) {
         ui_pill(u, ar, kl(s, "models.installed"), u->t.success, u->t.success_soft);
+    } else if (p->installable) {
+        /* The button the row promises: press it and the pack is written and
+         * loaded. No picker, no network — that was the whole complaint. */
+        if (s->downloading && osa_streq(s->dl_pack, p->id)) {
+            c_fill_round(u->c, ar, u->L.radius_sm, u->t.panel_alt);
+            ui_progress(u, rect_inset(ar, 9 * u->L.scale), (float)s->dl_progress, u->t.accent);
+        } else if (ui_button(u, 5200 + idx, ar, kl(s, "btn.install"), false)) {
+            *clicked_idx = idx;
+        } else if (hov && u->in.clicked && !u->consumed_click) {
+            u->consumed_click = true;
+            *clicked_idx = idx;
+        }
     } else if (!p->url[0]) {
-        /* Manual install: this is a real, working action, not a disabled label. */
+        /* Honest dead end: the file is not in the binary, so the only real
+         * action is the picker. */
         if (ui_button_ghost(u, 5200 + idx, ar, kl(s, "models.locallic")))
             *clicked_idx = idx;
     } else if (s->downloading && osa_streq(s->dl_pack, p->id)) {
@@ -969,6 +983,13 @@ static void draw_models(shell_state *s, ui_context *u, osa_rect body) {
                                 30 * u->L.scale);
             if (g_models[i].active) {
                 ui_pill(u, ar, kl(s, "models.active"), u->t.accent, u->t.accent_soft);
+            } else if (osa_starts(g_models[i].kind, "lang")) {
+                /* A word pack extends the phrasebook the application already
+                 * translates with; "activate" would be a lie (and an ellipsised
+                 * one, at this width). It is in force from the moment it is
+                 * installed, so the row says that instead of offering a switch
+                 * that would do nothing. */
+                ui_pill(u, ar, kl(s, "models.wordpack"), u->t.success, u->t.success_soft);
             } else if (ui_button(u, 5100 + i, ar, kl(s, "btn.activate"), false)) {
                 osa_error err;
                 if (osa_app_activate_model(s->app, g_models[i].id, &err)) {
@@ -1033,7 +1054,28 @@ static void draw_models(shell_state *s, ui_context *u, osa_rect body) {
                               rows.h), s->packs_scroll, np, visible);
 
     if (clicked >= 0 && clicked < np) {
-        if (!packs[clicked].url[0]) {
+        if (packs[clicked].installable) {
+            /* The offline path: build the pack, install it, reload the engine.
+             * It is quick enough to run inside the frame, and the toast that
+             * follows says what happened. */
+            osa_error err;
+            osa_strlcpy(s->dl_pack, packs[clicked].id, sizeof s->dl_pack);
+            s->downloading = true;
+            s->dl_progress = 1.0;
+            bool ok = osa_app_install_builtin_pack(s->app, packs[clicked].id, &err);
+            s->downloading = false;
+            s->dl_pack[0] = 0;
+            s->dl_progress = 0;
+            free(s->models_json);
+            s->models_json = NULL;
+            if (ok) {
+                s->models_tab = 0;           /* show it in the installed list */
+                shell_set_message(s, false, "%s %s", packs[clicked].name,
+                                  kl(s, "models.installedok"));
+            } else {
+                shell_set_message(s, true, "%s: %s", kl(s, "msg.failed"), err.msg);
+            }
+        } else if (!packs[clicked].url[0]) {
             /* Not a dead end: hand the user the picker that does work. */
             s->request = SHELL_REQ_PICK_PACK;
             shell_set_message(s, false, "%s", kl(s, "models.hintinstall"));
@@ -1802,6 +1844,20 @@ static void draw_settings(shell_state *s, ui_context *u, osa_rect body) {
 
 /* ---- About -------------------------------------------------------- */
 
+/* Machine readings, refreshed at most twice a second. The screen used to ask for
+ * a fresh status on every frame: three SQLite COUNTs, /proc/meminfo, /proc/stat
+ * and a statvfs, sixty times a second, to draw five lines that cannot change
+ * that fast. Cheap to fix and it keeps the repaint rate honest on a laptop. */
+static void about_status(shell_state *s, osa_app_status *out) {
+    if (!s->status_valid || osa_now_ms() - s->status_ms > 500) {
+        osa_app_get_status(s->app, &s->status_cache);
+        s->status_ms = osa_now_ms();
+        s->status_valid = true;
+    }
+    *out = s->status_cache;
+}
+
+
 static void about_bullet(ui_context *u, osa_rect r, const char *text) {
     float dx = u->L.rtl ? r.x + r.w - 8 * u->L.scale : r.x + 8 * u->L.scale;
     c_circle(u->c, dx, r.y + 9 * u->L.scale, 3 * u->L.scale, u->t.accent);
@@ -1871,7 +1927,7 @@ static void draw_about(shell_state *s, ui_context *u, osa_rect body) {
              kl(s, "about.system"), UI_FS_H2 * u->L.scale, u->t.text, u->L.rtl ? 2 : 0);
     c_hline(u->c, b.x + p, b.x + b.w - p, b.y + 42 * u->L.scale, 1, u->t.border_soft);
     osa_app_status st;
-    osa_app_get_status(s->app, &st);
+    about_status(s, &st);
     struct { const char *k; char v[192]; } rows[5];
     osa_strlcpy(rows[0].v, st.asr_model[0] ? st.asr_model : "—", sizeof rows[0].v);
     rows[0].k = "about.asr";
@@ -1879,7 +1935,20 @@ static void draw_about(shell_state *s, ui_context *u, osa_rect body) {
     rows[1].k = "about.mt";
     snprintf(rows[2].v, sizeof rows[2].v, "%d", st.n_models);
     rows[2].k = "about.modelcount";
-    snprintf(rows[3].v, sizeof rows[3].v, "%.0f MB", st.ram_used_mb);
+    /* "Memory in use" is this application's own resident size, not the whole
+     * machine's: /proc/meminfo (or GlobalMemoryStatusEx) moves with every other
+     * program on the computer, so a busy desktop made an idle window look like
+     * it was leaking, and nothing the app did could ever make the figure fall.
+     *
+     * The resident size is real, live memory, so only the two run modes that
+     * need a byte-identical picture — the snapshot renderer and the visual
+     * regression job — replace it with the frozen value. Everything else shows
+     * the truth. */
+    char ram[96], ramloc[160];
+    snprintf(ram, sizeof ram, "%.0f MB",
+             osa_sys_stats_frozen() ? st.app_ram_mb : (double)osa_process_ram_mb());
+    num_fa(s, ram, ramloc, sizeof ramloc);
+    snprintf(rows[3].v, sizeof rows[3].v, "%s", ramloc);
     rows[3].k = "about.ram";
     osa_strlcpy(rows[4].v, st.data_root, sizeof rows[4].v);
     rows[4].k = "about.dataroot";

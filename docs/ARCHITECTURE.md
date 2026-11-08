@@ -60,8 +60,16 @@ was forced by verifiability, and it is documented honestly instead of shipping a
 ## Determinism & offline guarantees
 
 * No engine call ever performs network I/O. Only the Download Manager does, and only when the user asks.
+* Most of the catalogue needs no Download Manager at all: an entry whose material is already in the binary is
+  **built locally** (`osa_app_install_builtin_pack`) into a plain UTF-8 `word<TAB>translation` file under
+  `<data>/Packs/`, then loaded into the translation engine with `mt_model_add_word_pack`. Installing is one call
+  with no network step, which is what makes the button on the Models screen truthful.
 * A model/dataset can only enter the store through a **catalog entry** (source URL, license, size, SHA-256) or an
   explicit user import with recorded provenance (rule #3 of the scenario).
+* `dist/` is self-contained: the two shipped containers live in `dist/models/` and are copied into the data folder
+  on first start. Nothing is ever written next to the exe.
+* A fault writes `<data>/last-fault.log` (fault kind, module-relative address, frame addresses) before the process
+  dies, so a release-build crash report is worth reading.
 * Every training run writes a new immutable model version; the previous one stays selectable (rule #5).
 * Local API binds to `127.0.0.1` only and requires a per-install bearer token stored in `settings` (security §10).
 

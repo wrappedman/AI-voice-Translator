@@ -562,6 +562,16 @@ static mt_model *model_alloc(void) {
 
 void mt_model_free(mt_model *m) {
     if (!m) return;
+    /* pairs and gloss hold strdup'd strings, not one flat block: the pairs come
+     * from add_pair(), which allocates each side separately. */
+    for (int i = 0; i < m->n_pairs; i++) {
+        free((void *)m->pairs[i].fa);
+        free((void *)m->pairs[i].en);
+    }
+    for (int i = 0; i < m->n_gloss; i++) {
+        free((void *)m->gloss[i].fa);
+        free((void *)m->gloss[i].en);
+    }
     free(m->pairs);
     free(m->gloss);
     free(m);
@@ -666,6 +676,104 @@ static bool add_pair(phrase_pair **arr, int *n, int *cap, const char *a, const c
     (*arr)[*n].en = pb;
     (*n)++;
     return true;
+}
+
+/* ---- offline word packs ------------------------------------------- *
+ * Format: UTF-8, one "source<TAB>translation" pair per line. '#' comments and
+ * blank lines are skipped, and the pair is stored with the Persian column in
+ * `fa` whatever the file order, so a pack pasted from a dictionary cannot
+ * translate in the wrong direction.
+ *
+ * A pack extends the builtin gloss instead of replacing it (gloss_word tries
+ * the loaded table first and falls through to WORDS), which is what makes a
+ * download optional rather than load-bearing: with no packs installed the
+ * application still translates everything it shipped with.
+ * ------------------------------------------------------------------- */
+
+#define MT_PACK_MAX_PAIRS 200000
+
+static bool looks_persian(const char *s) {
+    const char *p = s;
+    while (*p) {
+        uint32_t cp = utf8_next(&p);
+        if (is_persian_cp(cp)) return true;
+    }
+    return false;
+}
+
+int mt_model_extra_words(const mt_model *m) { return m ? m->n_gloss : 0; }
+
+/* Reads one line, strips CR/LF and surrounding spaces. Returns false at EOF. */
+static bool pack_line(FILE *f, char *buf, size_t cap) {
+    if (!fgets(buf, (int)cap, f)) return false;
+    size_t n = strlen(buf);
+    while (n && (buf[n-1] == '\n' || buf[n-1] == '\r' || buf[n-1] == ' ' || buf[n-1] == '\t'))
+        buf[--n] = 0;
+    return true;
+}
+
+static int load_pack(mt_model *m, const char *path, mt_lang src, bool store, osa_error *err) {
+    FILE *f = fopen(path, "rb");
+    if (!f) { osa_err_set(err, "cannot open %s", path); return -1; }
+    char line[1024];
+    int added = 0;
+    /* A byte-order mark on the first line would otherwise become part of the
+     * first word and silently never match. */
+    bool first = true;
+    while (pack_line(f, line, sizeof line)) {
+        char *p = line;
+        if (first) {
+            if ((unsigned char)p[0] == 0xEF && (unsigned char)p[1] == 0xBB && (unsigned char)p[2] == 0xBF)
+                p += 3;
+            first = false;
+        }
+        while (*p == ' ' || *p == '\t') p++;
+        if (!*p || *p == '#') continue;
+        char *tab = strchr(p, '\t');
+        if (!tab) tab = strchr(p, '=');
+        if (!tab) continue;
+        *tab = 0;
+        char *a = p, *b = tab + 1;
+        while (*b == ' ' || *b == '\t') b++;
+        size_t la = strlen(a), lb = strlen(b);
+        while (la && (a[la-1] == ' ' || a[la-1] == '\t')) a[--la] = 0;
+        if (!la || !lb) continue;
+        /* store as fa/en regardless of the file order */
+        const char *fa = a, *en = b;
+        if (src == MT_EN || (src == MT_AUTO && !looks_persian(a))) { fa = b; en = a; }
+        if (store) {
+            if (m->n_gloss >= MT_PACK_MAX_PAIRS) break;
+            if (!add_pair(&m->gloss, &m->n_gloss, &m->cap_gloss, fa, en)) {
+                fclose(f);
+                osa_err_set(err, "out of memory while reading %s", path);
+                return -1;
+            }
+        }
+        added++;
+    }
+    fclose(f);
+    return added;
+}
+
+bool mt_word_pack_check(const char *path, mt_lang src, int *n_pairs, osa_error *err) {
+    if (n_pairs) *n_pairs = 0;
+    int n = load_pack(NULL, path, src, false, err);
+    if (n < 0) return false;
+    if (n == 0) {
+        osa_err_set(err, "no \"word<TAB>translation\" lines in %s", path);
+        return false;
+    }
+    if (n_pairs) *n_pairs = n;
+    osa_err_ok(err);
+    return true;
+}
+
+int mt_model_add_word_pack(mt_model *m, const char *path, mt_lang src, osa_error *err) {
+    if (!m || !path) { osa_err_set(err, "bad arguments"); return -1; }
+    int n = load_pack(m, path, src, true, err);
+    if (n < 0) return -1;
+    osa_err_ok(err);
+    return n;
 }
 
 mt_model *mt_model_load(const char *path, osa_error *err) {

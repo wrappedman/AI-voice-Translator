@@ -450,6 +450,12 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE prev, LPSTR cmdline, int show) {
     (void)prev; (void)cmdline;
     SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
 
+    /* A crash in a release build used to leave the user with nothing but a
+     * fault offset in the Event Viewer. From here on it also leaves a small
+     * text file with the fault kind, the module-relative address and the frame
+     * addresses, which is what makes the report actionable. */
+    osa_crash_log_init(false);
+
     host *h = &g_host;
     memset(h, 0, sizeof *h);
     h->dpi_scale = 1.0f;
@@ -491,10 +497,25 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE prev, LPSTR cmdline, int show) {
 
     if (!host_alloc_surface(h, w, hh)) return 1;
     if (!ui_init(&h->ui, &h->canvas)) {
-        MessageBoxW(h->hwnd,
-                    L"فونت‌های همراه برنامه پیدا نشد.\n\nBundled fonts are missing: keep the\n"
-                    L"assets\\fonts folder next to OpenSpeechAI.exe.",
-                    L"OpenSpeech AI", MB_ICONERROR | MB_OK);
+        /* Say *where* the fonts have to be, with the real exe folder in the
+         * message: "keep the assets folder next to the exe" is useless when the
+         * user has no idea which folder that is. */
+        wchar_t wdir[OSAI_MAX_PATH] = L"";
+        MultiByteToWideChar(CP_UTF8, 0, osa_exe_dir(), -1, wdir,
+                            (int)(sizeof wdir / sizeof wdir[0]));
+        wchar_t msg[1400];
+        _snwprintf(msg, 1400,
+                   L"فونت‌های همراه برنامه پیدا نشد.\n"
+                   L"Bundled fonts were not found.\n\n"
+                   L"The program looked for:\n"
+                   L"  %s\\assets\\fonts\\Vazirmatn-Regular.ttf\n"
+                   L"  %s\\assets\\Vazirmatn-Regular.ttf\n"
+                   L"  %s\\fonts\\Vazirmatn-Regular.ttf\n\n"
+                   L"Copy the assets folder from the release zip next to\n"
+                   L"OpenSpeechAI.exe and start it again. Fault log: %s",
+                   wdir, wdir, wdir, L"last-fault.log (in the data folder)");
+        MessageBoxW(h->hwnd, msg, L"OpenSpeech AI — fonts missing",
+                    MB_ICONERROR | MB_OK);
         return 1;
     }
     shell_init(&h->shell, h->app);

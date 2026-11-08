@@ -90,6 +90,30 @@ const char *mt_model_license(const mt_model *m);
 const char *mt_model_source(const mt_model *m);
 const char *mt_model_backend(const mt_model *m);
 
+/* ---- offline word packs ------------------------------------------- *
+ * The phrasebook and the word gloss table are compiled in. An installed word
+ * pack (a plain UTF-8 "source<TAB>translation" file, one pair per line,
+ * comments with '#') extends the gloss without replacing it: two passes are
+ * made, the pack first and the builtin table second, so a pack can correct a
+ * word but never remove the coverage the application ships with.
+ *
+ * The path becomes part of the model, which is why the app loads the packs at
+ * start-up instead of translating with whatever it happened to find.
+ * ------------------------------------------------------------------- */
+
+/* Words currently loaded from packs (0 when only the builtin table is used). */
+int mt_model_extra_words(const mt_model *m);
+
+/* Add every pair in `path` to `m`'s gloss. `src` is the language of the first
+ * column; a pair whose columns are the wrong way round is stored swapped, so a
+ * pack cannot produce a translation in the wrong direction. Returns the number
+ * of pairs added, or -1 on error. Re-adding a pair replaces it. */
+int mt_model_add_word_pack(mt_model *m, const char *path, mt_lang src, osa_error *err);
+
+/* Verify that `path` looks like a word pack for `src` (at least one usable
+ * line) without changing `m`. Used by the installer before it copies a file. */
+bool mt_word_pack_check(const char *path, mt_lang src, int *n_pairs, osa_error *err);
+
 /* ---- translation -------------------------------------------------- */
 
 /* Translate `text`. `src` = MT_AUTO detects the language from the script

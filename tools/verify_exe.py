@@ -49,6 +49,16 @@ def check(path: str) -> int:
                          (b"permonitorv2", "DPI manifest")):
         if needle not in data:
             fails.append("missing %s resource" % what)
+    # The resource is stored as UTF-16, so a stale FILEVERSION block would not
+    # show up in the search above. Check the previous-version string explicitly:
+    # 1.0.0.0 in the file properties of a 1.1.0 release is exactly the kind of
+    # drift this script exists to catch.
+    stale = [v for v in ("1.0.0.0", "0.9.0.0")
+             if v != ver and v.encode("utf-16-le") in data]
+    for v in stale:
+        fails.append("file properties still report version %s" % v)
+    if ver.encode("utf-16-le") not in data:
+        fails.append("version resource does not carry %s" % ver)
     return report(fails, path, data)
 
 

@@ -60,7 +60,8 @@ typedef struct osa_app_status {
     int      n_transcripts;
     int      n_translations;
     double   cpu_percent;
-    double   ram_used_mb;
+    double   ram_used_mb;      /* whole machine, for context */
+    double   app_ram_mb;       /* this process: the honest "in use" figure */
     double   disk_free_mb;
     char     data_root[OSAI_MAX_PATH];
 } osa_app_status;
@@ -175,6 +176,10 @@ typedef struct osa_pack_info {
     char notes[256];
     double size_mb;
     bool installed;
+    /* True when the application builds this pack itself, offline. Such an
+     * entry has a working button: pressing it writes the pack into the data
+     * folder and reloads the translation engine. */
+    bool installable;
 } osa_pack_info;
 
 /* Number of catalogue entries written into `out`. */
@@ -187,6 +192,12 @@ int  osa_app_packs(osa_app *app, osa_pack_info *out, int max);
 int  osa_app_download_pack(osa_app *app, const char *id,
                            void (*progress)(int64_t got, int64_t total, void *ud), void *ud,
                            volatile int *cancel, osa_error *err);
+
+/* Builds and installs one of the packs the application carries (the offline
+ * path: no network, no file picker). Reloads the translation engine, so the
+ * pack is active when the call returns. Entries whose material is not in the
+ * binary fail with the catalogue note as the reason. */
+bool osa_app_install_builtin_pack(osa_app *app, const char *id, osa_error *err);
 
 /* Installs a language pack from a local file the user picked (the offline path
  * for the same feature). */

@@ -90,6 +90,17 @@ void osa_sys_stats_init(void);
 void osa_sys_stats_sample(osa_sys_stats *out);
 /* Replace the live CPU/RAM readings with fixed values (snapshot determinism). */
 void osa_sys_stats_freeze(bool frozen);
+/* True while the fixed values are in force. */
+bool osa_sys_stats_frozen(void);
+/* Resident memory of this process, in MB (0 when it cannot be measured). */
+float osa_process_ram_mb(void);
+
+/* ---------------- fault log ----------------
+ * Writes <data folder>/last-fault.log with the fault kind, address and the
+ * return addresses of the offending stack, then lets the process die normally.
+ * `quiet` suppresses the file (the snapshot/test harness). */
+void        osa_crash_log_init(bool quiet);
+const char *osa_crash_log_path(void);
 
 /* ---------------- desktop helpers ---------------- */
 bool osa_open_in_explorer(const char *path);   /* opens folder/file with the OS shell */

@@ -395,6 +395,11 @@ int main(int argc, char **argv) {
         else { fprintf(stderr, "unknown argument: %s\n", a); usage(); return 2; }
     }
 
+    /* Real runs get a fault log; the test/snapshot paths do not, so a failure
+     * in CI stays a failing exit code instead of a file in the data folder. */
+    if (!snapdir && !selftest)
+        osa_crash_log_init(false);
+
     if (snapdir) return run_snapshots(snapdir, w, h, lang, !light);
     if (file) return run_transcribe(file, json);
     if (selftest) return run_selftest();

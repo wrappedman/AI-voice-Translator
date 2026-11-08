@@ -447,11 +447,23 @@ void osa_sys_stats_init(void) {
  * would report a change that is not one. */
 static bool g_stats_frozen = false;
 void osa_sys_stats_freeze(bool frozen) { g_stats_frozen = frozen; }
+bool osa_sys_stats_frozen(void) { return g_stats_frozen; }
+
+float osa_process_ram_mb(void) {
+    /* Deliberately parts of the same sample: RSS is the one reading that
+     * describes this process rather than the machine it shares with everything
+     * else the user is running, so it is what "memory in use" means on screen. */
+    osa_sys_stats live;
+    osa_sys_stats_sample(&live);
+    return live.proc_ram_mb;
+}
 
 void osa_sys_stats_sample(osa_sys_stats *out) {
     memset(out, 0, sizeof *out);
     if (g_stats_frozen) {
-        /* A plausible, fixed machine. Nothing in the UI is judged by these. */
+        /* A plausible, fixed machine. The About screen draws these values
+         * during a snapshot run, so they must not vary between two renders of
+         * the same still; the live path reports the real ones. */
         out->cpu_percent = 12.0f;
         out->ram_used_mb = 512.0f;
         out->ram_total_mb = 8192.0f;

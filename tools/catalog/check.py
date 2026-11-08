@@ -24,7 +24,7 @@ HEADLESS = os.path.join(ROOT, "build", "openspeech")
 
 HEX64 = re.compile(r"^[0-9a-f]{64}$")
 KINDS = {"asr", "mt", "lang"}
-ENGINES = {"exemplar", "trained", "phrasebook"}
+ENGINES = {"exemplar", "trained", "phrasebook", "wordpack"}
 STATUSES = {"installed", "available", "manual", "deprecated"}
 
 
@@ -88,17 +88,34 @@ def main() -> int:
             fail(errors, "%s is installed but has no size" % tag)
         if m.get("status") == "available" and not m.get("url"):
             fail(errors, "%s is downloadable but has no url" % tag)
+        # An entry the application builds itself from material it already ships
+        # is installable offline: there are no remote bytes, so there is nothing
+        # to hash and nothing to fetch. `builtin://<id>` is that marker, and the
+        # id must be the entry's own id so a typo cannot point at another pack.
+        url = m.get("url") or ""
+        builtin = url.startswith("builtin://")
+        if builtin and url != "builtin://" + tag:
+            fail(errors, "%s builtin url must be builtin://%s, got %s" % (tag, tag, url))
+        if url and not builtin and not url.startswith("https://"):
+            fail(errors, "%s url must be https:// or builtin://<id>" % tag)
         # A downloadable entry whose bytes we have not verified is a liability:
         # either publish the hash, or mark the entry as a manual install.
-        if m.get("url") and not HEX64.match(sha) and m.get("status") == "available":
+        if url and not builtin and not HEX64.match(sha) and m.get("status") == "available":
             fail(errors, "%s has a url but no verified sha256" % tag)
-        if m.get("status") == "manual" and m.get("url"):
+        if m.get("status") == "manual" and url:
             fail(errors, "%s is manual-install but also has a url" % tag)
-        if m.get("status") == "installed" and m.get("url"):
+        if m.get("status") == "installed" and url:
             fail(errors, "%s is installed but also has a url" % tag)
+        if builtin and m.get("status") != "available":
+            fail(errors, "%s is built by the application, so its status must be available" % tag)
 
     if not errors:
         print("  ok   %d entries structurally valid" % len(models))
+        builtin = [m for m in models if (m.get("url") or "").startswith("builtin://")]
+        manual = [m for m in models if m.get("status") == "manual"]
+        print("  ok   %d installable offline, %d manual-install, %d installed"
+              % (len(builtin), len(manual),
+                 len([m for m in models if m.get("status") == "installed"])))
 
     if "--hash" in sys.argv:
         print("\nbuiltin containers")

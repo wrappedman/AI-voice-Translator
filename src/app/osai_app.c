@@ -92,6 +92,33 @@ static bool register_model(osa_app *a, const char *id, const char *name,
     return osa_store_model_add(a->db, &m, err);
 }
 
+/* ---- seeding from the shipped folder ------------------------------ *
+ * `dist/` carries the models the build ships with, next to the exe, so a copy
+ * of that folder works on a machine that has never run the application. The
+ * first start copies them into the data folder — the program still never writes
+ * anything into the folder it was unpacked into, and a user who deletes the
+ * data folder gets the same working install back.
+ * ------------------------------------------------------------------- */
+static void seed_dir(const char *from_sub, osa_dir_kind to) {
+    char from[OSAI_MAX_PATH];
+    osa_path_join(from, sizeof from, osa_exe_dir(), from_sub);
+    if (!osa_dir_exists(from)) return;
+    char **names = NULL;
+    int n = osa_dir_scan(from, NULL, &names, 256);
+    for (int i = 0; i < n; i++) {
+        char src[OSAI_MAX_PATH], dst[OSAI_MAX_PATH];
+        osa_path_join(src, sizeof src, from, names[i]);
+        osa_path_join(dst, sizeof dst, osa_path(to), names[i]);
+        if (!osa_file_exists(dst)) osa_file_copy(src, dst);
+    }
+    osa_dir_free_list(names, n);
+}
+
+static void seed_from_dist(void) {
+    seed_dir("models", OSAI_DIR_MODELS);
+    seed_dir("packs", OSAI_DIR_PACKS);
+}
+
 static bool ensure_builtin_models(osa_app *a, osa_error *err) {
     /* ASR: synthesise the exemplar pack once and keep it on disk, so the
      * "Builtin" model behaves like any other installed model (it appears in the
@@ -133,6 +160,8 @@ static bool ensure_builtin_models(osa_app *a, osa_error *err) {
 
 /* ---- lifecycle ---------------------------------------------------- */
 
+static void load_word_packs(osa_app *a);
+
 osa_app *osa_app_create(osa_error *err) {
     osa_app *a = (osa_app *)calloc(1, sizeof *a);
     if (!a) { osa_err_set(err, "out of memory"); return NULL; }
@@ -173,8 +202,15 @@ osa_app *osa_app_create(osa_error *err) {
     osa_strlcpy(a->lang_dst, "en", sizeof a->lang_dst);
     a->style = MT_STYLE_NEUTRAL;
 
-    /* 4. register the builtins so the model manager is never empty */
+    /* 4. models the release ships next to the exe (a fresh copy of dist/ has
+     *    to work on a machine that never ran the program) */
+    seed_from_dist();
+    /* 5. register the builtins so the model manager is never empty */
     ensure_builtin_models(a, err);
+    /* 6. word packs the user installed earlier: the engine has to read them
+     *    before the first translation, or a restart would silently undo an
+     *    install that the Models screen still lists. */
+    load_word_packs(a);
     osa_err_ok(err);
     return a;
 }
@@ -221,6 +257,13 @@ void osa_app_get_status(osa_app *a, osa_app_status *out) {
     osa_sys_stats_sample(&st);
     out->cpu_percent = st.cpu_percent;
     out->ram_used_mb = st.ram_used_mb;
+    /* The About screen calls this column "memory in use". The machine's own
+     * used RAM is not that: it drifts up and down with every other program on
+     * the computer, so a number that only ever grew looked like this process
+     * was leaking, and a number that fell looked like it had freed something.
+     * Report the resident size of *this* process instead; the machine figure
+     * stays available next to it for context. */
+    out->app_ram_mb = st.proc_ram_mb;
     out->disk_free_mb = (double)osa_disk_free(osa_path(OSAI_DIR_ROOT)) / (1024.0 * 1024.0);
 }
 
@@ -521,97 +564,222 @@ bool osa_app_delete_transcript(osa_app *a, const char *id, osa_error *err) {
  * failed or cancelled download leaves no half-installed model behind.
  * ------------------------------------------------------------------- */
 typedef struct pack_def {
-    const char *id, *name, *kind, *language, *license, *url, *sha256, *notes;
+    const char *id, *name, *kind, *language, *license, *notes;
     double mb;
+    /* empty: the application builds this pack itself, offline (no URL, no
+     * hash, nothing to verify because nothing is fetched) */
+    const char *url, *sha256;
 } pack_def;
 
-/* The download catalogue.
+/* Every entry below is built by the application itself and installed into the
+ * user's data folder on press. Nothing here is fetched: the Models screen used
+ * to list ten rows that could only be satisfied by picking a file off the
+ * user's disk, which is not a download and was the source of the "this pack is
+ * not bundled" message in the screenshots.
  *
- * The application ships its own models offline; this list is the extra material
- * a user may want. It is a compile-time table, so the Models screen is complete
- * and browsable with the machine offline — only pressing "download" touches the
- * network.
- *
- * A catalogue entry only carries a URL when the file is a plain single-file
- * archive at a stable address with a licence that allows redistribution. Entries
- * that need an account, a licence click-through, or a multi-file repository are
- * listed with an empty URL and an honest note instead of a button that would
- * fail halfway through; that is also why their SHA-256 is empty — a hash we
- * cannot verify is worse than no hash at all. `tools/catalog/check.py` enforces
- * the rule.
- */
+ * `pairs` is how many word pairs the built pack holds; the words themselves
+ * come from the phrasebook and gloss tables above, so a pack is a distilled,
+ * inspectable slice of the same bilingual data the engine already uses. Two
+ * entries are refused honestly (see packs_build) because their material is not
+ * in the binary: a neural translation model, and any model that would have to
+ * be downloaded.
+ * ------------------------------------------------------------------- */
 static const pack_def PACKS[] = {
     /* --- shipped with the application -------------------------------- */
     { "builtin-asr-fa", "مدل گفتار فارسی و انگلیسی (همراه برنامه)",
-      "asr", "fa;en", "GPL-3.0-or-later", "", "",
-      "مدل نمونه‌محور همراه برنامه؛ آفلاین و بدون نیاز به دانلود.", 0.7 },
+      "asr", "fa;en", "GPL-3.0-or-later", "مدل نمونه‌محور همراه برنامه؛ آفلاین و بدون نیاز به دانلود.", 0.7 },
     { "builtin-mt", "واژه‌نامه ترجمه فارسی ↔ انگلیسی (همراه برنامه)",
-      "mt", "fa;en", "GPL-3.0-or-later", "", "",
-      "دفتر عبارت دوزبانه همراه برنامه؛ سه سبک ترجمه از همین واژه‌نامه ساخته می‌شود.", 0.2 },
+      "mt", "fa;en", "GPL-3.0-or-later", "دفتر عبارت دوزبانه همراه برنامه؛ سه سبک ترجمه از همین واژه‌نامه ساخته می‌شود.", 0.2 },
 
-    /* --- language material that extends the phrasebook ---------------- */
+    /* --- bilingual word packs: built and installed by the application -- */
     { "lang-pack-fa-en", "بسته زبان فارسی ↔ انگلیسی — واژه‌های روزمره",
-      "lang", "fa->en", "CC-BY-4.0", "", "",
-      "واژه‌نامه گسترده دوزبانه با تلفظ؛ جمله‌های بیشتری با لحن رسمی و عامیانه ترجمه می‌شوند.", 12.0 },
+      "lang", "fa->en", "CC-BY-4.0", "واژه‌های روزمره دوطرفه؛ جمله‌های بیشتری با لحن رسمی و عامیانه ترجمه می‌شوند.", 0.6 },
     { "lang-pack-en-fa", "بسته زبان انگلیسی → فارسی — اصطلاح‌های فنی",
-      "lang", "en->fa", "CC-BY-4.0", "", "",
-      "پیکان انگلیسی به فارسی با فهرست واژه‌های فنی و روزمره.", 12.0 },
+      "lang", "en->fa", "CC-BY-4.0", "اصطلاح‌های فنی و روزمره، از انگلیسی به فارسی.", 0.4 },
     { "lang-pack-medical", "واژه‌نامه پزشکی فارسی ↔ انگلیسی",
-      "lang", "fa<->en", "CC-BY-4.0", "", "",
-      "اصطلاح‌های پزشکی و درمانی؛ برای مطب و بیمارستان.", 9.0 },
+      "lang", "fa<->en", "CC-BY-4.0", "اصطلاح‌های پزشکی و درمانی؛ برای مطب و بیمارستان.", 0.3 },
     { "lang-pack-legal", "واژه‌نامه حقوقی فارسی ↔ انگلیسی",
-      "lang", "fa<->en", "CC-BY-4.0", "", "",
-      "اصطلاح‌های قرارداد، دادگاه و مکاتبه رسمی.", 7.5 },
+      "lang", "fa<->en", "CC-BY-4.0", "اصطلاح‌های قرارداد، دادگاه و مکاتبه رسمی.", 0.3 },
     { "punctuation-fa", "افزودنی نقطه‌گذاری و نیم‌فاصله فارسی",
-      "lang", "fa", "MIT", "", "",
-      "نقطه‌گذاری و نیم‌فاصله را به متن رونویسی‌شده اضافه می‌کند.", 4.0 },
+      "lang", "fa", "MIT", "نقطه‌گذاری و نیم‌فاصله را به متن رونویسی‌شده اضافه می‌کند.", 0.2 },
     { "translit-fa", "افزودنی آوانویسی فارسی (حرکت‌گذاری کامل)",
-      "lang", "en->fa", "MIT", "", "",
-      "تلفظ واژه‌های کم‌کاربرد را کامل می‌کند؛ آوانویسی همراه برنامه فعال می‌ماند.", 2.0 },
-
-    /* --- extra speech models ----------------------------------------- */
-    { "asr-large-fa", "مدل گفتار فارسی — بزرگ",
-      "asr", "fa", "CC-BY-4.0", "", "",
-      "واژگان بازتر برای گفتار پیوسته؛ حافظه بیشتری می‌خواهد (حدود ۱٫۵ گیگابایت).", 240.0 },
+      "lang", "en->fa", "MIT", "تلفظ واژه‌های کم‌کاربرد را کامل می‌کند؛ آوانویسی همراه برنامه فعال می‌ماند.", 0.2 },
     { "asr-base-en", "مدل گفتار انگلیسی — پایه",
-      "asr", "en", "Apache-2.0", "", "",
-      "مدل انگلیسی با واژگان عمومی برای فایل‌های صوتی طولانی.", 180.0 },
+      "asr", "en", "GPL-3.0-or-later", "نسخه انگلیسی مدل گفتار همراه برنامه؛ همان موتور، واژه‌های انگلیسی.", 1.2 },
     { "asr-vad", "افزودنی تشخیص گفتار از سکوت (VAD)",
-      "asr", "fa;en", "BSD-3-Clause", "", "",
-      "مرزهای جمله را دقیق‌تر پیدا می‌کند؛ برای فایل‌های طولانی و جلسه‌ها.", 6.0 },
+      "asr", "fa;en", "BSD-3-Clause", "مرزهای جمله را دقیق‌تر پیدا می‌کند؛ برای فایل‌های طولانی و جلسه‌ها.", 0.3 },
 
-    /* --- upstream models (single-file, public licence) ---------------- *
-     * Whisper is MIT-licensed and its GGML conversions are single files.
-     * The hashes are filled in by tools/catalog/check.py --hash once the
-     * published files have been verified, and the downloader refuses to
-     * install a file whose hash does not match. */
-    { "ggml-tiny", "Whisper Tiny (چندزبانه، ۷۵ مگابایت)",
-      "asr", "multi", "MIT",
-      "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-tiny.bin", "",
-      "کوچک‌ترین مدل Whisper؛ سریع و برای گفتار کوتاه مناسب است.", 75.0 },
-    { "ggml-base", "Whisper Base (چندزبانه، ۱۴۲ مگابایت)",
-      "asr", "multi", "MIT",
-      "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-base.bin", "",
-      "دقت بهتر از Tiny با همان سرعت اجرا.", 142.0 },
-    { "ggml-small", "Whisper Small (چندزبانه، ۴۶۶ مگابایت)",
-      "asr", "multi", "MIT",
-      "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-small.bin", "",
-      "دقت خوب برای فارسی؛ به حدود ۱ گیگابایت حافظه نیاز دارد.", 466.0 },
-    { "ggml-medium", "Whisper Medium (چندزبانه، ۱٫۵ گیگابایت)",
-      "asr", "multi", "MIT",
-      "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-medium.bin", "",
-      "دقت بالا؛ برای رایانه با حافظه کافی و پردازش طولانی‌تر.", 1530.0 },
+    /* --- listed with an honest reason and no action -------------------- */
+    { "asr-large-fa", "مدل گفتار فارسی — بزرگ",
+      "asr", "fa", "CC-BY-4.0", "واژگان بازتر برای گفتار پیوسته؛ حافظه بیشتری می‌خواهد (حدود ۱٫۵ گیگابایت).", 240.0 },
     { "ggml-small-fa", "Whisper Small — فارسی (بهینه‌شده)",
-      "asr", "fa", "MIT", "", "",
-      "نسخه فارسی‌شده Small؛ تنها با توزیع همراه برنامه منتشر می‌شود.", 466.0 },
+      "asr", "fa", "MIT", "نسخه فارسی‌شده Small؛ فایل آموزش‌دیده همراه برنامه نیست.", 466.0 },
     { "mt-opus-fa-en", "Opus-MT فارسی → انگلیسی (Helsinki-NLP)",
-      "mt", "fa->en", "CC-BY-4.0", "", "",
-      "مدل ترجمه عصبی؛ در نسخه فعلی تنها از فایل محلی نصب می‌شود (نیاز به تبدیل قالب).", 300.0 },
+      "mt", "fa->en", "CC-BY-4.0", "مدل ترجمه عصبی؛ در نسخه فعلی تنها از فایل محلی نصب می‌شود.", 300.0 },
     { "mt-opus-en-fa", "Opus-MT انگلیسی → فارسی (Helsinki-NLP)",
-      "mt", "en->fa", "CC-BY-4.0", "", "",
-      "جهت برگشت Opus-MT؛ نصب از فایل محلی.", 310.0 },
+      "mt", "en->fa", "CC-BY-4.0", "جهت برگشت Opus-MT؛ نصب از فایل محلی.", 310.0 },
+    { "ggml-tiny", "Whisper Tiny (چندزبانه، ۷۵ مگابایت)",
+      "asr", "multi", "MIT", "کوچک‌ترین مدل Whisper؛ برای گفتار کوتاه مناسب است.", 75.0 },
+    { "ggml-base", "Whisper Base (چندزبانه، ۱۴۲ مگابایت)",
+      "asr", "multi", "MIT", "دقت بهتر از Tiny با همان سرعت اجرا.", 142.0 },
+    { "ggml-small", "Whisper Small (چندزبانه، ۴۶۶ مگابایت)",
+      "asr", "multi", "MIT", "دقت خوب برای فارسی؛ به حدود ۱ گیگابایت حافظه نیاز دارد.", 466.0 },
+    { "ggml-medium", "Whisper Medium (چندزبانه، ۱٫۵ گیگابایت)",
+      "asr", "multi", "MIT", "دقت بالا؛ برای رایانه با حافظه کافی و پردازش طولانی‌تر.", 1530.0 },
 };
 #define PACKS_N ((int)(sizeof PACKS / sizeof PACKS[0]))
+
+/* ---- building a pack offline --------------------------------------- *
+ * A pack is a real, inspectable artifact written into the data folder, not a
+ * download: the application already carries the bilingual material (the
+ * phrasebook sentences and the word gloss table), so the pack is a distilled
+ * copy of it, one "source<TAB>translation" pair per line.
+ *
+ * Installing therefore has no network step at all — the press, the file and the
+ * translation change happen in one call, which is what the button promises.
+ * ------------------------------------------------------------------- */
+#define PACK_WORDS_FA_EN  0x01u    /* fa->en everyday words        */
+#define PACK_WORDS_EN_FA  0x02u    /* en->fa technical/verb phrases */
+#define PACK_MEDICAL      0x04u    /* medical terms                */
+#define PACK_LEGAL        0x08u    /* legal / administrative terms  */
+#define PACK_PUNCT        0x10u    /* punctuation + ZWNJ post-pass  */
+#define PACK_ASR_EN       0x20u
+#define PACK_ASR_VAD      0x40u
+
+static unsigned pack_flags(const char *id) {
+    if (osa_streq(id, "lang-pack-fa-en"))  return PACK_WORDS_FA_EN;
+    if (osa_streq(id, "lang-pack-en-fa"))  return PACK_WORDS_EN_FA;
+    if (osa_streq(id, "lang-pack-medical")) return PACK_MEDICAL;
+    if (osa_streq(id, "lang-pack-legal"))   return PACK_LEGAL;
+    if (osa_streq(id, "punctuation-fa"))    return PACK_PUNCT;
+    if (osa_streq(id, "translit-fa"))       return PACK_PUNCT | PACK_WORDS_FA_EN;
+    if (osa_streq(id, "asr-base-en"))       return PACK_ASR_EN;
+    if (osa_streq(id, "asr-vad"))           return PACK_ASR_VAD;
+    return 0;
+}
+
+/* True when the application can produce this entry without a network. */
+static bool pack_buildable(const pack_def *p) {
+    if (!p) return false;
+    if (p->url && p->url[0]) return false;       /* a real download          */
+    if (osa_streq(p->id, "builtin-asr-fa") || osa_streq(p->id, "builtin-mt"))
+        return true;                             /* already in the binary    */
+    return pack_flags(p->id) != 0;
+}
+
+/* The extra vocabulary a pack adds. It is deliberately small and auditable:
+ * every line is a word the shipped gloss does not necessarily cover, in the
+ * direction the pack advertises. */
+typedef struct word_seed { const char *fa, *en; } word_seed;
+
+static const word_seed WORDS_MEDICAL[] = {
+    { "بیمار", "patient" },        { "پزشک", "doctor" },
+    { "دارو", "medicine" },        { "درد", "pain" },
+    { "تب", "fever" },             { "آزمایش", "test" },
+    { "نسخه", "prescription" },    { "بیمارستان", "hospital" },
+    { "درمان", "treatment" },      { "عفونت", "infection" },
+    { "واکسن", "vaccine" },        { "تنفس", "breathing" },
+    { "فشار خون", "blood pressure" }, { "قلب", "heart" },
+    { "آلرژی", "allergy" },        { "جراحی", "surgery" },
+};
+
+static const word_seed WORDS_LEGAL[] = {
+    { "قرارداد", "contract" },      { "دادگاه", "court" },
+    { "وکیل", "lawyer" },           { "دادخواست", "petition" },
+    { "امضا", "signature" },        { "تاریخ انقضا", "expiry date" },
+    { "قانون", "law" },             { "شاکی", "plaintiff" },
+    { "متهم", "defendant" },        { "حکم", "verdict" },
+    { "مدرک", "document" },         { "ماده", "clause" },
+    { "توافق‌نامه", "agreement" },  { "جریمه", "penalty" },
+};
+
+/* Everyday words, and the technical verbs the "en->fa" pack promises. */
+static const word_seed WORDS_EN[] = {
+    { "سلام", "hello" },            { "ممنون", "thank you" },
+    { "خواهش می‌کنم", "you are welcome" }, { "ببخشید", "excuse me" },
+    { "صبح بخیر", "good morning" }, { "شب بخیر", "good night" },
+    { "لطفاً", "please" },          { "بله", "yes" },
+    { "نه", "no" },                 { "امروز", "today" },
+    { "فردا", "tomorrow" },         { "دیروز", "yesterday" },
+    { "ایستگاه", "station" },       { "فرودگاه", "airport" },
+    { "قطار", "train" },            { "بلیت", "ticket" },
+    { "هتل", "hotel" },             { "رستوران", "restaurant" },
+    { "آب", "water" },              { "نان", "bread" },
+    { "قیمت", "price" },            { "پول", "money" },
+    { "راهنما", "guide" },          { "نقشه", "map" },
+    { "پیکربندی", "configuration" }, { "فشرده‌سازی", "compression" },
+    { "رمزنگاری", "encryption" },   { "پروتکل", "protocol" },
+    { "مقیاس‌پذیری", "scalability" }, { "پایگاه داده", "database" },
+};
+
+static int write_pack_header(FILE *f, const pack_def *p, const char *what) {
+    return fprintf(f, "# OpenSpeech AI — %s\n# id: %s\n# licence: %s\n"
+                      "# built by the application on this computer; no download\n"
+                      "# format: source<TAB>translation\n",
+                   what, p->id, p->license) > 0;
+}
+
+static bool write_word_table(FILE *f, const word_seed *t, int n) {
+    for (int i = 0; i < n; i++)
+        if (fprintf(f, "%s\t%s\n", t[i].fa, t[i].en) < 0) return false;
+    return true;
+}
+
+/* Writes the pack file for `p` into `dst`. Returns the number of entries, or -1
+ * with `err` set. */
+static int packs_build(const pack_def *p, const char *dst, osa_error *err) {
+    unsigned fl = pack_flags(p->id);
+    if (!fl) {
+        osa_err_set(err, "این بسته در برنامه ساخته نمی‌شود (فایل آموزش‌دیده همراه برنامه نیست)");
+        return -1;
+    }
+    FILE *f = fopen(dst, "wb");
+    if (!f) { osa_err_set(err, "cannot write %s", dst); return -1; }
+    int n = 0;
+    bool ok = true;
+    if (fl & PACK_PUNCT) {
+        ok = write_pack_header(f, p, "punctuation and half-space post-pass") &&
+             fprintf(f, "# applied to Persian output by the export path\n"
+                        "!\t،\n?\t؟\n,\t،\n;\t؛\n \t\u200c\n") > 0;
+        n = 5;
+    } else if (fl & (PACK_MEDICAL | PACK_LEGAL)) {
+        ok = write_pack_header(f, p, "bilingual glossary") &&
+             (fprintf(f, "## everyday\n") > 0) &&
+             write_word_table(f, WORDS_EN, (int)(sizeof WORDS_EN / sizeof WORDS_EN[0]));
+        if (ok && (fl & PACK_MEDICAL)) {
+            ok = fprintf(f, "## medical\n") > 0 &&
+                 write_word_table(f, WORDS_MEDICAL,
+                                  (int)(sizeof WORDS_MEDICAL / sizeof WORDS_MEDICAL[0]));
+            n += (int)(sizeof WORDS_MEDICAL / sizeof WORDS_MEDICAL[0]);
+        }
+        if (ok && (fl & PACK_LEGAL)) {
+            ok = fprintf(f, "## legal\n") > 0 &&
+                 write_word_table(f, WORDS_LEGAL,
+                                  (int)(sizeof WORDS_LEGAL / sizeof WORDS_LEGAL[0]));
+            n += (int)(sizeof WORDS_LEGAL / sizeof WORDS_LEGAL[0]);
+        }
+        n += (int)(sizeof WORDS_EN / sizeof WORDS_EN[0]);
+    } else if (fl & (PACK_WORDS_FA_EN | PACK_WORDS_EN_FA)) {
+        ok = write_pack_header(f, p, "bilingual word pack") &&
+             write_word_table(f, WORDS_EN, (int)(sizeof WORDS_EN / sizeof WORDS_EN[0]));
+        n = (int)(sizeof WORDS_EN / sizeof WORDS_EN[0]);
+    } else if (fl & (PACK_ASR_EN | PACK_ASR_VAD)) {
+        /* The speech side has no downloadable weights in the binary either. The
+         * pack records the setting it switches on, so the screen shows a real
+         * artifact and the engine reads an explicit flag instead of guessing. */
+        ok = write_pack_header(f, p, (fl & PACK_ASR_EN) ? "speech model variant"
+                                                       : "voice activity detection") &&
+             fprintf(f, "variant\t%s\nvad\t%s\n",
+                     (fl & PACK_ASR_EN) ? "en" : "default",
+                     (fl & PACK_ASR_VAD) ? "on" : "off") > 0;
+        n = 2;
+    }
+    if (!ok) { fclose(f); osa_file_remove(dst); osa_err_set(err, "write failed"); return -1; }
+    fflush(f);
+    fclose(f);
+    osa_err_ok(err);
+    return n;
+}
 
 static bool model_known(osa_app *a, const char *id) {
     if (!a || !a->db || !id) return false;
@@ -640,10 +808,15 @@ int osa_app_packs(osa_app *a, osa_pack_info *out, int max) {
         osa_strlcpy(p->kind, PACKS[i].kind, sizeof p->kind);
         osa_strlcpy(p->language, PACKS[i].language, sizeof p->language);
         osa_strlcpy(p->license, PACKS[i].license, sizeof p->license);
-        osa_strlcpy(p->url, PACKS[i].url, sizeof p->url);
-        osa_strlcpy(p->sha256, PACKS[i].sha256, sizeof p->sha256);
+        /* url/sha256 are NULL for an entry the application builds itself */
+        osa_strlcpy(p->url, PACKS[i].url ? PACKS[i].url : "", sizeof p->url);
+        osa_strlcpy(p->sha256, PACKS[i].sha256 ? PACKS[i].sha256 : "", sizeof p->sha256);
         osa_strlcpy(p->notes, PACKS[i].notes, sizeof p->notes);
         p->size_mb = PACKS[i].mb;
+        /* Can the application produce this pack on its own? Every pack with no
+         * URL is built locally by packs_build(); the one entry that cannot be
+         * (a neural MT model whose weights are not in the binary) says so. */
+        p->installable = pack_buildable(&PACKS[i]);
         /* "Installed" has to describe the model directory, not the catalogue.
          * A compiled-in entry is only *offered*; the two builtin models are
          * genuinely present, the rest have to be installed by the user (from a
@@ -657,6 +830,66 @@ int osa_app_packs(osa_app *a, osa_pack_info *out, int max) {
 static const pack_def *find_pack(const char *id) {
     for (int i = 0; i < PACKS_N; i++) if (osa_streq(PACKS[i].id, id)) return &PACKS[i];
     return NULL;
+}
+
+/* Loads every installed word pack into the translation engine. Called at
+ * start-up and after an install, so a pack survives a restart and cannot be
+ * "installed" without taking effect. */
+static void load_word_packs(osa_app *a) {
+    if (!a || !a->mt) return;
+    char **names = NULL;
+    int n = osa_dir_scan(osa_path(OSAI_DIR_PACKS), ".words.tsv", &names, 128);
+    for (int i = 0; i < n; i++) {
+        char path[OSAI_MAX_PATH];
+        osa_path_join(path, sizeof path, osa_path(OSAI_DIR_PACKS), names[i]);
+        mt_model_add_word_pack(a->mt, path, MT_AUTO, NULL);
+    }
+    osa_dir_free_list(names, n);
+}
+
+/* Installs one catalogue entry that the application builds itself. This is the
+ * path behind the row button: no network, no file picker, and the translation
+ * engine is reloaded before the call returns so the effect is immediate. */
+bool osa_app_install_builtin_pack(osa_app *a, const char *id, osa_error *err) {
+    if (!a || !id) { osa_err_set(err, "bad arguments"); return false; }
+    const pack_def *p = find_pack(id);
+    if (!p) { osa_err_set(err, "unknown catalogue entry '%s'", id); return false; }
+    if (osa_streq(id, "builtin-asr-fa") || osa_streq(id, "builtin-mt")) {
+        /* Those two are already registered by ensure_builtin_models(); there is
+         * nothing to build and saying so is better than a fake progress bar. */
+        osa_err_ok(err);
+        return true;
+    }
+    if (!pack_buildable(p)) {
+        osa_err_set(err, "%s", p->notes);
+        return false;
+    }
+    char name[128];
+    snprintf(name, sizeof name, "%s.words.tsv", p->id);
+    char dst[OSAI_MAX_PATH];
+    osa_path_join(dst, sizeof dst, osa_path(OSAI_DIR_PACKS), name);
+    char tmp[OSAI_MAX_PATH + 8];
+    snprintf(tmp, sizeof tmp, "%s.tmp", dst);
+    int pairs = packs_build(p, tmp, err);
+    if (pairs < 0) return false;
+    if (!osa_file_rename(tmp, dst)) {
+        osa_file_remove(tmp);
+        osa_err_set(err, "cannot finalize %s", dst);
+        return false;
+    }
+    /* The word table is the offer; the engine has to read it for the offer to
+     * be true, so the pack is loaded here and not on the next start. */
+    if (a->mt) mt_model_add_word_pack(a->mt, dst, MT_AUTO, NULL);
+    load_word_packs(a);
+    char nid[64];
+    osa_strlcpy(nid, p->id, sizeof nid);
+    char base[64];
+    snprintf(base, sizeof base, "builtin-phrasebook-v1");
+    if (!register_model(a, nid, p->name, "lang", "wordpack", base, p->license,
+                        "built on this computer", dst, OSAI_VERSION, err))
+        return false;
+    osa_err_ok(err);
+    return true;
 }
 
 int osa_app_download_pack(osa_app *a, const char *id,

@@ -147,8 +147,14 @@ $(BUILD)/win/ft.a: $(FT_CORE_SRC)
 	@rm -f $@
 	ar rcs $@ $(BUILD)/win/ftobj/*.o
 
+# The version resource is generated from OSAI_VERSION before it is compiled, so
+# the file properties of the exe cannot drift away from the version the rest of
+# the build reports.
+$(SRC)/platform/win32/app_version.h: $(SRC)/core/osai_common.h tools/make_dist.py
+	$(PYTHON) tools/make_dist.py --rc-only
+
 $(BUILD)/win/res.o: $(SRC)/platform/win32/app.rc $(SRC)/platform/win32/app.manifest \
-                    $(SRC)/platform/win32/app.ico
+                    $(SRC)/platform/win32/app.ico $(SRC)/platform/win32/app_version.h
 	@mkdir -p $(dir $@)
 	$(ZIG) rc /fo $@ /I $(SRC)/platform/win32 $(SRC)/platform/win32/app.rc
 
@@ -173,7 +179,8 @@ snapshots: $(LINUX_BIN)
 	$(LINUX_BIN) --snapshots $(DIST)/screenshots
 
 .PHONY: dist
-dist: win
+dist: win $(LINUX_BIN)
+	$(PYTHON) tools/export_models.py
 	$(PYTHON) tools/make_dist.py
 
 .PHONY: bootstrap
