@@ -1133,19 +1133,10 @@ static void draw_models(shell_state *s, ui_context *u, osa_rect body) {
         } else if (!osa_http_has_tls()) {
             shell_set_message(s, true, "%s", kl(s, "models.notls"));
         } else {
-            osa_error err;
-            osa_strlcpy(s->dl_pack, packs[clicked].id, sizeof s->dl_pack);
-            s->downloading = true;
-            s->dl_progress = 0;
-            int rc = osa_app_download_pack(s->app, packs[clicked].id, NULL, NULL, NULL, &err);
-            s->downloading = false;
-            s->dl_pack[0] = 0;
-            free(s->models_json);
-            s->models_json = NULL;
-            if (rc == 0)
-                shell_set_message(s, false, "%s", kl(s, "msg.ok"));
-            else
-                shell_set_message(s, true, "%s: %s", kl(s, "msg.failed"), err.msg);
+            /* Non-blocking: the transfer runs on a worker thread and the row
+             * shows its progress; shell_download_tick() reports the outcome. */
+            if (!s->dl && !shell_download_start(s, packs[clicked].id))
+                shell_set_message(s, true, "%s", kl(s, "msg.failed"));
         }
     }
 

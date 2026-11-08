@@ -96,6 +96,7 @@ typedef struct shell_state {
     double        dl_progress;           /* 0..1 while downloading      */
     char          dl_pack[64];
     bool          downloading;
+    struct dl_job *dl;                   /* background fetch, or NULL   */
 
     /* training */
     int           train_epochs;
@@ -165,6 +166,11 @@ bool shell_load_waveform(shell_state *s, const char *path);
 /* Runs the transcribe (+translate) action for the current file. Used by the
  * button and by the command-line/snapshot driver. */
 bool shell_run_transcribe(shell_state *s);
+
+/* Downloads a catalogue pack on a worker thread. The window keeps painting; the
+ * file is installed on the UI thread by shell_download_tick() once it arrives. */
+bool shell_download_start(shell_state *s, const char *id);
+void shell_download_tick(shell_state *s);
 
 /* Runs the translate action for the Translate screen's current input. */
 void shell_run_translate(shell_state *s);

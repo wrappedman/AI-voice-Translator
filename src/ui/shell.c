@@ -1001,10 +1001,78 @@ static void draw_transcribe(shell_state *s, ui_context *u, osa_rect body) {
 
 /* ---- public draw entry point -------------------------------------- */
 
+typedef struct dl_job {
+    char          id[64];
+    char          file[OSAI_MAX_PATH];
+    volatile int  permille;
+    volatile int  cancel;
+    volatile int  done;
+    int           rc;
+    osa_error     err;
+    osa_thread    th;
+} dl_job;
+
+/* Runs on the worker thread: network and hashing only. It never touches the
+ * application database, which the UI thread keeps using. */
+static void dl_progress_cb(int64_t got, int64_t total, void *ud) {
+    dl_job *j = (dl_job *)ud;
+    if (total > 0) j->permille = (int)((got * 1000) / total);
+}
+
+static void dl_worker(void *ud) {
+    dl_job *j = (dl_job *)ud;
+    j->rc = osa_app_fetch_pack(j->id, dl_progress_cb, j, &j->cancel,
+                               j->file, sizeof j->file, &j->err);
+    j->done = 1;
+}
+
+bool shell_download_start(shell_state *s, const char *id) {
+    if (!s || !id || s->dl) return false;
+    dl_job *j = (dl_job *)calloc(1, sizeof *j);
+    if (!j) return false;
+    osa_strlcpy(j->id, id, sizeof j->id);
+    if (!osa_thread_start(&j->th, dl_worker, j)) { free(j); return false; }
+    s->dl = j;
+    s->downloading = true;
+    s->dl_progress = 0;
+    osa_strlcpy(s->dl_pack, id, sizeof s->dl_pack);
+    return true;
+}
+
+void shell_download_tick(shell_state *s) {
+    dl_job *j = s ? s->dl : NULL;
+    if (!j) return;
+    s->dl_progress = j->permille / 1000.0;
+    if (!j->done) return;
+    osa_thread_join(&j->th);
+    s->dl = NULL;
+    s->downloading = false;
+    s->dl_pack[0] = 0;
+    s->dl_progress = 0;
+    free(s->models_json);
+    s->models_json = NULL;
+    if (j->rc == 0) {
+        osa_error ierr;
+        if (osa_app_install_pack_file(s->app, j->file, &ierr)) {
+            osa_file_remove(j->file);
+            s->models_tab = 0;               /* show it in the installed list */
+            shell_set_message(s, false, "%s", tt(s->lang, "msg.ok"));
+        } else {
+            shell_set_message(s, true, "%s: %s", tt(s->lang, "msg.failed"), ierr.msg);
+        }
+    } else if (j->rc == -2) {
+        shell_set_message(s, true, "%s", tt(s->lang, "msg.failed"));
+    } else {
+        shell_set_message(s, true, "%s: %s", tt(s->lang, "msg.failed"), j->err.msg);
+    }
+    free(j);
+}
+
 void shell_draw(shell_state *s, osa_canvas *c, ui_context *u, const ui_input *in) {
     if (!s || !c || !u) return;
     s->frame++;
     shell_message_tick(s);
+    shell_download_tick(s);
     ui_frame_begin(u, c, in);
 
     ui_set_theme(u, s->dark);

@@ -189,6 +189,12 @@ int  osa_app_packs(osa_app *app, osa_pack_info *out, int max);
  * the recorded SHA-256 and registers it as an installed model. Blocking; the
  * caller reports progress through `progress`. Returns 0 on success, -1 on
  * failure (err has the reason), -2 when cancelled. */
+/* Thread-safe half of a download: fetches and verifies only. The result is a
+ * file in the downloads folder, to be installed on the UI thread. */
+int  osa_app_fetch_pack(const char *id,
+                        void (*progress)(int64_t got, int64_t total, void *ud), void *ud,
+                        volatile int *cancel, char *file_out, size_t cap, osa_error *err);
+
 int  osa_app_download_pack(osa_app *app, const char *id,
                            void (*progress)(int64_t got, int64_t total, void *ud), void *ud,
                            volatile int *cancel, osa_error *err);

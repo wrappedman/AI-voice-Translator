@@ -1032,10 +1032,14 @@ bool osa_app_install_builtin_pack(osa_app *a, const char *id, osa_error *err) {
     return true;
 }
 
-int osa_app_download_pack(osa_app *a, const char *id,
-                          void (*progress)(int64_t got, int64_t total, void *ud), void *ud,
-                          volatile int *cancel, osa_error *err) {
-    if (!a || !id) { osa_err_set(err, "bad arguments"); return -1; }
+/* Fetches one catalogue entry into <downloads>/<id>.pack and verifies its
+ * SHA-256. It never touches the application state, so it can run on a worker
+ * thread while the window keeps painting: the caller installs the file on the
+ * UI thread with osa_app_install_pack_file(). Returns 0, -1 (err) or -2. */
+int osa_app_fetch_pack(const char *id,
+                       void (*progress)(int64_t got, int64_t total, void *ud), void *ud,
+                       volatile int *cancel, char *file_out, size_t cap, osa_error *err) {
+    if (!id || !file_out || !cap) { osa_err_set(err, "bad arguments"); return -1; }
     const pack_def *p = find_pack(id);
     if (!p) { osa_err_set(err, "unknown catalogue entry '%s'", id); return -1; }
     if (!p->url[0]) {
@@ -1055,8 +1059,20 @@ int osa_app_download_pack(osa_app *a, const char *id,
         osa_err_set(err, "دانلود خراب است (هش مطابقت ندارد)");
         return -1;
     }
-    if (!osa_app_install_pack_file(a, dst, err)) return -1;
-    osa_file_remove(dst);
+    osa_strlcpy(file_out, dst, cap);
+    osa_err_ok(err);
+    return 0;
+}
+
+int osa_app_download_pack(osa_app *a, const char *id,
+                          void (*progress)(int64_t got, int64_t total, void *ud), void *ud,
+                          volatile int *cancel, osa_error *err) {
+    if (!a || !id) { osa_err_set(err, "bad arguments"); return -1; }
+    char file[OSAI_MAX_PATH];
+    int rc = osa_app_fetch_pack(id, progress, ud, cancel, file, sizeof file, err);
+    if (rc != 0) return rc;
+    if (!osa_app_install_pack_file(a, file, err)) return -1;
+    osa_file_remove(file);
     return 0;
 }
 
