@@ -1,218 +1,136 @@
 # OpenSpeech AI
 
-**Offline Persian ⇄ English speech recognition and translation for Windows.**
+**Offline multilingual speech recognition and translation for Windows — no bundled models.**
 
-Download one file, double-click it, talk. No installer, no account, no network
-call at any point — not at start-up, not while transcribing, not for updates.
+version 1.2.0 · Windows 10 1903+ / 11 x64 · GPL-3.0-or-later
+
+خلاصهٔ فارسی: برنامه دیگر هیچ مدل کوچک یا ازپیش‌نصب‌شده همراه ندارد. در بخش «مدل‌ها»
+یک مدل گفتار Whisper، یک مدل ترجمه Qwen GGUF و مدل تشخیص زبان fastText را دانلود و
+**فعال** می‌کنید. تا وقتی هر سه دسته مدل فعال نداشته باشند، رونویسی، ترجمه و ترجمهٔ
+زنده غیرفعال می‌مانند. زبان‌های قابل انتخاب از خود مدل فعال خوانده می‌شوند، نه یک
+فهرست ثابت فارسی/انگلیسی. آموزش درون‌برنامه‌ای برای این مدل‌های کوانتیزه پشتیبانی
+نمی‌شود و ارزیابی بدون دادهٔ برچسب‌خورده عدد ساختگی نشان نمی‌دهد.
 
 ```
- dist/bin/OpenSpeechAI.exe          31 MB, x86-64, static, GUI subsystem
- dist/OpenSpeechAI-1.1.0-win64.zip  the same binary, packaged
- dist/checksums-1.1.0.txt           SHA-256 of both
+dist/bin/OpenSpeechAI.exe          GUI executable, x86-64, static
+dist/bin/OpenSpeechWorker.exe      isolated neural inference worker
+dist/OpenSpeechAI-1.2.0-win64.zip  exe + worker + fonts/catalog/docs (no weights)
+dist/checksums-1.2.0.txt           SHA-256 of exe, worker and zip
 ```
 
-![Transcribe screen](dist/screenshots/screen-00-transcribe.png)
+![Fresh-install Models screen](dist/screenshots/screen-04-models.png)
 
 ---
 
-## What it does
+## What changed in 1.2.0
 
-| | |
+| Area | Behaviour |
 |---|---|
-| **Transcribe** | Load a WAV/MP3/M4A/FLAC/OGG file and get the Persian (or English) text, with confidence, duration and processing time. A correction box stores the fixed transcript for the next training run, and says that the current model does not change yet. |
-| **Translate** | Bidirectional Persian ⇄ English, using a local phrasebook with proper normalisation of Arabic/Persian character variants, optional transliteration and Persian/Arabic digit handling. |
-| **Live** | Microphone capture with a level meter, a session timer and streaming partial results; the target language and the running translation update as you speak. |
-| **History** | Every transcript is stored locally in SQLite with its audio, and can be searched, replayed, copied or deleted. |
-| **Models** | Two tabs: what is installed (activate / roll back, never deleted) and the offline catalogue of 18 packs and models with licence, size and one working action each. Twelve are **built on this computer and installed with one press** (دریافت) — no network, no file picker: word packs extend the translation lexicon, and four of them are written as real `.osam` / `.osmt` model files you can move to another machine. The other four are Whisper weights, downloaded from a fixed URL. Nothing in the list says "go and find a file yourself". Import `.osam` / `.osmt` files here too. When `ggml-tiny.bin` (Whisper tiny) is in the models folder, it is the default recogniser: it is registered and activated the first time it is seen, and the choice you make afterwards is kept across restarts. |
-| **Training** | Pick the training data **inside the app**: four bundled sets (Persian words, Persian sentences, English sentences, both languages) are generated on press as ordinary `audio<TAB>text` tables with real WAV clips, or choose a file of your own. The run saves a **new** model version, activates it, and leaves the previous one installed for rollback. |
-| **Evaluation** | WER and CER measured in the app, per sentence, with each reference and hypothesis shown side by side. A language the active model has no lexicon for is reported as *not measured*, not as an error rate of 100%. |
-| **Bilingual UI** | The whole interface is available in Persian (default, right-to-left) and English, with correct bidirectional text rendering, mirrored layouts and Persian digits. |
+| **Crash on audio selection** | Selecting a file only loads/decodes audio on a background job. The Windows M4A/AAC path was rewritten around `MFCreateSourceReaderFromURL` with balanced COM/MF lifetime and MTA; it no longer installs a custom `IStream` vtable. |
+| **No bundled models** | Fresh install has zero installed/active models. The old exemplar/phrasebook containers and tiny/base Whisper entries are not shipped or auto-installed. |
+| **Verified downloads** | Catalog entries are pinned by exact byte size and SHA-256. Downloads run off the UI thread, support resume/cancel, and install **inactive**. Activation is a separate explicit action. |
+| **One active model per category** | Speech (`asr`), translation (`mt`) and language ID (`lang`) each have at most one active row, enforced by a SQLite partial unique index and an activation transaction. The Models/About screens label the active model in each category. |
+| **Gating** | Transcribe, translate and live require active ASR + MT + LID. File selection/import are also gated. The sidebar/chrome show what is missing. |
+| **Model-derived languages** | Whisper language choices come from the loaded model. Translation targets are the supported Qwen2.5 language set; auto-detect uses the active fastText LID model. |
+| **Live translation** | Microphone partials use the same active models through a no-history API. Stop closes the mic and reaps the worker; shutdown joins safely. |
+| **Honest training/evaluation** | Fine-tuning quantized inference artifacts is unsupported and says so. Evaluation reports zero samples / no labelled data instead of synthetic WER/CER. |
+| **Long text / Unicode** | 64 KiB text buffers, strict UTF-8/surrogate JSON decoding, chunked MT with overflow/incomplete-output failure, history stores full translation/duration. |
 
-## Screenshots
+## Downloadable models
 
-| | |
-|---|---|
-| ![History](dist/screenshots/screen-03-history.png) | ![Models](dist/screenshots/screen-04b-models-download.png) |
-| ![Settings](dist/screenshots/screen-07-settings.png) | ![Light theme](dist/screenshots/screen-00b-transcribe-en-light.png) |
+| Category | Model | Size | Licence |
+|---|---|---:|---|
+| Speech | Whisper Medium Q5_0 (`ggml-medium-q5_0.bin`) | 539 MB | MIT |
+| Speech | Whisper Large v3 Turbo Q5_0 (`ggml-large-v3-turbo-q5_0.bin`) | 574 MB | MIT |
+| Translation | Qwen2.5 3B Instruct Q4_K_M (`.gguf`) | 2.10 GB | Apache-2.0 |
+| Language ID | fastText LID 176 full (`.bin`, not `.ftz`) | 131 MB | CC-BY-SA-3.0 |
 
-All images in `dist/screenshots/` are rendered by the application's own drawing
-code and are regenerated by `make snapshots`; CI fails if they drift.
+Exact pinned URLs/hashes live in `src/app/osai_app.c` and `tools/catalog/catalog.json`.
+Nothing is downloaded automatically. Inference is offline after installation.
 
----
+## Running
 
-## Running it
-
-Requirements: Windows 10 or 11, 64-bit. Nothing else — the CRT and the C++
-runtime are linked in.
+Requirements: Windows 10 version 1903 or newer / Windows 11, 64-bit. 8 GB RAM
+minimum recommended for Qwen2.5 3B; several GB free disk for chosen models.
+Internet is needed only when you press Download.
 
 ```
 OpenSpeechAI.exe
 ```
 
-On first start it creates
+Keep `OpenSpeechWorker.exe` next to `OpenSpeechAI.exe`, plus `assets/fonts` and
+`assets/catalog.json`. Data is created under `%LOCALAPPDATA%\OpenSpeechAI`:
 
 ```
-%LOCALAPPDATA%\OpenSpeechAI\
-    Models\      builtin + imported models
-    Audio\       a copy of each transcribed file (optional)
-    openspeech.db  transcripts, translations, model cards
-    Logs\        timings and error codes only — never speech or text
-    settings.ini
+Models\        downloaded/imported verified models
+Audio\         copies of transcribed files
+Database\      SQLite transcripts/translations/model cards
+Logs\          fault/timing logs (no speech text by default)
+settings.ini
 ```
 
-If the folder is not writable the app says so instead of failing silently.
+First run: open **Models**, download one ASR + one MT + the LID model, then
+activate each. The app remains gated until all three are active.
 
-### The folder is self-contained
+## Screenshots
 
-`dist/` holds everything the program opens: the exe, `assets/fonts` (Vazirmatn),
-`assets/catalog.json` and `models/` with the two models the build ships. Copy the
-folder and it runs on a machine that has never seen the program — the first start
-copies the shipped models into the data folder above and then never writes next
-to the exe again. If a file is missing the program names the path it looked in
-instead of opening an empty window, and a fault leaves `last-fault.log` in the
-data folder with the address and the frame list, so a crash report is actionable.
+| | |
+|---|---|
+| ![Models download](dist/screenshots/screen-04b-models-download.png) | ![History](dist/screenshots/screen-03-history.png) |
+| ![Settings](dist/screenshots/screen-07-settings.png) | ![English light](dist/screenshots/screen-00b-transcribe-en-light.png) |
 
----
-
-## How it works
-
-Four layers, no framework:
-
-```
-  ui/          canvas, text shaping (HarfBuzz + FreeType), widgets, screens
-  app/         Local Application API: transcribe, translate, history, models
-  engines/     ASR (exemplar DTW), MT (phrasebook), MLP
-  core/        arena, JSON, SHA-256, SQLite, audio, TTS, platform
-```
-
-The UI is **drawn, not compiled into widgets**: one canvas, one font stack, and
-an immediate-mode widget kit. That is why the same code produces the Windows
-window and the PNG snapshots above, and why the layout mirrors correctly for
-right-to-left without a second set of screens.
-
-Text goes through HarfBuzz for shaping, so Persian letter joining and
-bidirectional runs are correct rather than "good enough"; numbers are localised
-to Persian digits in the Persian interface.
-
-See `docs/ARCHITECTURE.md` for the layer contracts and `docs/MODEL_FORMAT.md`
-for the exact byte layout of the model containers.
-
-### Measured accuracy
-
-Five sentences per language, produced with the bundled TTS and transcribed
-through the same public entry point the application uses
-(`osa_app_evaluate`, which the Evaluation screen calls). Each language is
-measured with its own builtin model active:
-
-| | WER | CER |
-|---|---|---|
-| Persian (`builtin-asr-fa`) | **0.040** | 0.035 |
-| English (`builtin-asr-en`) | **0.050** | 0.029 |
-
-Four of the five Persian sentences and four of the five English ones are exact.
-Both remaining errors are single short function words ("امروز هوا شما قشنگ
-است" for "خیلی"; "select a audio file" for "the"). Reproduce with
-`./build/openspeech --selftest`, or in the app on the Evaluation screen.
-
-These numbers only mean something for this vocabulary: the sentences are the
-ones the builtin lexicon covers. On unrestricted speech the recogniser simply
-does not know the words — see the limitations below.
-
-This is an **exemplar-matching** recogniser, not a trained acoustic model: it
-recognises the vocabulary it ships with and passes unknown words through. It is
-honest about that in the UI and in the model card. Translation is a phrasebook
-with longest-match-first semantics, likewise limited and likewise documented.
-
-If you need open-vocabulary recognition, the model format is designed to be
-replaced — `docs/MODEL_FORMAT.md` describes everything needed to write a
-compatible container.
-
----
+Images are rendered by the application's own drawing code from a fresh empty
+install (`make snapshots`). They show disabled/gated states, not fake transcripts.
 
 ## Building
 
-The Windows binary is cross-compiled from Linux with `zig cc`; there is no
-Visual Studio requirement and no NuGet.
-
-```sh
-make bootstrap          # fetch pinned zig 0.17.1 (one time, ~40 MB)
-make win                # dist/bin/OpenSpeechAI.exe
-make dist               # + shipped models, release zip and SHA-256 sums
+```
+make bootstrap      # fetch zig cross toolchain
+make linux -j2      # headless host + worker
+make tests          # regression suite + fresh-install selftest
+make snapshots      # regenerate dist/screenshots
+make win -j2        # cross-build OpenSpeechAI.exe + OpenSpeechWorker.exe
+make dist           # catalog check, package zip, verify PE headers
 ```
 
-`make dist` also runs `tools/export_models.py`, which asks the headless build for
-the two containers the program ships and copies them into `dist/models/`. The
-zip is not considered shippable if any file the program opens at run time is
-missing from the layout (`tools/make_dist.py` fails the build instead of shipping
-a folder that only works after some manual copying).
-
-Host-side development and tests need only gcc:
-
-```sh
-make linux              # portable core + headless host
-make tests              # 237 assertions, no display, no network
-make snapshots          # re-render dist/screenshots/
-```
-
-`make tests` is the interesting one: it runs the engine, the database, the app
-API and the snapshot renderer, and it is the same suite CI gates on.
-
-### Repository layout
+Optional real-model smoke test (user-supplied official artifacts):
 
 ```
-src/core/        portable runtime: arena, JSON, crypto, SQLite, audio, TTS
-src/engines/     asr, mt, nn
-src/app/         Local Application API
-src/ui/          canvas, text, bidi, ui_kit, shell, screens
-src/platform/    mic capture, Win32 host, FreeType/HarfBuzz glue
-src/third_party/ vendored, pinned: sqlite, harfbuzz, freetype, stb, dr_libs
-tools/           bootstrap, packaging, model catalogue, PE verifier
-tests/           unit + integration suite
-dist/            the shipped binary, its zip, checksums, screenshots
+OSAI_TEST_ASR=/path/ggml-medium-q5_0.bin \
+OSAI_TEST_MT=/path/qwen2.5-3b-instruct-q4_k_m.gguf \
+OSAI_TEST_LID=/path/lid.176.bin \
+OSAI_TEST_WAV=/path/speech.wav \
+make tests
 ```
 
----
+Without those variables the suite validates gating/catalog/store/Unicode/audio/
+worker isolation and explicitly skips real inference.
 
-## Privacy
+## Validation status
 
-- No telemetry. No crash reporting. No update check.
-- Logs record **timings, durations and error codes** — never audio, never text.
-- "Keep a copy of the audio" and "no audio content in logs" are both visible
-  switches in Settings, and both default to the private option.
-- The binary links only against system DLLs; there is no HTTP client in the
-  application path at all.
+- Linux: `make tests` and `make snapshots` pass in this environment.
+- Windows: cross-build succeeds; `tools/verify_exe.py` checks PE subsystem,
+  manifests and load-bearing strings for both executables.
+- **Not performed here:** native Windows microphone/Media Foundation runtime,
+  real-weight download/inference end-to-end. The MF crash fix is compiled and
+  statically checked, but needs a Windows machine with the chosen models to
+  confirm the original `mfreadwrite.dll` access violation is gone.
 
-## Limitations
+## Architecture
 
-Stated plainly, because the screenshots look more capable than the engine is:
+```
+ui/          drawn canvas, HarfBuzz/FreeType text, immediate-mode widgets
+app/         local API: gating, model lifecycle, history, downloads
+worker/      isolated llama.cpp MT + fastText LID process (JSON lines)
+engines/     whisper.cpp bridge (ASR), legacy helpers retained but not bundled
+core/        SQLite store, audio decoders, SHA-256, HTTP, process wrapper
+platform/    Win32 host, Media Foundation URL reader, microphone
+```
 
-- **The vocabulary is closed.** The builtin Persian model knows 50 words, the
-  English one 40 (the complete list is `src/core/lexicon.c`). Speech outside
-  that set comes out as nearby known words, not as the words you said. Importing a `.osam` trained on more data lifts this;
-  `docs/MODEL_FORMAT.md` describes the container.
-- **Templates are synthetic.** They are generated by the bundled formant
-  synthesiser, so the recogniser is strongest on clean, close-miked speech and
-  on the phrases the demo uses. Accents, noise and overlapping speakers degrade
-  it quickly.
-- **Translation is a phrasebook,** not a machine-translation model. It handles
-  the builtin phrases, common words and number/time expressions; it glosses
-  word by word beyond that and says so.
-- **Training adapts, it does not learn a language.** A run adds exemplars
-  (whole-word recordings, cut proportionally from each clip when the dataset is
-  `audio<TAB>text`) to a new model version and activates it. It improves the
-  recogniser for the words and the speaker you give it; it will not grow the
-  vocabulary beyond the words in your dataset.
-- **Only one speech model is active at a time.** The bundled model carries one
-  language's lexicon. Transcribing English with the Persian model active now
-  fails with an explanation instead of returning confident Persian words; switch
-  to the English model on the Models screen (or import one).
-- **The Windows binary is cross-compiled and not smoke-tested on Windows here.**
-  CI verifies the PE header, subsystem, machine type and embedded resources,
-  and the engine/UI logic is exercised by the Linux test suite and snapshot
-  renderer, but nobody has double-clicked this exact binary.
+See `docs/ARCHITECTURE.md` and `docs/MODEL_FORMAT.md`.
 
 ## Licence
 
-GPL-3.0-or-later. Bundled fonts: Vazirmatn, SIL OFL 1.1 (see
-`src/ui/assets/Vazirmatn-OFL.txt`). Vendored third-party code keeps its own licence
-alongside it in `src/third_party/`.
+Application: GPL-3.0-or-later. Fonts: Vazirmatn (SIL OFL 1.1). Vendored engine
+sources: llama.cpp (MIT), fastText (MIT), nlohmann/json (MIT). Downloaded model
+weights carry their own licences, shown in the Models screen and catalog.

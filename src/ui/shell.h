@@ -56,10 +56,10 @@ typedef struct shell_state {
 
     /* transcribe screen */
     char          audio_path[OSAI_MAX_PATH];
-    char          transcript[8192];
-    char          translation[8192];
+    char          transcript[OSAI_MAX_TEXT];
+    char          translation[OSAI_MAX_TEXT];
     char          phonetic[4096];        /* آوانویسی of the translation       */
-    char          correction[4096];      /* edited transcript awaiting review  */
+    char          correction[OSAI_MAX_TEXT];      /* edited transcript awaiting review  */
     char          detected_lang[8];
     char          transcript_id[40];
     float         transcript_conf;
@@ -96,7 +96,10 @@ typedef struct shell_state {
     double        dl_progress;           /* 0..1 while downloading      */
     char          dl_pack[64];
     bool          downloading;
-    struct dl_job *dl;                   /* background fetch, or NULL   */
+    struct dl_job *dl;                   /* legacy alias: same as job for downloads */
+    struct shell_job *job;               /* one cancellable background action */
+    bool          restoring;
+    bool          models_ready;
 
     /* training */
     int           train_epochs;
@@ -135,9 +138,9 @@ typedef struct shell_state {
     mt_style      style;
 
     /* translate screen buffer */
-    char          tr_in[4096];
-    char          tr_out[4096];
-    char          tr_phonetic[2048];
+    char          tr_in[OSAI_MAX_TEXT];
+    char          tr_out[OSAI_MAX_TEXT];
+    char          tr_phonetic[4096];
     char          tr_out_lang[8];
     double        tr_score;
 
@@ -166,9 +169,14 @@ bool shell_load_waveform(shell_state *s, const char *path);
 /* Runs the transcribe (+translate) action for the current file. Used by the
  * button and by the command-line/snapshot driver. */
 bool shell_run_transcribe(shell_state *s);
+bool shell_select_audio(shell_state *s, const char *path);
+bool shell_activate_model(shell_state *s, const char *id);
+bool shell_import_model(shell_state *s, const char *path);
+void shell_job_tick(shell_state *s);
+void shell_cancel_jobs(shell_state *s);
+void shell_live_shutdown(shell_state *s);
 
-/* Downloads a catalogue pack on a worker thread. The window keeps painting; the
- * file is installed on the UI thread by shell_download_tick() once it arrives. */
+/* Downloads, verifies and installs on a worker; never activates automatically. */
 bool shell_download_start(shell_state *s, const char *id);
 void shell_download_tick(shell_state *s);
 

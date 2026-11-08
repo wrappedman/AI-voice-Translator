@@ -139,32 +139,22 @@ static void host_blit(host *h) {
 static void finish_pick_audio(host *h, const wchar_t *file) {
     char path[OSAI_MAX_PATH];
     if (!WideCharToMultiByte(CP_UTF8, 0, file, -1, path, sizeof path, NULL, NULL)) return;
-    osa_strlcpy(h->shell.audio_path, path, sizeof h->shell.audio_path);
-    shell_load_waveform(&h->shell, h->shell.audio_path);
-    shell_run_transcribe(&h->shell);
+    /* Selection is not transcription. Decode the preview off the UI thread;
+     * inference starts only when the user presses Transcribe. */
+    shell_select_audio(&h->shell,path);
 }
 
 static void finish_pick_model(host *h, const wchar_t *file) {
     char path[OSAI_MAX_PATH];
     if (!WideCharToMultiByte(CP_UTF8, 0, file, -1, path, sizeof path, NULL, NULL)) return;
-    osa_error err;
-    if (osa_app_install_pack_file(h->app, path, &err)) {
-        free(h->shell.models_json);
-        h->shell.models_json = osa_app_models_json(h->app, NULL);
-        shell_set_message(&h->shell, false, "%s", tt(h->shell.lang, "msg.ok"));
-    } else {
-        shell_set_message(&h->shell, true, "%s: %s", tt(h->shell.lang, "msg.failed"), err.msg);
-    }
+    if(!shell_import_model(&h->shell,path))shell_set_message(&h->shell,true,"%s",tt(h->shell.lang,"msg.failed"));
 }
 
 /* Training data: either a tab-separated "audio<TAB>text" file or a folder of
  * recordings. The picker offers both, so a user with a folder of clips is not
  * forced to assemble a manifest by hand. */
 static void finish_pick_dataset(host *h, const wchar_t *file) {
-    char path[OSAI_MAX_PATH];
-    if (!WideCharToMultiByte(CP_UTF8, 0, file, -1, path, sizeof path, NULL, NULL)) return;
-    osa_strlcpy(h->shell.dataset_path, path, sizeof h->shell.dataset_path);
-    shell_set_message(&h->shell, false, "%s", tt(h->shell.lang, "training.datasetset"));
+    (void)file;shell_set_message(&h->shell,true,"%s",tt(h->shell.lang,"training.unsupported"));
 }
 
 /* The transcript export: the user picks where to write it. */
@@ -225,11 +215,9 @@ static bool start_dialog(host *h, int kind) {
         h->ofn.lpstrTitle = L"انتخاب فایل صوتی / Choose an audio file";
     } else {
         h->ofn.lpstrFilter =
-            L"Language packs and models (*.pack;*.osam;*.osmt;*.tsv)\0*.pack;*.osam;*.osmt;*.tsv\0"
-            L"OpenSpeech models (*.osam;*.osmt)\0*.osam;*.osmt\0"
-            L"Language pack (*.pack;*.tsv)\0*.pack;*.tsv\0"
+            L"Verified models (*.gguf;*.bin)\0*.gguf;*.bin\0"
             L"All files\0*.*\0";
-        h->ofn.lpstrTitle = L"نصب بسته زبان یا مدل / Install a pack or model";
+        h->ofn.lpstrTitle = L"نصب مدل تأییدشده / Install a verified model";
     }
     BOOL ok = GetOpenFileNameW(&h->ofn);
     /* Read the result *after* the dialog has closed, and clear the flag before

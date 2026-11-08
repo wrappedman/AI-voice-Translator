@@ -96,8 +96,42 @@ LINUX_OBJ := $(patsubst %.c,$(BUILD)/lin/%.o,$(LIB_SRC)) \
              $(BUILD)/lin/sqlite3.o $(BUILD)/lin/stb_vorbis.o \
              $(BUILD)/lin/ft.a $(BUILD)/lin/hb.o $(LINUX_WSP_OBJ)
 
+# The neural MT / language worker is deliberately a separate executable. Its
+# pinned ggml version must not collide with Whisper's ggml in the GUI process.
+LLAMA_DIR := $(SRC)/third_party/llama
+FTXT_DIR  := $(SRC)/third_party/fasttext
+LLAMA_C   := $(wildcard $(LLAMA_DIR)/ggml/src/*.c) $(wildcard $(LLAMA_DIR)/ggml/src/ggml-cpu/*.c)
+LLAMA_CPP := $(wildcard $(LLAMA_DIR)/src/*.cpp) $(wildcard $(LLAMA_DIR)/ggml/src/*.cpp) \
+             $(filter-out $(LLAMA_DIR)/ggml/src/ggml-cpu/arch/x82%,$(wildcard $(LLAMA_DIR)/ggml/src/ggml-cpu/*.cpp))
+LLAMA_INC := -I$(LLAMA_DIR)/include -I$(LLAMA_DIR)/ggml/include -I$(LLAMA_DIR)/ggml/src \
+             -I$(LLAMA_DIR)/ggml/src/ggml-cpu -I$(LLAMA_DIR)/src -I$(SRC)/third_party \
+             -I$(FTXT_DIR)/src
+LLAMA_DEF := -DGGML_VERSION=\"b6018\" -DGGML_COMMIT=\"bda62193\" -D_GNU_SOURCE -DNDEBUG -DGGML_USE_CPU -DGGML_CPU_GENERIC -DGGML_USE_LLAMAFILE=0
+FTXT_SRC  := $(wildcard $(FTXT_DIR)/src/*.cc)
+WORKER_SRC := $(SRC)/worker/worker.cpp
+WORKER_LINUX := $(BUILD)/OpenSpeechWorker
+WORKER_WIN := $(DIST)/bin/OpenSpeechWorker.exe
+WORKER_OBJ := $(patsubst %.c,$(BUILD)/worker-lin/%.c.o,$(LLAMA_C)) \
+              $(patsubst %.cpp,$(BUILD)/worker-lin/%.cpp.o,$(LLAMA_CPP)) \
+              $(patsubst %.cc,$(BUILD)/worker-lin/%.cc.o,$(FTXT_SRC)) \
+              $(BUILD)/worker-lin/$(WORKER_SRC).o
+
+.PHONY: worker
+worker: $(WORKER_LINUX)
+$(BUILD)/worker-lin/%.c.o: %.c
+	@mkdir -p $(dir $@)
+	$(CC) -std=c11 -O2 -pthread $(LLAMA_DEF) $(LLAMA_INC) -c $< -o $@
+$(BUILD)/worker-lin/%.cpp.o: %.cpp
+	@mkdir -p $(dir $@)
+	$(CXX) -std=c++17 -O2 -pthread $(LLAMA_DEF) $(LLAMA_INC) -c $< -o $@
+$(BUILD)/worker-lin/%.cc.o: %.cc
+	@mkdir -p $(dir $@)
+	$(CXX) -std=c++17 -O2 -pthread $(LLAMA_INC) -c $< -o $@
+$(WORKER_LINUX): $(WORKER_OBJ)
+	$(CXX) -o $@ $^ -lm -lpthread -ldl
+
 .PHONY: linux
-linux: $(LINUX_BIN)
+linux: $(LINUX_BIN) $(WORKER_LINUX)
 
 $(BUILD)/lin/%.o: %.c
 	@mkdir -p $(dir $@)
@@ -163,8 +197,27 @@ WIN_LIBS := -lws2_32 -lshlwapi -lshell32 -lole32 -loleaut32 -lgdi32 -luser32 \
             -ladvapi32 -luuid -lcomdlg32 -lversion -lbcrypt -lwinmm -lpsapi \
             -lwinhttp -lkernel32
 
+WORKER_WIN_OBJ := $(patsubst %.c,$(BUILD)/worker-win/%.c.o,$(LLAMA_C)) \
+                  $(patsubst %.cpp,$(BUILD)/worker-win/%.cpp.o,$(LLAMA_CPP)) \
+                  $(patsubst %.cc,$(BUILD)/worker-win/%.cc.o,$(FTXT_SRC)) \
+                  $(BUILD)/worker-win/$(WORKER_SRC).o
+$(BUILD)/worker-win/%.c.o: %.c
+	@mkdir -p $(dir $@)
+	$(WIN_CC) -std=c11 $(LLAMA_DEF) $(LLAMA_INC) -c $< -o $@
+$(BUILD)/worker-win/%.cpp.o: %.cpp
+	@mkdir -p $(dir $@)
+	$(WIN_CXX) -std=c++17 $(LLAMA_DEF) $(LLAMA_INC) -c $< -o $@
+$(BUILD)/worker-win/%.cc.o: %.cc
+	@mkdir -p $(dir $@)
+	$(WIN_CXX) -std=c++17 $(LLAMA_INC) -c $< -o $@
+$(BUILD)/worker-win/res.o: $(SRC)/platform/win32/worker.rc $(SRC)/platform/win32/worker.manifest
+	@mkdir -p $(dir $@)
+	$(ZIG) rc /fo $@ /I $(SRC)/platform/win32 $(SRC)/platform/win32/worker.rc
+$(WORKER_WIN): $(WORKER_WIN_OBJ) $(BUILD)/worker-win/res.o
+	@mkdir -p $(dir $@)
+	$(WIN_CXX) -static -o $@ $^ -lm -lpthread
 .PHONY: win
-win: $(WIN_BIN)
+win: $(WIN_BIN) $(WORKER_WIN)
 
 $(BUILD)/win/%.o: %.c
 	@mkdir -p $(dir $@)
@@ -223,7 +276,7 @@ $(WIN_BIN): $(WIN_OBJ)
 #  Tests, snapshots, distribution
 # ===========================================================================
 .PHONY: tests
-tests: unittest $(LINUX_BIN)
+tests: unittest $(LINUX_BIN) $(WORKER_LINUX)
 	@echo ""
 	@echo "== headless self-test =="
 	$(LINUX_BIN) --selftest
@@ -235,8 +288,10 @@ snapshots: $(LINUX_BIN)
 
 .PHONY: dist
 dist: win $(LINUX_BIN)
-	$(PYTHON) tools/export_models.py
+	$(PYTHON) tools/catalog/check.py
 	$(PYTHON) tools/make_dist.py
+	$(PYTHON) tools/verify_exe.py $(WIN_BIN)
+	$(PYTHON) tools/verify_exe.py $(WORKER_WIN) --console
 
 .PHONY: bootstrap
 bootstrap:

@@ -63,6 +63,7 @@ static const char *SCHEMA =
     "CREATE TABLE IF NOT EXISTS SystemLogs("
     "  id INTEGER PRIMARY KEY AUTOINCREMENT, level TEXT, tag TEXT, msg TEXT, created_at TEXT);"
     "CREATE TABLE IF NOT EXISTS Settings(key TEXT PRIMARY KEY, value TEXT);"
+    "CREATE UNIQUE INDEX IF NOT EXISTS ux_model_active ON Models(kind) WHERE active=1;"
     "CREATE INDEX IF NOT EXISTS ix_tr_created ON Transcriptions(created_at DESC);"
     "CREATE INDEX IF NOT EXISTS ix_dl_started ON DownloadHistory(started_at DESC);"
     "CREATE INDEX IF NOT EXISTS ix_seg_tr ON Segments(transcription_id, idx);"
@@ -103,6 +104,8 @@ void osa_db_close(osa_db *db) {
 
 bool osa_db_migrate(osa_db *db, osa_error *err) {
     char *msg = NULL;
+    /* Repair old interrupted/non-atomic activations before adding the invariant. */
+    sqlite3_exec(db->h, "UPDATE Models SET active=0 WHERE active=1 AND rowid NOT IN (SELECT MAX(rowid) FROM Models WHERE active=1 GROUP BY kind);", NULL, NULL, NULL);
     if (sqlite3_exec(db->h, SCHEMA, NULL, NULL, &msg) != SQLITE_OK) {
         osa_err_set(err, "schema error: %s", msg ? msg : "?");
         sqlite3_free(msg);
@@ -222,28 +225,15 @@ char *osa_db_get_setting(osa_db *db, const char *key, osa_arena *a, const char *
 
 /* ============================== models ============================== */
 bool osa_store_model_add(osa_db *db, const osa_model *m, osa_error *err) {
-    osa_arena a; osa_arena_init(&a);
-    osa_buf sql; osa_buf_init(&sql);
+    osa_arena a; osa_arena_init(&a); osa_buf sql; osa_buf_init(&sql);
     osa_buf_printf(&sql,
-        "INSERT OR REPLACE INTO Models(id,name,kind,engine,base_model,version,path,size_bytes,"
-        "source_url,license,sha256,status,active,notes,created_at) VALUES("
-        "'%s','%s','%s','%s','%s','%s','%s',%lld,'%s','%s','%s','%s',0,'%s','%s')",
-        osa_sql_escape(&a, m->id), osa_sql_escape(&a, m->name), osa_sql_escape(&a, m->kind),
-        osa_sql_escape(&a, m->engine), osa_sql_escape(&a, m->base_model),
-        osa_sql_escape(&a, m->version), osa_sql_escape(&a, m->path),
-        (long long)m->size_bytes, osa_sql_escape(&a, m->source_url),
-        osa_sql_escape(&a, m->license), osa_sql_escape(&a, m->sha256),
-        osa_sql_escape(&a, m->status), osa_sql_escape(&a, m->notes),
-        osa_sql_escape(&a, m->created_at));
-    osa_buf_printf(&sql,
-        ";INSERT INTO ModelVersions(model_id,version,path,sha256,metrics,created_at)"
-        " VALUES('%s','%s','%s','%s','','%s')",
-        osa_sql_escape(&a, m->id), osa_sql_escape(&a, m->version), osa_sql_escape(&a, m->path),
-        osa_sql_escape(&a, m->sha256), osa_sql_escape(&a, m->created_at));
-    bool ok = osa_sql_exec(db, sql.data, err);
-    osa_buf_free(&sql);
-    osa_arena_free(&a);
-    return ok;
+        "INSERT INTO Models(id,name,kind,engine,base_model,version,path,size_bytes,source_url,license,sha256,status,active,notes,created_at) VALUES("
+        "'%s','%s','%s','%s','%s','%s','%s',%lld,'%s','%s','%s','%s',0,'%s','%s') "
+        "ON CONFLICT(id) DO UPDATE SET name=excluded.name,kind=excluded.kind,engine=excluded.engine,base_model=excluded.base_model,version=excluded.version,path=excluded.path,size_bytes=excluded.size_bytes,source_url=excluded.source_url,license=excluded.license,sha256=excluded.sha256,status=excluded.status,notes=excluded.notes;"
+        "INSERT INTO ModelVersions(model_id,version,path,sha256,metrics,created_at) SELECT '%s','%s','%s','%s','','%s' WHERE NOT EXISTS (SELECT 1 FROM ModelVersions WHERE model_id='%s' AND version='%s' AND sha256='%s');",
+        osa_sql_escape(&a,m->id),osa_sql_escape(&a,m->name),osa_sql_escape(&a,m->kind),osa_sql_escape(&a,m->engine),osa_sql_escape(&a,m->base_model),osa_sql_escape(&a,m->version),osa_sql_escape(&a,m->path),(long long)m->size_bytes,osa_sql_escape(&a,m->source_url),osa_sql_escape(&a,m->license),osa_sql_escape(&a,m->sha256),osa_sql_escape(&a,m->status),osa_sql_escape(&a,m->notes),osa_sql_escape(&a,m->created_at),
+        osa_sql_escape(&a,m->id),osa_sql_escape(&a,m->version),osa_sql_escape(&a,m->path),osa_sql_escape(&a,m->sha256),osa_sql_escape(&a,m->created_at),osa_sql_escape(&a,m->id),osa_sql_escape(&a,m->version),osa_sql_escape(&a,m->sha256));
+    bool ok=osa_sql_exec(db,sql.data,err);osa_buf_free(&sql);osa_arena_free(&a);return ok;
 }
 
 bool osa_store_model_list(osa_db *db, osa_rs *rs, const char *kind, osa_error *err) {
@@ -260,16 +250,15 @@ bool osa_store_model_list(osa_db *db, osa_rs *rs, const char *kind, osa_error *e
 }
 
 bool osa_store_model_set_active(osa_db *db, const char *id, osa_error *err) {
-    osa_arena a; osa_arena_init(&a);
-    osa_buf sql; osa_buf_init(&sql);
-    const char *idq = osa_sql_escape(&a, id);
-    osa_buf_printf(&sql,
-        "UPDATE Models SET active=0 WHERE kind=(SELECT kind FROM Models WHERE id='%s');"
-        "UPDATE Models SET active=1 WHERE id='%s';", idq, idq);
-    bool ok = osa_sql_exec(db, sql.data, err);
-    osa_buf_free(&sql);
-    osa_arena_free(&a);
-    return ok;
+    if(sqlite3_exec(db->h,"BEGIN IMMEDIATE;",NULL,NULL,NULL)!=SQLITE_OK){osa_err_set(err,"cannot begin model activation");return false;}
+    sqlite3_stmt *st=NULL;bool ok=false;
+    if(sqlite3_prepare_v2(db->h,"SELECT kind FROM Models WHERE id=?",-1,&st,NULL)==SQLITE_OK){sqlite3_bind_text(st,1,id,-1,SQLITE_TRANSIENT);if(sqlite3_step(st)==SQLITE_ROW){const char*kind=(const char*)sqlite3_column_text(st,0);char k[24];osa_strlcpy(k,kind?kind:"",sizeof k);sqlite3_finalize(st);st=NULL;
+        if(sqlite3_prepare_v2(db->h,"UPDATE Models SET active=0 WHERE kind=?",-1,&st,NULL)==SQLITE_OK){sqlite3_bind_text(st,1,k,-1,SQLITE_TRANSIENT);ok=sqlite3_step(st)==SQLITE_DONE;sqlite3_finalize(st);st=NULL;}
+        if(ok&&sqlite3_prepare_v2(db->h,"UPDATE Models SET active=1 WHERE id=? AND kind=?",-1,&st,NULL)==SQLITE_OK){sqlite3_bind_text(st,1,id,-1,SQLITE_TRANSIENT);sqlite3_bind_text(st,2,k,-1,SQLITE_TRANSIENT);ok=sqlite3_step(st)==SQLITE_DONE&&sqlite3_changes(db->h)==1;sqlite3_finalize(st);st=NULL;}
+    }}
+    if(st)sqlite3_finalize(st);
+    if(ok)ok=sqlite3_exec(db->h,"COMMIT;",NULL,NULL,NULL)==SQLITE_OK;else sqlite3_exec(db->h,"ROLLBACK;",NULL,NULL,NULL);
+    if(!ok)osa_err_set(err,"model activation failed; previous choice preserved");return ok;
 }
 
 const char *osa_store_model_active(osa_db *db, const char *kind, osa_arena *a) {

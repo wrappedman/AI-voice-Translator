@@ -257,7 +257,7 @@ bool osa_file_copy(const char *from, const char *to) {
     if (!fi) return false;
     FILE *fo = fopen(to, "wb");
     if (!fo) { fclose(fi); return false; }
-    static char buf[1 << 16];
+    char buf[1 << 16];
     size_t n; bool ok = true;
     while ((n = fread(buf, 1, sizeof buf, fi)) > 0)
         if (fwrite(buf, 1, n, fo) != n) { ok = false; break; }
@@ -623,9 +623,10 @@ int osa_http_download(const char *url, const char *dest_path, bool resume,
     memcpy(path, uc.lpszUrlPath, pl * sizeof(wchar_t));
     path[pl] = 0;
 
-    HINTERNET ses = WinHttpOpen(L"OpenSpeechAI/1.0", WINHTTP_ACCESS_TYPE_AUTOMATIC_PROXY,
+    HINTERNET ses = WinHttpOpen(L"OpenSpeechAI/1.2", WINHTTP_ACCESS_TYPE_AUTOMATIC_PROXY,
                                 WINHTTP_NO_PROXY_NAME, WINHTTP_NO_PROXY_BYPASS, 0);
     if (!ses) { osa_err_set(err, "cannot start WinHTTP (%lu)", GetLastError()); return -1; }
+    WinHttpSetTimeouts(ses, 15000, 15000, 30000, 30000);
     HINTERNET con = WinHttpConnect(ses, host, uc.nPort, 0);
     if (!con) {
         WinHttpCloseHandle(ses);
@@ -635,6 +636,7 @@ int osa_http_download(const char *url, const char *dest_path, bool resume,
     DWORD flags = uc.nScheme == INTERNET_SCHEME_HTTPS ? WINHTTP_FLAG_SECURE : 0;
     HINTERNET req = WinHttpOpenRequest(con, L"GET", path, NULL, WINHTTP_NO_REFERER,
                                        WINHTTP_DEFAULT_ACCEPT_TYPES, flags);
+    if (req) { DWORD policy=WINHTTP_OPTION_REDIRECT_POLICY_DISALLOW_HTTPS_TO_HTTP; WinHttpSetOption(req,WINHTTP_OPTION_REDIRECT_POLICY,&policy,sizeof policy); }
     if (!req) {
         WinHttpCloseHandle(con); WinHttpCloseHandle(ses);
         osa_err_set(err, "cannot create the request (%lu)", GetLastError());
@@ -645,9 +647,10 @@ int osa_http_download(const char *url, const char *dest_path, bool resume,
     char part[OSAI_MAX_PATH];
     snprintf(part, sizeof part, "%s.part", dest_path);
     if (resume && osa_file_exists(part)) have = osa_file_size(part);
+    if (have < 0) have = 0;
     if (have > 0) {
-        wchar_t range[64];
-        swprintf(range, 64, L"bytes=%lld-", (long long)have);
+        wchar_t range[80];
+        swprintf(range, 80, L"Range: bytes=%lld-", (long long)have);
         WinHttpAddRequestHeaders(req, range, (DWORD)-1L,
                                  WINHTTP_ADDREQ_FLAG_ADD | WINHTTP_ADDREQ_FLAG_REPLACE);
     }
@@ -661,33 +664,46 @@ int osa_http_download(const char *url, const char *dest_path, bool resume,
     DWORD status = 0, len = sizeof status;
     WinHttpQueryHeaders(req, WINHTTP_QUERY_STATUS_CODE | WINHTTP_QUERY_FLAG_NUMBER,
                         WINHTTP_HEADER_NAME_BY_INDEX, &status, &len, WINHTTP_NO_HEADER_INDEX);
-    if (status == 416) {                     /* already complete */
-        osa_file_rename(part, dest_path);
+    if (status == 416) {
+        /* The server rejected the range. Only treat the partial file as complete
+         * if Content-Range proves its size equals the whole resource; otherwise
+         * discard it so the next attempt starts clean. The caller still verifies
+         * SHA-256 before installation. */
+        wchar_t cr[128]; DWORD crl = sizeof cr; int64_t whole = -1;
+        if (WinHttpQueryHeaders(req, WINHTTP_QUERY_CONTENT_RANGE, WINHTTP_HEADER_NAME_BY_INDEX,
+                                cr, &crl, WINHTTP_NO_HEADER_INDEX)) {
+            const wchar_t *star = wcschr(cr, L'/');
+            if (star && star[1] >= L'0' && star[1] <= L'9') whole = _wtoi64(star + 1);
+        }
         WinHttpCloseHandle(req); WinHttpCloseHandle(con); WinHttpCloseHandle(ses);
-        osa_err_ok(err);
-        return 0;
+        if (have > 0 && whole == have && osa_file_rename(part, dest_path)) { osa_err_ok(err); return 0; }
+        osa_file_remove(part);
+        osa_err_set(err, "partial download does not match the server; retry the download");
+        return -1;
     }
     if (status != 200 && status != 206) {
         osa_err_set(err, "server returned HTTP %lu", (unsigned long)status);
         WinHttpCloseHandle(req); WinHttpCloseHandle(con); WinHttpCloseHandle(ses);
         return -1;
     }
-    /* total size for the progress bar */
+    /* 206 means the server honored Range: Content-Length is the remaining tail,
+     * so append and add the bytes we already have. 200 means the server ignored
+     * Range and is sending the whole file: truncate and do NOT add `have`. */
+    bool appending = (status == 206 && have > 0);
     int64_t total = 0;
     {
-        wchar_t clen[64];
-        DWORD cl = sizeof clen;
-        if (WinHttpQueryHeaders(req, WINHTTP_QUERY_CONTENT_LENGTH, WINHTTP_HEADER_NAME_BY_INDEX,
-                                clen, &cl, WINHTTP_NO_HEADER_INDEX) && cl)
-            total = _wtoi64(clen) + have;
+        DWORD clen = 0, cl = sizeof clen;
+        if (WinHttpQueryHeaders(req, WINHTTP_QUERY_CONTENT_LENGTH | WINHTTP_QUERY_FLAG_NUMBER,
+                                WINHTTP_HEADER_NAME_BY_INDEX, &clen, &cl, WINHTTP_NO_HEADER_INDEX))
+            total = (int64_t)clen + (appending ? have : 0);
     }
-    FILE *f = fopen(part, have > 0 ? "ab" : "wb");
+    FILE *f = fopen(part, appending ? "ab" : "wb");
     if (!f) {
         osa_err_set(err, "cannot write %s", part);
         WinHttpCloseHandle(req); WinHttpCloseHandle(con); WinHttpCloseHandle(ses);
         return -1;
     }
-    int64_t got = have;
+    int64_t got = appending ? have : 0;
     int rc = 0;
     for (;;) {
         if (cancel && *cancel) { rc = -2; break; }
@@ -720,7 +736,7 @@ int osa_http_download(const char *url, const char *dest_path, bool resume,
         osa_err_ok(err);
         return 0;
     }
-    if (rc == -2) { if (err) osa_err_set(err, "cancelled"); return -2; }
+    if (rc == -2) { osa_file_remove(part); if (err) osa_err_set(err, "cancelled"); return -2; }
     if (err && !err->msg[0]) osa_err_set(err, "network error (%lu)", GetLastError());
     return -1;
 #else

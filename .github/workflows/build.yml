@@ -73,8 +73,10 @@ jobs:
       - name: Build OpenSpeechAI.exe
         run: make win -j"$(nproc)"
 
-      - name: Verify the PE header
-        run: python3 tools/verify_exe.py dist/bin/OpenSpeechAI.exe
+      - name: Verify the PE headers
+        run: |
+          python3 tools/verify_exe.py dist/bin/OpenSpeechAI.exe
+          python3 tools/verify_exe.py dist/bin/OpenSpeechWorker.exe --console
 
       - name: Package and hash
         run: make dist
@@ -87,6 +89,7 @@ jobs:
           name: OpenSpeechAI-win64
           path: |
             dist/bin/OpenSpeechAI.exe
+            dist/bin/OpenSpeechWorker.exe
             dist/OpenSpeechAI-*-win64.zip
             dist/checksums-*.txt
           if-no-files-found: error

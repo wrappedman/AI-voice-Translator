@@ -112,7 +112,8 @@ typedef struct ui_context {
     int          popup_id;
     osa_rect     popup_rect;
     int          popup_sel;
-    int          popup_n;
+    int          popup_n;       /* total choices; items holds the visible page */
+    int          popup_scroll;  /* first global index in the visible page */
     float        popup_x, popup_y;
     char         popup_items[12][64];
     /* animation clock, seconds since start (0 for stills) */

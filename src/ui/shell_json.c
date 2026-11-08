@@ -118,13 +118,15 @@ static void hist_visit(void *ud, const char *o, const char *e) {
     shell_json_str(o, e, "\"id\"", r->id, sizeof r->id);
     shell_json_str(o, e, "\"text\"", r->text, sizeof r->text);
     shell_json_str(o, e, "\"language\"", r->lang, sizeof r->lang);
+    shell_json_str(o, e, "\"translation\"", r->translation, sizeof r->translation);
+    shell_json_str(o, e, "\"target_lang\"", r->target_lang, sizeof r->target_lang);
     char iso[48] = {0};
     shell_json_str(o, e, "\"created_at\"", iso, sizeof iso);
     /* ISO-8601 "2026-01-01T10:00:00Z" → "01-01 10:00" */
     if (strlen(iso) >= 16) snprintf(r->when, sizeof r->when, "%.5s %.5s", iso + 5, iso + 11);
     else osa_strlcpy(r->when, iso, sizeof r->when);
     shell_json_num(o, e, "\"confidence\"", &r->conf);
-    shell_json_num(o, e, "\"duration_s\"", &r->dur);
+    double ms=0;shell_json_num(o, e, "\"duration_ms\"", &ms);r->dur=ms/1000.0;
 }
 
 

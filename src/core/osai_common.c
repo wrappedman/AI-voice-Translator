@@ -257,40 +257,31 @@ static const char *json_find(const char *json, const char *key) {
     return NULL;
 }
 
-bool osa_json_get_string(const char *json, const char *key, char *out, size_t cap) {
-    const char *p = json_find(json, key);
-    if (!p || *p != '"') return false;
-    p++;
-    size_t n = 0;
-    while (*p && *p != '"' && n + 1 < cap) {
-        if (*p == '\\' && p[1]) {
-            p++;
-            char c = *p;
-            if (c == 'n') c = '\n';
-            else if (c == 't') c = '\t';
-            else if (c == 'r') c = '\r';
-            else if (c == 'u') {
-                /* minimal: decode BMP escape as '?' for non-ASCII, keep ASCII */
-                unsigned v = 0;
-                if (p[1] && p[2] && p[3] && p[4]) {
-                    for (int i = 1; i <= 4; i++) {
-                        char h = p[i]; v <<= 4;
-                        v |= (unsigned)(h >= '0' && h <= '9' ? h - '0' :
-                                        h >= 'a' && h <= 'f' ? h - 'a' + 10 :
-                                        h >= 'A' && h <= 'F' ? h - 'A' + 10 : 0);
-                    }
-                    p += 4;
-                }
-                if (v && n + 1 < cap) out[n++] = (char)(v < 128 ? (int)v : '?');
-                p++;
-                continue;
-            }
-            out[n++] = c;
-        } else out[n++] = *p;
-        p++;
+static int json_hex4(const char *p) {
+    int v=0; for(int i=0;i<4;i++){int c=(unsigned char)p[i];int d=c>='0'&&c<='9'?c-'0':c>='a'&&c<='f'?c-'a'+10:c>='A'&&c<='F'?c-'A'+10:-1;if(d<0)return -1;v=v*16+d;}return v;
+}
+static char *json_string(const char *p,size_t *consumed) {
+    if(!p||*p!='"')return NULL; const char *start=p; p++; osa_buf b;osa_buf_init(&b);
+    while(*p && *p!='"') {
+        unsigned char c=(unsigned char)*p++;
+        if(c<0x20){osa_buf_free(&b);return NULL;}
+        if(c!='\\'){osa_buf_putc(&b,(char)c);continue;}
+        c=(unsigned char)*p++;
+        if(c=='u') {
+            int v=json_hex4(p);if(v<0){osa_buf_free(&b);return NULL;}p+=4;
+            if(v>=0xd800&&v<=0xdbff){if(p[0]!='\\'||p[1]!='u'){osa_buf_free(&b);return NULL;}int lo=json_hex4(p+2);if(lo<0xdc00||lo>0xdfff){osa_buf_free(&b);return NULL;}p+=6;v=0x10000+((v-0xd800)<<10)+(lo-0xdc00);}
+            else if(v>=0xdc00&&v<=0xdfff){osa_buf_free(&b);return NULL;}
+            char u[4];int n=osa_utf8_encode((uint32_t)v,u);osa_buf_putn(&b,u,n);
+        } else {
+            switch(c){case '"':case '\\':case '/':osa_buf_putc(&b,(char)c);break;case 'b':osa_buf_putc(&b,'\b');break;case 'f':osa_buf_putc(&b,'\f');break;case 'n':osa_buf_putc(&b,'\n');break;case 'r':osa_buf_putc(&b,'\r');break;case 't':osa_buf_putc(&b,'\t');break;default:osa_buf_free(&b);return NULL;}
+        }
     }
-    out[n] = 0;
-    return true;
+    if(*p!='"'||b.oom){osa_buf_free(&b);return NULL;}p++;if(consumed)*consumed=(size_t)(p-start);
+    osa_buf_putc(&b,0);return osa_buf_detach(&b);
+}
+char *osa_json_string_dup(const char *json,const char *key){const char *p=json_find(json,key);size_t n;return json_string(p,&n);}
+bool osa_json_get_string(const char *json, const char *key, char *out, size_t cap) {
+    if(!out||!cap)return false;out[0]=0;char *s=osa_json_string_dup(json,key);if(!s)return false;size_t n=strlen(s);if(n>=cap){free(s);return false;}memcpy(out,s,n+1);free(s);return true;
 }
 
 bool osa_json_get_bool(const char *json, const char *key, bool *out) {

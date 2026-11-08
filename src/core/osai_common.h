@@ -18,7 +18,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 
-#define OSAI_VERSION        "1.1.0"
+#define OSAI_VERSION        "1.2.0"
 #define OSAI_APP_NAME       "OpenSpeech AI"
 #define OSAI_APP_ID         "OpenSpeechAI"
 
@@ -29,6 +29,7 @@
 
 #define OSAI_MAX_PATH       1024
 #define OSAI_MAX_LINE       4096
+#define OSAI_MAX_TEXT       65536
 #define OSAI_MAX_MSG        512
 
 /* ---------------- arena ---------------- */
@@ -77,6 +78,8 @@ char *osa_trim_inplace(char *s);
 int   osa_split(char *s, char sep, char **out, int maxout);   /* destructive, keeps empties */
 char *osa_json_escape(osa_arena *a, const char *s);           /* returns "..." incl. quotes */
 bool  osa_json_get_string(const char *json, const char *key, char *out, size_t cap);
+/* Allocates an exact-size UTF-8 string, including JSON surrogate pairs. free(). */
+char *osa_json_string_dup(const char *json, const char *key);
 bool  osa_json_get_bool(const char *json, const char *key, bool *out);
 bool  osa_json_get_num(const char *json, const char *key, double *out);
 

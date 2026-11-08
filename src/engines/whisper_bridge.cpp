@@ -7,11 +7,13 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <limits.h>
 
 struct wsp_ctx {
     struct whisper_context *ctx;
     char name[64];
     int  n_threads;
+    volatile int *cancel;
 };
 
 /* whisper.cpp logs model loading to stderr; a GUI build has no stderr, and the
@@ -34,7 +36,7 @@ bool wsp_is_model_file(const char *path) {
     size_t got = fread(m, 1, 4, f);
     fclose(f);
     /* "ggml" as a little-endian uint32 — the magic whisper.cpp checks */
-    return got == 4 && m[0] == 0x6c && m[1] == 0x6d && m[2] == 0x67 && m[3] == 0x67;
+    return got == 4 && ((m[0] == 0x6c && m[1] == 0x6d && m[2] == 0x67 && m[3] == 0x67) || (m[0]=='G'&&m[1]=='G'&&m[2]=='U'&&m[3]=='F'));
 }
 
 static wsp_ctx *load_impl(const char *path, char *err, size_t cap) {
@@ -70,6 +72,9 @@ void wsp_free(wsp_ctx *c) {
 }
 
 const char *wsp_model_name(const wsp_ctx *c) { return c ? c->name : ""; }
+void wsp_set_cancel(wsp_ctx *c, volatile int *cancel) { if(c) c->cancel=cancel; }
+int wsp_languages(wsp_ctx *c,const char **codes,int max) { if(!c||!codes||max<=0)return 0; int n=0; for(int i=0;i<=whisper_lang_max_id()&&n<max;i++){const char*s=whisper_lang_str(i);if(s&&*s&&whisper_lang_id(s)>=0)codes[n++]=s;} return n; }
+static bool abort_cb(void *ud){volatile int *p=(volatile int*)ud;return p&&*p;}
 
 static bool transcribe_impl(wsp_ctx *c, const float *pcm, int64_t n, const char *lang,
                             wsp_result *out, char *err, size_t cap) {
@@ -84,11 +89,11 @@ static bool transcribe_impl(wsp_ctx *c, const float *pcm, int64_t n, const char 
     wp.print_special = false;
     wp.no_context = true;                     /* each pass stands on its own */
     wp.translate = false;
+    wp.abort_callback=abort_cb; wp.abort_callback_user_data=(void*)c->cancel;
+    wp.suppress_blank=true; wp.suppress_nst=true; wp.temperature_inc=0.0f;
+    wp.no_speech_thold=0.6f; wp.logprob_thold=-1.0f; wp.entropy_thold=2.4f;
     if (lang && *lang) {
-        if (strcmp(lang, "fa") != 0 && strcmp(lang, "en") != 0) {
-            set_err(err, cap, "unsupported language");
-            return false;
-        }
+        if (whisper_lang_id(lang)<0) { set_err(err,cap,"unsupported speech language"); return false; }
         if (!whisper_is_multilingual(c->ctx) && strcmp(lang, "en") != 0) {
             set_err(err, cap, "this model only understands English");
             return false;
@@ -100,8 +105,9 @@ static bool transcribe_impl(wsp_ctx *c, const float *pcm, int64_t n, const char 
         wp.detect_language = true;
     }
 
+    if (n > INT_MAX) { set_err(err,cap,"audio is too long for one pass"); return false; }
     if (whisper_full(c->ctx, wp, pcm, (int)n) != 0) {
-        set_err(err, cap, "recognition failed");
+        set_err(err, cap, c->cancel&&*c->cancel?"recognition cancelled":"recognition failed");
         return false;
     }
 
@@ -119,12 +125,10 @@ static bool transcribe_impl(wsp_ctx *c, const float *pcm, int64_t n, const char 
         const char *t = whisper_full_get_segment_text(c->ctx, i);
         if (t) {
             size_t tl = strlen(t);
-            if (used + tl + 2 < sizeof out->text) {
-                if (used) out->text[used++] = ' ';
-                memcpy(out->text + used, t, tl);
-                used += tl;
-                out->text[used] = 0;
-            }
+            size_t extra=(used && t[0]!=' ' && t[0]!='\n')?1:0;
+            if (used + tl + extra + 1 >= sizeof out->text) { set_err(err,cap,"transcript exceeds 64 KiB; split the audio"); return false; }
+            if(extra)out->text[used++]=' ';
+            memcpy(out->text+used,t,tl);used+=tl;out->text[used]=0;
         }
         int nt = whisper_full_n_tokens(c->ctx, i);
         for (int j = 0; j < nt; j++) {

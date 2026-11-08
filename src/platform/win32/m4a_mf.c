@@ -1,19 +1,10 @@
-/* m4a_mf.c — AAC (.m4a/.mp4/.aac) decoding through Media Foundation.
- *
- * Vendoring an AAC decoder for one container is several hundred kilobytes of
- * source and a patent question; Windows has had one built in since Vista. This
- * file uses the Source Reader, which is the small part of Media Foundation:
- * open the file, set the audio stream to 16 kHz mono PCM, read frames in a loop.
- * MFCreateSourceReaderFromURL pulls in the whole source-resolver stack, so the
- * reader is created from a plain IStream over the file instead, and the two
- * DLLs are loaded by name. That keeps the exe's import table free of Media
- * Foundation: on a stripped-down system the app still starts, and only .m4a
- * files are refused, with a message that says so.
- *
- * Only `MFStartup` and the float->PCM handoff need MF; everything else is plain
- * COM, which is already linked for the shell bits. */
+/* AAC/M4A/MP4 decoding with the Windows Media Foundation source reader.
+ * The system owns the file byte stream and every COM object: no hand-written
+ * IStream vtable (the old layout/refcount bug caused mfreadwrite.dll AVs).
+ * Runs on the file-job thread, initializes MTA there, and balances every
+ * successful initialization/release even on error. MF DLLs remain delay-loaded
+ * by name so machines without Media Foundation can still use WAV/MP3/FLAC. */
 #if defined(_WIN32)
-
 #include <windows.h>
 #include <objbase.h>
 #include <mfapi.h>
@@ -22,279 +13,75 @@
 #include <mferror.h>
 #include "audio_m4a.h"
 
-/* Media Foundation's GUIDs are *not* in the import libraries zig ships beyond
- * the ones we link, and the two reader attributes we set are plain integers.
- *
- * MF_SOURCE_READER_ENABLE_AUDIO_PROCESSING pulls the decoded stream into the
- * format we asked for instead of handing back the file's native profile, which
- * is what makes a 44.1 kHz stereo AAC file arrive as 16 kHz mono float. */
-#ifndef MF_SOURCE_READER_ENABLE_AUDIO_PROCESSING
-static const GUID OSAI_MF_SR_AUDIO_PROCESSING =
-    { 0x97fba2fa, 0x89c3, 0x4d1f, { 0x9b, 0x19, 0x77, 0x54, 0x34, 0xaf, 0xa5, 0x0a } };
-#else
-#define OSAI_MF_SR_AUDIO_PROCESSING MF_SOURCE_READER_ENABLE_AUDIO_PROCESSING
-#endif
-
-#define OSAI_MF_TARGET_RATE 16000
-
+#define TARGET_RATE 16000
 typedef struct mf_api {
-    HMODULE plat, rw;
-    HRESULT (STDAPICALLTYPE *startup)(ULONG, DWORD);
+    HMODULE plat,rw;
+    HRESULT (STDAPICALLTYPE *startup)(ULONG,DWORD);
     HRESULT (STDAPICALLTYPE *shutdown)(void);
-    HRESULT (STDAPICALLTYPE *create_reader_from_stream)(IUnknown *, IMFAttributes *,
-                                                        REFIID, void **);
-    HRESULT (STDAPICALLTYPE *create_attributes)(IMFAttributes **, UINT32);
-    HRESULT (STDAPICALLTYPE *create_media_type)(IMFMediaType **);
+    HRESULT (STDAPICALLTYPE *reader_url)(LPCWSTR,IMFAttributes*,IMFSourceReader**);
+    HRESULT (STDAPICALLTYPE *media_type)(IMFMediaType**);
 } mf_api;
-
-static mf_api g_mf;
-static bool   g_mf_loaded;
-
-/* One attempt per process: loading two DLLs on every file pick is pointless,
- * and a machine without Media Foundation should not pay for it twice. */
-static mf_api *mf_load(void) {
-    if (g_mf_loaded) return g_mf.plat ? &g_mf : NULL;
-    g_mf_loaded = true;
-    g_mf.plat = LoadLibraryW(L"mfplat.dll");
-    g_mf.rw = LoadLibraryW(L"mfreadwrite.dll");
-    if (!g_mf.plat || !g_mf.rw) return NULL;
-    g_mf.startup = (HRESULT (STDAPICALLTYPE *)(ULONG, DWORD))
-        GetProcAddress(g_mf.plat, "MFStartup");
-    g_mf.shutdown = (HRESULT (STDAPICALLTYPE *)(void))
-        GetProcAddress(g_mf.plat, "MFShutdown");
-    g_mf.create_reader_from_stream =
-        (HRESULT (STDAPICALLTYPE *)(IUnknown *, IMFAttributes *, REFIID, void **))
-        GetProcAddress(g_mf.rw, "MFCreateSourceReaderFromByteStream");
-    g_mf.create_attributes = (HRESULT (STDAPICALLTYPE *)(IMFAttributes **, UINT32))
-        GetProcAddress(g_mf.plat, "MFCreateAttributes");
-    g_mf.create_media_type = (HRESULT (STDAPICALLTYPE *)(IMFMediaType **))
-        GetProcAddress(g_mf.plat, "MFCreateMediaType");
-    if (!g_mf.startup || !g_mf.create_reader_from_stream || !g_mf.create_attributes ||
-        !g_mf.create_media_type)
-        return NULL;
-    return &g_mf;
+static mf_api g; static bool g_tried;
+static mf_api *load_mf(void){
+    if(g_tried)return g.plat&&g.rw?&g:NULL;g_tried=true;
+    g.plat=LoadLibraryW(L"mfplat.dll");g.rw=LoadLibraryW(L"mfreadwrite.dll");if(!g.plat||!g.rw)return NULL;
+    g.startup=(void*)GetProcAddress(g.plat,"MFStartup");g.shutdown=(void*)GetProcAddress(g.plat,"MFShutdown");
+    g.reader_url=(void*)GetProcAddress(g.rw,"MFCreateSourceReaderFromURL");g.media_type=(void*)GetProcAddress(g.plat,"MFCreateMediaType");
+    return g.startup&&g.shutdown&&g.reader_url&&g.media_type?&g:NULL;
 }
-
-/* An IStream that reads a file through the C runtime, so no shell32 shim or
- * COM initialisation of a particular apartment is required. Only the methods
- * the source reader actually calls are implemented; the rest report
- * E_NOTIMPL, which is a legal (and common) thing for a read-only stream. */
-typedef struct file_stream {
-    IStream vtbl;
-    HANDLE  file;
-    int64_t size;
-    LONG    refs;      /* real COM lifetime: the reader takes its own reference */
-} file_stream;
-
-static HRESULT STDMETHODCALLTYPE fs_QueryInterface(IStream *iface, REFIID riid, void **out) {
-    if (!out) return E_POINTER;
-    if (IsEqualIID(riid, &IID_IUnknown) || IsEqualIID(riid, &IID_IStream) ||
-        IsEqualIID(riid, &IID_ISequentialStream)) {
-        *out = iface;
-        return S_OK;
-    }
-    *out = NULL;
-    return E_NOINTERFACE;
-}
-static ULONG STDMETHODCALLTYPE fs_AddRef(IStream *iface) {
-    file_stream *f = (file_stream *)iface;
-    return (ULONG)InterlockedIncrement(&f->refs);
-}
-static ULONG STDMETHODCALLTYPE fs_Release(IStream *iface) {
-    file_stream *f = (file_stream *)iface;
-    LONG left = InterlockedDecrement(&f->refs);
-    if (left > 0) return (ULONG)left;
-    if (f->file && f->file != INVALID_HANDLE_VALUE) CloseHandle(f->file);
-    f->file = NULL;
-    free(f);
-    return 0;
-}
-static HRESULT STDMETHODCALLTYPE fs_Read(IStream *iface, void *buf, ULONG n, ULONG *got) {
-    file_stream *f = (file_stream *)iface;
-    if (got) *got = 0;
-    if (f->file == INVALID_HANDLE_VALUE || !f->file) return E_FAIL;
-    DWORD want = n, read = 0;
-    if (!ReadFile(f->file, buf, want, &read, NULL)) return E_FAIL;
-    if (got) *got = read;
-    return read == want ? S_OK : S_FALSE;
-}
-static HRESULT STDMETHODCALLTYPE fs_Seek(IStream *iface, LARGE_INTEGER move, DWORD origin,
-                                         ULARGE_INTEGER *pos) {
-    file_stream *f = (file_stream *)iface;
-    if (f->file == INVALID_HANDLE_VALUE || !f->file) return E_FAIL;
-    LARGE_INTEGER np;
-    np.QuadPart = move.QuadPart;
-    if (!SetFilePointerEx(f->file, np, &np, origin)) return E_FAIL;
-    if (pos) pos->QuadPart = (ULONGLONG)np.QuadPart;
-    return S_OK;
-}
-static HRESULT STDMETHODCALLTYPE fs_Stat(IStream *iface, STATSTG *st, DWORD flags) {
-    (void)flags;
-    file_stream *f = (file_stream *)iface;
-    if (!st) return E_POINTER;
-    memset(st, 0, sizeof *st);
-    st->type = STGTY_STREAM;
-    st->cbSize.QuadPart = (ULONGLONG)f->size;
-    return S_OK;
-}
-static HRESULT STDMETHODCALLTYPE fs_SetSize(IStream *i, ULARGE_INTEGER n) { (void)i; (void)n; return E_NOTIMPL; }
-static HRESULT STDMETHODCALLTYPE fs_CopyTo(IStream *i, IStream *o, ULARGE_INTEGER n,
-                                           ULARGE_INTEGER *r, ULARGE_INTEGER *w) {
-    (void)i; (void)o; (void)n; (void)r; (void)w; return E_NOTIMPL;
-}
-static HRESULT STDMETHODCALLTYPE fs_Commit(IStream *i, DWORD f) { (void)i; (void)f; return E_NOTIMPL; }
-static HRESULT STDMETHODCALLTYPE fs_Revert(IStream *i) { (void)i; return E_NOTIMPL; }
-static HRESULT STDMETHODCALLTYPE fs_LockRegion(IStream *i, ULARGE_INTEGER a, ULARGE_INTEGER b, DWORD l) {
-    (void)i; (void)a; (void)b; (void)l; return E_NOTIMPL;
-}
-static HRESULT STDMETHODCALLTYPE fs_UnlockRegion(IStream *i, ULARGE_INTEGER a, ULARGE_INTEGER b, DWORD l) {
-    (void)i; (void)a; (void)b; (void)l; return E_NOTIMPL;
-}
-static HRESULT STDMETHODCALLTYPE fs_Clone(IStream *i, IStream **out) { (void)i; if (out) *out = NULL; return E_NOTIMPL; }
-static HRESULT STDMETHODCALLTYPE fs_Write(IStream *i, const void *b, ULONG n, ULONG *w) {
-    (void)i; (void)b; (void)n; if (w) *w = 0; return E_NOTIMPL;
-}
-
-static IStreamVtbl FILE_STREAM_VTBL = {
-    fs_QueryInterface, fs_AddRef, fs_Release,
-    fs_Read, fs_Write, fs_Seek, fs_SetSize, fs_CopyTo, fs_Commit, fs_Revert,
-    fs_LockRegion, fs_UnlockRegion, fs_Stat, fs_Clone
-};
-
-static file_stream *stream_open(const char *path) {
-    wchar_t wpath[OSAI_MAX_PATH];
-    if (!MultiByteToWideChar(CP_UTF8, 0, path, -1, wpath, OSAI_MAX_PATH)) return NULL;
-    HANDLE h = CreateFileW(wpath, GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING,
-                           FILE_ATTRIBUTE_NORMAL, NULL);
-    if (h == INVALID_HANDLE_VALUE) return NULL;
-    LARGE_INTEGER sz;
-    if (!GetFileSizeEx(h, &sz)) { CloseHandle(h); return NULL; }
-    file_stream *f = (file_stream *)calloc(1, sizeof *f);
-    if (!f) { CloseHandle(h); return NULL; }
-    f->vtbl.lpVtbl = &FILE_STREAM_VTBL;
-    f->refs = 1;
-    f->file = h;
-    f->size = sz.QuadPart;
-    return f;
-}
-
-/* Read the whole decoded stream as mono float at OSAI_MF_TARGET_RATE. */
-bool osa_m4a_decode(const char *path, float **frames, int64_t *n, int *rate,
-                    osa_error *err) {
-    if (frames) *frames = NULL;
-    if (n) *n = 0;
-    if (rate) *rate = 0;
-    if (!path || !*path) { osa_err_set(err, "no file"); return false; }
-
-    mf_api *mf = mf_load();
-    if (!mf) {
-        osa_err_set(err, "Media Foundation is not available on this system, so .m4a "
-                         "cannot be decoded here; convert the file to WAV or MP3");
-        return false;
-    }
-    /* The window thread owns the apartment; a failed COM init means somebody
-     * else already set it up, which is fine for a stream. */
-    bool com = SUCCEEDED(CoInitializeEx(NULL, COINIT_APARTMENTTHREADED));
-    bool mf_ok = SUCCEEDED(mf->startup(MF_VERSION, MFSTARTUP_LITE));
-    bool ok = false;
-    IMFSourceReader *reader = NULL;
-    file_stream *stream = stream_open(path);
-    IMFMediaType *want = NULL;
-    float  *buf = NULL;
-    size_t  cap = 0, used = 0;
-
-    if (!stream) { osa_err_set(err, "cannot open the file"); goto done; }
-    if (!mf_ok) { osa_err_set(err, "Media Foundation could not start"); goto done; }
-
-    /* MF_SOURCE_READER_ENABLE_AUDIO_PROCESSING at creation time: without it the
-     * reader hands back the file's native profile and refuses the 16 kHz mono
-     * type we ask for below. AAC is the usual case; a container holding plain
-     * PCM converts just as well, so no format list is needed. */
-    {
-        IMFAttributes *attrs = NULL;
-        if (SUCCEEDED(mf->create_attributes(&attrs, 1)) && attrs) {
-            attrs->lpVtbl->SetUINT32(attrs, &OSAI_MF_SR_AUDIO_PROCESSING, TRUE);
-        }
-        IUnknown *unk = (IUnknown *)&stream->vtbl;
-        HRESULT hr = mf->create_reader_from_stream(unk, attrs, &IID_IMFSourceReader,
-                                                   (void **)&reader);
-        if (attrs) attrs->lpVtbl->Release(attrs);
-        if (FAILED(hr) || !reader) {
-            osa_err_set(err, "the file is not an audio container Media Foundation can open");
-            goto done;
-        }
-    }
-    {
-        HRESULT hr = mf->create_media_type(&want);
-        if (FAILED(hr) || !want) { osa_err_set(err, "out of memory"); goto done; }
-        want->lpVtbl->SetGUID(want, &MF_MT_MAJOR_TYPE, &MFMediaType_Audio);
-        want->lpVtbl->SetGUID(want, &MF_MT_SUBTYPE, &MFAudioFormat_PCM);
-        want->lpVtbl->SetUINT32(want, &MF_MT_AUDIO_NUM_CHANNELS, 1);
-        want->lpVtbl->SetUINT32(want, &MF_MT_AUDIO_SAMPLES_PER_SECOND, OSAI_MF_TARGET_RATE);
-        want->lpVtbl->SetUINT32(want, &MF_MT_AUDIO_BITS_PER_SAMPLE, 16);
-        hr = reader->lpVtbl->SetCurrentMediaType(reader, MF_SOURCE_READER_FIRST_AUDIO_STREAM,
-                                                 NULL, want);
-        if (FAILED(hr)) {
-            osa_err_set(err, "the file has no audio track that can be decoded");
-            goto done;
-        }
-    }
-
-    for (;;) {
-        DWORD flags = 0;
-        IMFSample *sample = NULL;
-        HRESULT hr = reader->lpVtbl->ReadSample(reader, MF_SOURCE_READER_FIRST_AUDIO_STREAM,
-                                                0, NULL, &flags, NULL, &sample);
-        if (FAILED(hr)) { if (sample) sample->lpVtbl->Release(sample); break; }
-        if (flags & MF_SOURCE_READERF_ENDOFSTREAM) { if (sample) sample->lpVtbl->Release(sample); break; }
-        if (!sample) continue;
-        IMFMediaBuffer *mb = NULL;
-        if (SUCCEEDED(sample->lpVtbl->ConvertToContiguousBuffer(sample, &mb)) && mb) {
-            BYTE *data = NULL;
-            DWORD len = 0;
-            if (SUCCEEDED(mb->lpVtbl->Lock(mb, &data, NULL, &len)) && data && len) {
-                size_t add = (size_t)len / sizeof(int16_t);
-                if (used + add > cap) {
-                    size_t ncap = cap ? cap * 2 : 65536;
-                    while (ncap < used + add) ncap *= 2;
-                    float *nb = (float *)realloc(buf, ncap * sizeof(float));
-                    if (!nb) { mb->lpVtbl->Unlock(mb); mb->lpVtbl->Release(mb);
-                               sample->lpVtbl->Release(sample); goto done; }
-                    buf = nb;
-                    cap = ncap;
-                }
-                const int16_t *src = (const int16_t *)data;
-                for (size_t i = 0; i < add; i++) buf[used + i] = (float)src[i] / 32768.0f;
-                used += add;
+bool osa_m4a_decode(const char *path,float **frames,int64_t *n,int *rate,osa_error *err){
+    if(frames)*frames=NULL;if(n)*n=0;if(rate)*rate=0;
+    if(!path||!*path){osa_err_set(err,"no audio file");return false;}
+    mf_api *mf=load_mf();if(!mf){osa_err_set(err,"Media Foundation is unavailable; convert this file to WAV/MP3 or install the Windows Media Feature Pack");return false;}
+    wchar_t wpath[32768];int wn=MultiByteToWideChar(CP_UTF8,MB_ERR_INVALID_CHARS,path,-1,wpath,32768);if(!wn){osa_err_set(err,"invalid audio file path");return false;}
+    HRESULT hc=CoInitializeEx(NULL,COINIT_MULTITHREADED);
+    if(FAILED(hc)){osa_err_set(err,"cannot initialize COM MTA for audio decoding (0x%08lx)",(unsigned long)hc);return false;}
+    HRESULT hm=mf->startup(MF_VERSION,MFSTARTUP_LITE);
+    if(FAILED(hm)){CoUninitialize();osa_err_set(err,"Media Foundation could not start (0x%08lx)",(unsigned long)hm);return false;}
+    IMFSourceReader *reader=NULL;IMFMediaType *want=NULL;float *buf=NULL;size_t cap=0,used=0;bool ok=false;
+    HRESULT hr=mf->reader_url(wpath,NULL,&reader);
+    if(FAILED(hr)||!reader){osa_err_set(err,"Media Foundation cannot open this audio container (0x%08lx)",(unsigned long)hr);goto done;}
+    /* Deselect everything except the first audio stream. NULL attributes let
+     * the source resolver create and own a correct system byte stream. */
+    reader->lpVtbl->SetStreamSelection(reader,(DWORD)MF_SOURCE_READER_ALL_STREAMS,FALSE);
+    hr=reader->lpVtbl->SetStreamSelection(reader,(DWORD)MF_SOURCE_READER_FIRST_AUDIO_STREAM,TRUE);
+    if(FAILED(hr)){osa_err_set(err,"file has no selectable audio stream");goto done;}
+    hr=mf->media_type(&want);if(FAILED(hr)||!want){osa_err_set(err,"cannot allocate audio format");goto done;}
+    want->lpVtbl->SetGUID(want,&MF_MT_MAJOR_TYPE,&MFMediaType_Audio);
+    want->lpVtbl->SetGUID(want,&MF_MT_SUBTYPE,&MFAudioFormat_PCM);
+    want->lpVtbl->SetUINT32(want,&MF_MT_AUDIO_NUM_CHANNELS,1);
+    want->lpVtbl->SetUINT32(want,&MF_MT_AUDIO_SAMPLES_PER_SECOND,TARGET_RATE);
+    want->lpVtbl->SetUINT32(want,&MF_MT_AUDIO_BITS_PER_SAMPLE,16);
+    want->lpVtbl->SetUINT32(want,&MF_MT_AUDIO_BLOCK_ALIGNMENT,2);
+    want->lpVtbl->SetUINT32(want,&MF_MT_AUDIO_AVG_BYTES_PER_SECOND,TARGET_RATE*2);
+    hr=reader->lpVtbl->SetCurrentMediaType(reader,(DWORD)MF_SOURCE_READER_FIRST_AUDIO_STREAM,NULL,want);
+    if(FAILED(hr)){osa_err_set(err,"Windows cannot decode/resample this audio track (0x%08lx)",(unsigned long)hr);goto done;}
+    for(;;){
+        DWORD flags=0;IMFSample *sample=NULL;
+        hr=reader->lpVtbl->ReadSample(reader,(DWORD)MF_SOURCE_READER_FIRST_AUDIO_STREAM,0,NULL,&flags,NULL,&sample);
+        if(FAILED(hr)){if(sample)sample->lpVtbl->Release(sample);osa_err_set(err,"audio read failed (0x%08lx)",(unsigned long)hr);goto done;}
+        if(flags&MF_SOURCE_READERF_ENDOFSTREAM){if(sample)sample->lpVtbl->Release(sample);break;}
+        if(flags&MF_SOURCE_READERF_STREAMTICK){if(sample)sample->lpVtbl->Release(sample);continue;}
+        if(!sample)continue;
+        IMFMediaBuffer *mb=NULL;
+        if(SUCCEEDED(sample->lpVtbl->ConvertToContiguousBuffer(sample,&mb))&&mb){
+            BYTE *data=NULL;DWORD len=0;
+            if(SUCCEEDED(mb->lpVtbl->Lock(mb,&data,NULL,&len))&&data&&len){
+                size_t add=len/2;
+                if(add>(SIZE_MAX/sizeof(float))-used){mb->lpVtbl->Unlock(mb);mb->lpVtbl->Release(mb);sample->lpVtbl->Release(sample);osa_err_set(err,"audio too large");goto done;}
+                if(used+add>cap){size_t nc=cap?cap*2:65536;while(nc<used+add)nc*=2;float *nb=realloc(buf,nc*sizeof(float));if(!nb){mb->lpVtbl->Unlock(mb);mb->lpVtbl->Release(mb);sample->lpVtbl->Release(sample);osa_err_set(err,"out of memory decoding audio");goto done;}buf=nb;cap=nc;}
+                const BYTE *p=data;for(size_t i=0;i<add;i++){int16_t v=(int16_t)((uint16_t)p[2*i]|((uint16_t)p[2*i+1]<<8));buf[used+i]=(float)v/32768.0f;}used+=add;
                 mb->lpVtbl->Unlock(mb);
             }
             mb->lpVtbl->Release(mb);
         }
         sample->lpVtbl->Release(sample);
     }
-
-    if (!used) {
-        osa_err_set(err, "the AAC track is empty");
-        goto done;
-    }
-    if (frames) *frames = buf;
-    if (n) *n = (int64_t)used;
-    if (rate) *rate = OSAI_MF_TARGET_RATE;
-    buf = NULL;
-    ok = true;
-
+    if(!used){osa_err_set(err,"audio track contains no samples");goto done;}
+    if(frames)*frames=buf;else free(buf);
+    if(n)*n=(int64_t)used;if(rate)*rate=TARGET_RATE;buf=NULL;ok=true;osa_err_ok(err);
 done:
-    free(buf);
-    if (want) want->lpVtbl->Release(want);
-    if (reader) reader->lpVtbl->Release(reader);
-    if (stream) fs_Release((IStream *)&stream->vtbl);
-    if (mf_ok && mf->shutdown) mf->shutdown();
-    if (com) CoUninitialize();
-    return ok;
+    free(buf);if(want)want->lpVtbl->Release(want);if(reader)reader->lpVtbl->Release(reader);
+    mf->shutdown();CoUninitialize();return ok;
 }
-
-#endif /* _WIN32 */
-
-/* The definition above is the only one in the Windows build: src/core/audio_m4a.c
- * is compiled out by OSAI_WIN_MEDIA_FOUNDATION, which the Makefile passes to
- * every Windows object. */
+#endif
