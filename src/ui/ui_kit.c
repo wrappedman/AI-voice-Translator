@@ -709,9 +709,14 @@ bool ui_segmented(ui_context *u, int id, osa_rect r, const char *labels, int *va
 bool ui_stepper(ui_context *u, int id, osa_rect r, int *value, int vmin, int vmax) {
     bool changed = false;
     float bw = r.h;
-    char num[32];
+    char num[32], loctmp[64];
     snprintf(num, sizeof num, "%d", *value);
-    float num_w = text_measure(u->bold, UI_FS_BODY * u->L.scale, num) + 26 * u->L.scale;
+    /* Size the field for the digits that will actually be drawn: localised
+     * Persian digits are wider than Latin ones, and a field measured with "6"
+     * clipped "۴" to "f". */
+    if (u->L.rtl) text_localize_digits(num, "fa", loctmp, sizeof loctmp);
+    else osa_strlcpy(loctmp, num, sizeof loctmp);
+    float num_w = text_measure(u->bold, UI_FS_BODY * u->L.scale, loctmp) + 30 * u->L.scale;
     if (num_w < r.w * 0.34f) num_w = r.w * 0.34f;
     if (num_w > r.w - bw * 2 - 4) num_w = r.w - bw * 2 - 4;
 

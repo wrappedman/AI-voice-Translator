@@ -79,7 +79,11 @@ void shell_load_prefs(shell_state *s) {
     s->privacy_logs = true;
     s->show_phonetic = true;
     s->vad_sensitivity = 0.5f;
-    s->asr_threads = osa_cpu_count();
+    /* A fixed default, not the core count: the Settings screen shows this
+     * number, so using the host's core count would make the rendered snapshot
+     * depend on the machine (2 cores here, 4 in CI, 16 on a workstation) and the
+     * visual-regression job would fail on a difference that is not one. */
+    s->asr_threads = 4;
     if (s->asr_threads < 1) s->asr_threads = 1;
     if (s->asr_threads > 16) s->asr_threads = 16;
     osa_strlcpy(s->lang_src, "", sizeof s->lang_src);
