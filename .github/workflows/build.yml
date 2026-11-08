@@ -1,0 +1,92 @@
+name: build
+
+# Everything here runs offline except the toolchain fetch. The application
+# itself never touches the network, and neither do the tests.
+
+on:
+  push:
+    branches: [ main, "arena/**" ]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # ---------------------------------------------------------------------
+  # Portable tests: the engine, the app layer and the UI code all compile
+  # and run headless on Linux. This is the fast, high-signal job.
+  # ---------------------------------------------------------------------
+  test:
+    name: tests (linux)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Fetch zig
+        run: make bootstrap
+
+      - name: Build
+        run: make linux -j"$(nproc)"
+
+      - name: Unit + integration tests
+        run: make tests
+
+      - name: Render screens and diff against the committed baseline
+        run: |
+          # The renderer is required to be deterministic: it pins the clock and
+          # uses a throwaway data directory, so a clean checkout must reproduce
+          # the committed images byte for byte.
+          rm -rf /tmp/openspeech-snapshot
+          make snapshots
+          git add -A dist/screenshots
+          if ! git diff --cached --quiet; then
+            echo "::error::Rendered screens differ from dist/screenshots."
+            echo "Download the artifact below, check the images, then commit them."
+            git diff --cached --stat
+            exit 1
+          fi
+
+      - name: Upload screenshots
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: screenshots
+          path: dist/screenshots/*.png
+          if-no-files-found: warn
+
+  # ---------------------------------------------------------------------
+  # The shipped Windows binary. Built with zig cc against the mingw-w64
+  # target, statically linked, no runtime to install.
+  # ---------------------------------------------------------------------
+  windows:
+    name: windows x64
+    runs-on: ubuntu-latest
+    needs: test
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Fetch zig
+        run: make bootstrap
+
+      - name: Build OpenSpeechAI.exe
+        run: make win -j"$(nproc)"
+
+      - name: Verify the PE header
+        run: python3 tools/verify_exe.py dist/bin/OpenSpeechAI.exe
+
+      - name: Package and hash
+        run: make dist
+
+      - name: Publish the checksums
+        run: cat dist/checksums-*.txt >> "$GITHUB_STEP_SUMMARY"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: OpenSpeechAI-win64
+          path: |
+            dist/bin/OpenSpeechAI.exe
+            dist/OpenSpeechAI-*-win64.zip
+            dist/checksums-*.txt
+          if-no-files-found: error
