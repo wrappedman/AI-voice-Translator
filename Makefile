@@ -112,10 +112,13 @@ WIN_CXX  := $(ZIG) c++ -target x86_64-windows-gnu -O2 -static
 WIN_OBJ  := $(patsubst %.c,$(BUILD)/win/%.o,$(LIB_SRC)) \
             $(BUILD)/win/src/platform/mic.o \
             $(BUILD)/win/src/platform/win32/main_win.o \
+            $(BUILD)/win/src/platform/win32/m4a_mf.o \
             $(BUILD)/win/sqlite3.o $(BUILD)/win/stb_vorbis.o \
             $(BUILD)/win/ft.a $(BUILD)/win/hb.o $(BUILD)/win/res.o
 # Only system DLLs. No D2D/DWrite: the canvas renders with GDI, which exists on
 # every supported Windows version and keeps the import table tiny.
+# mfplat/mfreadwrite are *not* here on purpose: m4a_mf.c loads them by name, so
+# the exe keeps starting on a system where Media Foundation is absent.
 WIN_LIBS := -lws2_32 -lshlwapi -lshell32 -lole32 -loleaut32 -lgdi32 -luser32 \
             -ladvapi32 -luuid -lcomdlg32 -lversion -lbcrypt -lwinmm -lpsapi \
             -lwinhttp -lkernel32
@@ -125,7 +128,7 @@ win: $(WIN_BIN)
 
 $(BUILD)/win/%.o: %.c
 	@mkdir -p $(dir $@)
-	$(WIN_CC) -std=c11 $(INCLUDES) -c $< -o $@
+	$(WIN_CC) -std=c11 $(INCLUDES) -DOSAI_WIN_MEDIA_FOUNDATION -c $< -o $@
 
 $(BUILD)/win/sqlite3.o: $(SRC)/third_party/sqlite/sqlite3.c
 	@mkdir -p $(dir $@)

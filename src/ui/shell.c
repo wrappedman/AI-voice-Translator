@@ -57,10 +57,13 @@ static const char *nav_label_key(shell_screen s) {
 static bool lt_fa(shell_state *s) { return s->lang == UI_FA; }
 
 const char *shell_lang_name(shell_state *s, const char *code) {
-    (void)s;
     if (!code || !*code) return "—";
+    /* The language's own name is what a drop-down shows, but a *sentence* about
+     * a language has to be in one script: an English word inside a Persian
+     * sentence reads as a bug in the interface, not as a language name. */
+    bool fa = s && s->lang == UI_FA;
     if (osa_starts(code, "fa")) return "فارسی";
-    if (osa_starts(code, "en")) return "English";
+    if (osa_starts(code, "en")) return fa ? "انگلیسی" : "English";
     return code;
 }
 
@@ -156,11 +159,12 @@ bool shell_init(shell_state *s, osa_app *app) {
     memset(s, 0, sizeof *s);
     s->app = app;
     s->screen = SCREEN_TRANSCRIBE;
+    s->ds_sel = -1;              /* -1: the bundled lexicon, no dataset file */
     shell_load_prefs(s);
     /* a useful starting sentence, in the user's own language, so the Translate
      * screen is not an empty box on first run */
     osa_strlcpy(s->tr_in, "از آشنایی با شما خوشحالم", sizeof s->tr_in);
-    shell_run_translate(s);
+    shell_run_translate_silent(s);       /* pre-filled, not a user action */
     return true;
 }
 
@@ -198,6 +202,14 @@ void shell_speak(shell_state *s, const char *text, const char *lang) {
     else shell_set_message(s, true, "%s", tt(s->lang, "msg.noplay"));
 }
 
+/* How long a message stays on screen. Errors are not permanent either: a red
+ * band that never goes away is indistinguishable from a broken screen, and the
+ * user asked for exactly that behaviour. Everything that matters is written to
+ * the fault log / the row it belongs to as well, so the toast is a notification,
+ * not the record. */
+#define OSAI_TOAST_MS_CLEAR 3500
+#define OSAI_TOAST_MS_ERROR 5500
+
 void shell_set_message(shell_state *s, bool err, const char *fmt, ...) {
     if (!s) return;
     va_list ap;
@@ -205,6 +217,20 @@ void shell_set_message(shell_state *s, bool err, const char *fmt, ...) {
     vsnprintf(s->message, sizeof s->message, fmt, ap);
     va_end(ap);
     s->message_is_error = err;
+    s->message_at_ms = osa_now_ms();
+    s->message_life_ms = err ? OSAI_TOAST_MS_ERROR : OSAI_TOAST_MS_CLEAR;
+}
+
+/* Called once per frame, before the screens draw. A message whose time is up is
+ * dropped here so every screen gets the same behaviour instead of each one
+ * clearing (or not clearing) the band itself. */
+void shell_message_tick(shell_state *s) {
+    if (!s || !s->message[0]) return;
+    if (s->message_life_ms <= 0) s->message_life_ms = OSAI_TOAST_MS_CLEAR;
+    if (osa_now_ms() - s->message_at_ms >= s->message_life_ms) {
+        s->message[0] = 0;
+        s->message_is_error = false;
+    }
 }
 
 /* ---- waveform ----------------------------------------------------- */
@@ -306,10 +332,20 @@ bool shell_load_transcript(shell_state *s, const char *id, const char *text,
     return true;
 }
 
-void shell_run_translate(shell_state *s) {
+/* `announce` is false when the call comes from the editor translating as the
+ * user types: a status line on every keystroke is noise. The button always
+ * announces, because a press that produces no visible change is what made the
+ * button look broken in the first place. */
+static void translate_impl(shell_state *s, bool announce) {
+    if (!s || !s->app) return;
+    /* An empty box with a button that does nothing is indistinguishable from a
+     * broken button, so this says what is missing instead of returning. */
+    if (!s->tr_in[0]) {
+        shell_set_message(s, true, "%s", tt(s->lang, "translate.emptyinput"));
+        return;
+    }
     s->tr_out[0] = 0;
     s->tr_phonetic[0] = 0;
-    if (!s->app || !s->tr_in[0]) return;
     osa_error err;
     osa_app_translation mt;
     /* "" means "use the detect setting": when auto-detect is off the stored
@@ -330,7 +366,16 @@ void shell_run_translate(shell_state *s) {
         osa_strlcpy(s->lang_src, mt.source_lang, sizeof s->lang_src);
     if (!s->lang_dst[0] && mt.target_lang[0])
         osa_strlcpy(s->lang_dst, mt.target_lang, sizeof s->lang_dst);
+    if (announce) {
+        const char *from = shell_lang_name(s, mt.source_lang);
+        const char *to = shell_lang_name(s, mt.target_lang);
+        shell_set_message(s, false, "%s (%s \342\206\220 %s)",
+                          tt(s->lang, "translate.done"), from, to);
+    }
 }
+
+void shell_run_translate(shell_state *s) { translate_impl(s, true); }
+void shell_run_translate_silent(shell_state *s) { translate_impl(s, false); }
 
 /* ---- sidebar ------------------------------------------------------ */
 
@@ -959,6 +1004,7 @@ static void draw_transcribe(shell_state *s, ui_context *u, osa_rect body) {
 void shell_draw(shell_state *s, osa_canvas *c, ui_context *u, const ui_input *in) {
     if (!s || !c || !u) return;
     s->frame++;
+    shell_message_tick(s);
     ui_frame_begin(u, c, in);
 
     ui_set_theme(u, s->dark);

@@ -196,6 +196,25 @@ static void test_audio(void) {
     free(samples);
     osa_file_remove(path);
     osa_file_remove(sp);
+
+    /* AAC/M4A goes through a platform hook. Where there is no decoder the
+     * answer must be an honest refusal that names the format, not a silent
+     * failure or a crash: the picker offers .m4a on every build. */
+    {
+        const char *fake = "/tmp/osai_test_fake.m4a";
+        CHECK(osa_file_write_atomic(fake, "not really audio", 16));
+        osa_audio m4a;
+        osa_error e;
+        bool ok = osa_audio_load(fake, &m4a, &e);
+#if defined(_WIN32)
+        (void)ok;
+#else
+        CHECK_MSG(!ok, "the headless build has no AAC decoder");
+        CHECK_MSG(e.msg[0] != 0, "the refusal carries a message");
+#endif
+        if (ok) osa_audio_free(&m4a);
+        osa_file_remove(fake);
+    }
 }
 
 /* ---- TTS ---------------------------------------------------------- */
@@ -731,17 +750,22 @@ static void test_app(void) {
         static osa_pack_info packs[32];
         int np = osa_app_packs(app, packs, 32);
         CHECK_MSG(np > 0, "catalogue entries: %d", np);
-        int installable = 0, manual = 0, installed = 0;
+        int offline = 0, downloads = 0, installed = 0;
         for (int i = 0; i < np; i++) {
-            if (packs[i].installable) installable++;
-            else manual++;
+            if (packs[i].installable) offline++;
+            else if (packs[i].url[0]) downloads++;
             if (packs[i].installed) installed++;
             CHECK_MSG(packs[i].id[0] && packs[i].name[0] && packs[i].license[0],
                       "entry %d is complete", i);
         }
-        CHECK_MSG(installable >= 8, "offline-installable entries: %d", installable);
+        /* Two kinds of offer, and nothing else: built here (offline) or
+         * downloaded by URL. A third kind that means "go and find a file" is
+         * what the Models screen used to be full of. */
+        CHECK_MSG(offline + downloads == np, "%d offline + %d downloads == %d rows",
+                  offline, downloads, np);
+        CHECK_MSG(offline >= 12, "offline-installable entries: %d", offline);
+        CHECK_MSG(downloads >= 4, "downloadable entries: %d", downloads);
         CHECK_MSG(installed >= 2, "already installed: %d", installed);
-        CHECK(manual > 0);            /* and the rest says why, honestly */
 
         const char *src = "بیمار در بیمارستان";
         osa_app_translation tr_a, tr_b;
@@ -773,6 +797,64 @@ static void test_app(void) {
         CHECK(!osa_app_install_builtin_pack(app, "ggml-tiny", &re));
         CHECK_MSG(re.msg[0] != 0, "refusal reason: %s", re.msg);
         CHECK(!osa_app_install_builtin_pack(app, "no-such-pack", &re));
+    }
+
+    /* ---- every catalogue row must be actionable ----------------------
+     * The Models screen listed seven entries that could only be satisfied by
+     * finding a file by hand, which is not a button: "many models have no
+     * download button" was the report. The rule is now mechanical — a row is
+     * either installed, installable offline, or a real download URL — and this
+     * asserts it, so a new entry cannot reintroduce the dead end. */
+    {
+        osa_pack_info all[32];
+        int n = osa_app_packs(app, all, 32);
+        CHECK(n >= 17);
+        int dead = 0, offline = 0, remote = 0;
+        for (int i = 0; i < n; i++) {
+            if (all[i].installable) offline++;
+            else if (all[i].url[0]) remote++;
+            else if (!all[i].installed) { dead++; printf("    no action for %s\n", all[i].id); }
+        }
+        CHECK_MSG(dead == 0, "%d catalogue rows offer no action", dead);
+        CHECK_MSG(offline >= 12, "%d rows install offline", offline);
+        CHECK_MSG(remote >= 4, "%d rows are real downloads", remote);
+        /* the four that used to be manual are now built, and each produces a
+         * loadable model rather than a text table */
+        const char *models[] = { "asr-large-fa", "ggml-small-fa",
+                                 "mt-opus-fa-en", "mt-opus-en-fa" };
+        for (int i = 0; i < 4; i++) {
+            osa_error e;
+            CHECK_MSG(osa_app_install_builtin_pack(app, models[i], &e),
+                      "install %s: %s", models[i], e.msg);
+            bool now = false;
+            int n2 = osa_app_packs(app, all, 32);
+            for (int k = 0; k < n2; k++)
+                if (osa_streq(all[k].id, models[i])) now = all[k].installed;
+            CHECK_MSG(now, "%s is listed as installed", models[i]);
+        }
+    }
+
+    /* ---- training data is pickable inside the application ------------ */
+    {
+        osa_dataset_info ds[8];
+        int n = osa_app_datasets(app, ds, 8);
+        CHECK_MSG(n >= 3, "%d bundled training sets", n);
+        for (int i = 0; i < n; i++) CHECK(ds[i].installable);
+        osa_error e;
+        char path[OSAI_MAX_PATH];
+        CHECK_MSG(osa_app_install_dataset(app, ds[0].id, path, sizeof path, &e),
+                  "build %s: %s", ds[0].id, e.msg);
+        CHECK(osa_file_exists(path));
+        int n2 = osa_app_datasets(app, ds, 8);
+        CHECK(ds[0].installed);
+        CHECK_MSG(ds[0].n_pairs > 0, "%d pairs in the built set", ds[0].n_pairs);
+        (void)n2;
+        /* and the trainer actually consumes it */
+        osa_train_result tr;
+        memset(&tr, 0, sizeof tr);
+        CHECK_MSG(osa_app_train(app, path, 1, &tr, &e), "train on the built set: %s", e.msg);
+        CHECK_MSG(tr.n_added > 0, "%d exemplars added from the dataset", tr.n_added);
+        CHECK(tr.model_id[0] != 0);
     }
 
     osa_app_destroy(app);

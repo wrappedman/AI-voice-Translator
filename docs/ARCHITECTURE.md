@@ -50,7 +50,7 @@ was forced by verifiability, and it is documented honestly instead of shipping a
 │  n-gram language model   │  (imported as local packs)         │
 │  lang-id + text norm     │                                    │
 ├──────────────────────────┴────────────────────────────────────┤
-│ Audio pipeline (WAV/MP3/FLAC decode, resample, VAD, chunking) │
+│ Audio pipeline (WAV/MP3/M4A/FLAC/OGG, resample, VAD, chunking)│
 ├───────────────────────────────────────────────────────────────┤
 │ Persistence: SQLite (18 tables) + filesystem artifact store   │
 │ Network: WinHTTP/BSD sockets, resumable downloads, SHA-256    │

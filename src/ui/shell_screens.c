@@ -73,11 +73,27 @@ static void stat_tile(ui_context *u, osa_rect r, const char *label, const char *
 
 /* ---- Live --------------------------------------------------------- */
 
+/* Live capture state. One growing segment of audio is recognised again every
+ * time it gets longer, and the text of the whole segment replaces the pane.
+ *
+ * This is the important detail: the recogniser is an exemplar decoder, not a
+ * streaming one, and it needs enough audio to decide. Feeding it the last 300 ms
+ * of a sentence produces single stray words ("را", "به"), which is exactly the
+ * "it records but recognises nothing" report. So a pass only runs once there is
+ * at least LIVE_MIN_S seconds, and each pass sees the whole segment from its
+ * start — the transcript of a growing segment is stable in a way that a
+ * transcript of sliding windows never is. */
+#define LIVE_MIN_S      1.2        /* no pass before this much audio       */
+#define LIVE_SEG_MAX_S  25.0       /* commit and start a new segment here  */
+
 static struct {
     osa_mic *mic;
-    float    ring[OSAI_SR * 30];   /* 30 s of audio, enough for a sentence-pair */
+    float    ring[OSAI_SR * 30];
     int64_t  n;
-    double   last_emit;
+    double   since_emit;
+    /* text already committed from earlier segments, and the tail currently
+     * being recognised; the pane shows committed + partial */
+    char     committed[2048];
     char     partial[1024];
     char     final_text[4096];
     char     translation[4096];
@@ -85,37 +101,77 @@ static struct {
 
 static void live_reset(void) {
     g_live.n = 0;
-    g_live.last_emit = 0;
+    g_live.since_emit = 0;
+    g_live.committed[0] = 0;
     g_live.partial[0] = 0;
     g_live.final_text[0] = 0;
     g_live.translation[0] = 0;
 }
 
-/* Transcribes whatever is in the ring buffer. Called every ~700 ms while the
- * user speaks, so the transcript appears as it is spoken instead of only after
- * the stop button — which is what "live" has to mean. */
+static void live_join(char *dst, size_t cap, const char *a, const char *b) {
+    if (a && *a && b && *b) snprintf(dst, cap, "%s %s", a, b);
+    else osa_strlcpy(dst, (a && *a) ? a : (b ? b : ""), cap);
+}
+
+/* Recognises the current segment and updates the panes. Returns true when the
+ * text changed. */
 static bool live_emit(shell_state *s) {
-    if (g_live.n < OSAI_SR / 4) return false;
+    if (g_live.n < (int64_t)(OSAI_SR * LIVE_MIN_S)) return false;
     osa_app_transcript tr;
     osa_error err;
+    osa_err_ok(&err);
     if (!osa_app_transcribe_samples(s->app, g_live.ring, g_live.n, &tr, &err)) return false;
     if (!tr.text[0]) return false;
-    osa_strlcpy(g_live.final_text, tr.text, sizeof g_live.final_text);
+    osa_strlcpy(g_live.partial, tr.text, sizeof g_live.partial);
+    char joined[4096];
+    live_join(joined, sizeof joined, g_live.committed, g_live.partial);
+    if (osa_streq(joined, g_live.final_text)) return false;
+    osa_strlcpy(g_live.final_text, joined, sizeof g_live.final_text);
     osa_app_translation mt;
-    if (osa_app_translate(s->app, tr.text, NULL, &mt, &err))
+    osa_err_ok(&err);
+    if (osa_app_translate(s->app, g_live.final_text, "", &mt, &err))
         osa_strlcpy(g_live.translation, mt.text, sizeof g_live.translation);
+    s->live_words = 0;
+    for (const char *c = g_live.final_text; *c; c++) if (*c == ' ') s->live_words++;
+    if (g_live.final_text[0]) s->live_words++;
     return true;
 }
 
+/* A segment that has grown past the window is committed and the buffer starts
+ * again from empty. Doing it in the recognition path (not on a timer) keeps the
+ * commit aligned with text the user has already seen. */
+static void live_commit_if_long(shell_state *s) {
+    if (g_live.n < (int64_t)(OSAI_SR * LIVE_SEG_MAX_S)) return;
+    if (g_live.partial[0]) {
+        char joined[4096];
+        live_join(joined, sizeof joined, g_live.committed, g_live.partial);
+        osa_strlcpy(g_live.committed, joined, sizeof g_live.committed);
+        g_live.partial[0] = 0;
+    }
+    /* keep the last 2 s as the context lead-in for the next segment */
+    int64_t keep = OSAI_SR * 2;
+    if (keep > g_live.n) keep = g_live.n;
+    memmove(g_live.ring, g_live.ring + (g_live.n - keep), (size_t)keep * sizeof(float));
+    g_live.n = keep;
+    (void)s;
+}
+
 static void live_stop(shell_state *s) {
-    if (g_live.n > 0) live_emit(s);
+    /* one last pass over whatever was captured after the previous one, so the
+     * end of the sentence is not lost to the 700 ms cadence */
+    bool got = live_emit(s);
     if (g_live.mic) { osa_mic_close(g_live.mic); g_live.mic = NULL; }
     s->live = false;
     s->live_level = 0;
     if (g_live.final_text[0]) {
+        osa_strlcpy(s->translation, g_live.translation, sizeof s->translation);
         shell_set_message(s, false, "%s", kl(s, "live.done"));
         free(s->history_json);
         s->history_json = osa_app_history_json(s->app, 100, NULL);
+    } else {
+        /* Silence, a muted microphone or a device that recorded nothing used to
+         * end in a cheerful "done" with two empty panes. Say which it is. */
+        shell_set_message(s, !got, "%s", kl(s, got ? "live.nothing" : "live.silent"));
     }
 }
 
@@ -123,24 +179,20 @@ void shell_live_tick(shell_state *s, double dt) {
     if (!s->live || !g_live.mic) return;
     s->live_time += dt;
     float buf[1600];
-    int n = osa_mic_read(g_live.mic, buf, 1600);
-    s->live_level = osa_mic_level(g_live.mic);
-    if (n > 0) {
+    int n;
+    /* drain the device every tick: the reader is what re-queues finished
+     * buffers, so not reading would stop capture after one buffer */
+    while ((n = osa_mic_read(g_live.mic, buf, 1600)) > 0) {
         for (int i = 0; i < n && g_live.n < (int64_t)(sizeof g_live.ring / sizeof g_live.ring[0]); i++)
             g_live.ring[g_live.n++] = buf[i];
-        /* the ring is fixed: once it fills, drop the oldest half so a long
-         * session keeps working instead of going silent */
-        if (g_live.n >= (int64_t)(sizeof g_live.ring / sizeof g_live.ring[0])) {
-            int64_t half = g_live.n / 2;
-            memmove(g_live.ring, g_live.ring + half,
-                    (size_t)(g_live.n - half) * sizeof(float));
-            g_live.n -= half;
-        }
-        g_live.last_emit += dt;
-        if (g_live.last_emit >= 0.7) {
-            g_live.last_emit = 0;
-            live_emit(s);
-        }
+        if (g_live.n >= (int64_t)(sizeof g_live.ring / sizeof g_live.ring[0])) break;
+    }
+    s->live_level = osa_mic_level(g_live.mic);
+    g_live.since_emit += dt;
+    if (g_live.since_emit >= 0.7) {
+        g_live.since_emit = 0;
+        live_emit(s);
+        live_commit_if_long(s);
     }
 }
 
@@ -517,7 +569,7 @@ static void draw_translate(shell_state *s, ui_context *u, osa_rect body) {
                           in_r.h - 50 * u->L.scale - btn_h - 24 * u->L.scale);
     ui_field_hint(kl(s, "translate.placeholder"));
     bool changed = ui_text_area(u, 3200, area, s->tr_in, sizeof s->tr_in, 3800);
-    if (changed) shell_run_translate(s);
+    if (changed) shell_run_translate_silent(s);
 
     float bw = 138 * u->L.scale;
     float by = in_r.y + in_r.h - btn_h - 14 * u->L.scale;
@@ -807,8 +859,7 @@ static void draw_pack_row(shell_state *s, ui_context *u, osa_rect r, const osa_p
      * of repeating the pack's marketing copy. */
     const char *line3 = p->installed ? kl(s, "models.hintbundled")
                        : p->installable ? kl(s, "models.hintbuild")
-                       : p->url[0]   ? kl(s, "models.hintdownload")
-                                     : kl(s, "models.hintlocalfile");
+                       : kl(s, "models.hintdownload");
     ui_label(u, rectf(tx, r.y + 42 * u->L.scale, tw, 16 * u->L.scale), line3,
              UI_FS_TINY * u->L.scale, col_alpha(u->t.text_faint, 0.85f),
              u->L.rtl ? 2 : 0);
@@ -823,7 +874,7 @@ static void draw_pack_row(shell_state *s, ui_context *u, osa_rect r, const osa_p
         if (s->downloading && osa_streq(s->dl_pack, p->id)) {
             c_fill_round(u->c, ar, u->L.radius_sm, u->t.panel_alt);
             ui_progress(u, rect_inset(ar, 9 * u->L.scale), (float)s->dl_progress, u->t.accent);
-        } else if (ui_button(u, 5200 + idx, ar, kl(s, "btn.install"), false)) {
+        } else if (ui_button(u, 5200 + idx, ar, kl(s, "models.get"), false)) {
             *clicked_idx = idx;
         } else if (hov && u->in.clicked && !u->consumed_click) {
             u->consumed_click = true;
@@ -838,7 +889,7 @@ static void draw_pack_row(shell_state *s, ui_context *u, osa_rect r, const osa_p
         c_fill_round(u->c, ar, u->L.radius_sm, u->t.panel_alt);
         ui_progress(u, rect_inset(ar, 9 * u->L.scale), (float)s->dl_progress, u->t.accent);
     } else {
-        bool b = ui_button(u, 5200 + idx, ar, kl(s, "btn.download"), false);
+        bool b = ui_button(u, 5200 + idx, ar, kl(s, "models.get"), false);
         if (b || (hov && u->in.clicked && !u->consumed_click)) *clicked_idx = idx;
     }
 }
@@ -1229,7 +1280,10 @@ static void draw_training(shell_state *s, ui_context *u, osa_rect body) {
     }
     y += row_h + 4 * u->L.scale;
 
-    /* dataset: bundled lexicon or a file the user picked */
+    /* dataset: a list inside the app, the same shape as the Models screen, plus
+     * the file picker for a set of the user's own. A button that opens an empty
+     * file dialog is not a way to pick training data on a fresh install, which
+     * is why the row starts with the sets the application can build itself. */
     {
         osa_rect note = rectf(cfg.x + p, y, cfg.w - p * 2, 74 * u->L.scale);
         c_fill_round(u->c, note, u->L.radius_sm, u->t.panel_alt);
@@ -1243,11 +1297,38 @@ static void draw_training(shell_state *s, ui_context *u, osa_rect body) {
         ui_label(u, rectf(note.x + 12 * u->L.scale, note.y + 24 * u->L.scale,
                           note.w - 24 * u->L.scale, 20 * u->L.scale),
                  name, UI_FS_SMALL * u->L.scale, u->t.text, u->L.rtl ? 2 : 0);
-        float bw = note.w - 24 * u->L.scale;
-        if (ui_button_ghost(u, 6110, rectf(note.x + 12 * u->L.scale,
-                                           note.y + 46 * u->L.scale, bw, 22 * u->L.scale),
-                            kl(s, "training.choose")))
+        /* two actions, both labelled with what they do: the list the app owns,
+         * and the file the user already has */
+        float bw = (note.w - 24 * u->L.scale - 8 * u->L.scale) * 0.5f;
+        float bx = note.x + 12 * u->L.scale;
+        osa_rect pick_r = rectf(u->L.rtl ? bx + bw + 8 * u->L.scale : bx,
+                                note.y + 46 * u->L.scale, bw, 22 * u->L.scale);
+        osa_rect list_r = rectf(u->L.rtl ? bx : bx + bw + 8 * u->L.scale,
+                                note.y + 46 * u->L.scale, bw, 22 * u->L.scale);
+        if (ui_button_ghost(u, 6110, pick_r, kl(s, "training.choose")))
             s->request = SHELL_REQ_PICK_DATASET;
+        bool open = (u->popup_id == 6111);
+
+        if (ui_dropdown(u, 6111, list_r, kl(s, "training.chooselist"), open)) {
+            static osa_dataset_info ds[8];
+            int nds = s->app ? osa_app_datasets(s->app, ds, 8) : 0;
+            int n = 1;
+            osa_strlcpy(u->popup_items[0], kl(s, "training.datasetbuiltin"),
+                        sizeof u->popup_items[0]);
+            for (int i = 0; i < nds && n < 12; i++, n++) {
+                /* name, then the state: a 64-column popup row cannot hold the
+                 * catalogue's long Persian titles, and "installed or not" is
+                 * what the choice actually depends on */
+                snprintf(u->popup_items[n], sizeof u->popup_items[n], "%s — %s",
+                         ds[i].name, kl(s, ds[i].installed ? "training.ready"
+                                                           : "training.build"));
+            }
+            u->popup_n = n;
+            u->popup_id = open ? 0 : 6111;
+            u->popup_rect = list_r;
+            u->popup_sel = 0;
+            if (s->ds_sel >= 0) u->popup_sel = s->ds_sel + 1;
+        }
     }
     y += 86 * u->L.scale;
 
@@ -2103,6 +2184,38 @@ void shell_popup_commit(shell_state *s, int popup_id, int sel) {
         case 6100:                      /* training language */
             s->train_lang = sel;
             break;
+        case 6111: {                    /* training data: the in-app list */
+            if (sel == 0) {
+                s->ds_sel = -1;
+                s->dataset_path[0] = 0;
+                shell_set_message(s, false, "%s", kl(s, "training.datasetbuiltin"));
+                break;
+            }
+            static osa_dataset_info ds[8];
+            int nds = s->app ? osa_app_datasets(s->app, ds, 8) : 0;
+            int i = sel - 1;
+            if (i < 0 || i >= nds) break;
+            if (ds[i].installed) {
+                osa_strlcpy(s->dataset_path, ds[i].path, sizeof s->dataset_path);
+                s->ds_sel = i;
+                shell_set_message(s, false, "%s", kl(s, "training.datasetset"));
+            } else {
+                /* building a set writes a few hundred small WAVs; doing it when
+                 * it is picked (not when the run starts) keeps the run quick and
+                 * makes the choice verifiable before anything is trained */
+                osa_error err;
+                osa_err_ok(&err);
+                char path[OSAI_MAX_PATH];
+                if (osa_app_install_dataset(s->app, ds[i].id, path, sizeof path, &err)) {
+                    osa_strlcpy(s->dataset_path, path, sizeof s->dataset_path);
+                    s->ds_sel = i;
+                    shell_set_message(s, false, "%s", kl(s, "training.datasetready"));
+                } else {
+                    shell_set_message(s, true, "%s: %s", kl(s, "msg.failed"), err.msg);
+                }
+            }
+            break;
+        }
         default:
             break;
     }

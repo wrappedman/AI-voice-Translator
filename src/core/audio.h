@@ -1,5 +1,7 @@
 /* audio.h — decoding, resampling, VAD, chunking and feature extraction.
- * Decoders: WAV (PCM/float), MP3, FLAC, OGG/Vorbis — all in-tree, no ffmpeg. */
+ * Decoders: WAV (PCM/float), MP3, FLAC, OGG/Vorbis — all in-tree, no ffmpeg.
+ * M4A/MP4/AAC goes through an optional platform hook (audio_m4a.h): Media
+ * Foundation on Windows, unavailable elsewhere. */
 #ifndef OSAI_AUDIO_H
 #define OSAI_AUDIO_H
 

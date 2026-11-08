@@ -11,64 +11,93 @@
 #include <windows.h>
 #include <mmsystem.h>
 
-#define MIC_BUFS 8
-#define MIC_FRAMES 1600            /* 100 ms at 16 kHz */
+/* Two buffers of 500 ms. Small buffers keep the latency down; large ones keep
+ * the number of callbacks (and therefore lock acquisitions) down. 500 ms is
+ * where a live transcript still feels live without the callback waking the
+ * process twenty times a second. */
+#define MIC_BUFS 2
+#define MIC_FRAMES 8000            /* 500 ms at 16 kHz */
 
 typedef struct mic_buf {
     WAVEHDR hdr;
     int16_t data[MIC_FRAMES];
 } mic_buf;
 
+/* The event-driven form of waveIn, deliberately.
+ *
+ * The callback form (CALLBACK_FUNCTION) cannot re-queue its buffer from inside
+ * the callback — the winmm documentation says so, and doing it anyway is what
+ * made stopping the microphone freeze the application: waveInReset() waits for
+ * the driver's callbacks to finish, while our callback waits inside
+ * waveInAddBuffer() for the device lock waveInReset() is holding. A deadlock
+ * that only shows up on the stop press, i.e. exactly what the report described.
+ *
+ * With CALLBACK_EVENT the audio thread never runs our code: the reader polls
+ * the event (osa_mic_read is already non-blocking for the UI) and re-queues
+ * finished buffers from the caller's thread, where waveIn calls are legal.
+ * Closing is then just stop, unprepare, close — no callback can be in flight. */
 struct osa_mic {
     HWAVEIN         h;
+    HANDLE          evt;
     int             sr;
     mic_buf         bufs[MIC_BUFS];
     int             n_bufs;
     CRITICAL_SECTION lock;
-    /* one decoded 16-bit frame ready for the reader */
-    float           pending[MIC_FRAMES * 2];
-    int             pending_n;
-    int             pending_at;
+    /* decoded 16-bit frames ready for the reader; a ring so a slow frame does
+     * not lose audio that already arrived */
+    float           pending[MIC_FRAMES * 4];
+    int             pend_start, pend_len;
     int64_t         total;
     float           level;
-    bool            open;
+    volatile LONG   open;
 };
 
-static void CALLBACK mic_cb(HWAVEIN hwi, UINT msg, DWORD_PTR inst, DWORD_PTR p1, DWORD_PTR p2) {
-    (void)hwi; (void)p2;
-    if (msg != WIM_DATA) return;
-    osa_mic *m = (osa_mic *)inst;
-    if (!m) return;
-    WAVEHDR *hdr = (WAVEHDR *)p1;
-    EnterCriticalSection(&m->lock);
-    int n = (int)(hdr->dwBytesRecorded / sizeof(int16_t));
-    if (n > 0) {
-        /* decode into the pending buffer; if the reader fell behind, drop the
-         * oldest audio rather than growing without bound (a live transcription
-         * that lags is worse than one that skips) */
-        if (m->pending_at + n > (int)(sizeof m->pending / sizeof m->pending[0])) {
-            memmove(m->pending, m->pending + m->pending_at,
-                    (size_t)(m->pending_n - m->pending_at) * sizeof(float));
-            m->pending_n -= m->pending_at;
-            m->pending_at = 0;
+/* Pulls every finished buffer into the ring and hands it straight back to the
+ * driver. Called from the reader's thread only, so no locking is required
+ * around the waveIn calls themselves; the ring is guarded because the level
+ * meter and the reader may be the same thread anyway — cheap and harmless. */
+static void mic_service(osa_mic *m) {
+    for (int i = 0; i < m->n_bufs; i++) {
+        WAVEHDR *hdr = &m->bufs[i].hdr;
+        if (!(hdr->dwFlags & WHDR_DONE)) continue;
+        int n = (int)(hdr->dwBytesRecorded / sizeof(int16_t));
+        if (n > 0) {
+            EnterCriticalSection(&m->lock);
+            int room = (int)(sizeof m->pending / sizeof m->pending[0]) - m->pend_len;
+            if (n > room) {
+                /* the reader fell behind by more than two seconds: drop the
+                 * oldest audio rather than growing without bound (a live
+                 * transcript that lags is worse than one that skips) */
+                int drop = n - room;
+                if (drop >= m->pend_len) { m->pend_start = 0; m->pend_len = 0; }
+                else {
+                    m->pend_start = (m->pend_start + drop) %
+                                    (int)(sizeof m->pending / sizeof m->pending[0]);
+                    m->pend_len -= drop;
+                }
+                room = (int)(sizeof m->pending / sizeof m->pending[0]) - m->pend_len;
+            }
+            const int16_t *src = (const int16_t *)hdr->lpData;
+            int cap = (int)(sizeof m->pending / sizeof m->pending[0]);
+            float peak = m->level;
+            for (int k = 0; k < n && k < room; k++) {
+                float v = (float)src[k] * (1.0f / 32768.0f);
+                m->pending[(m->pend_start + m->pend_len + k) % cap] = v;
+                float a = fabsf(v);
+                if (a > peak) peak = a;
+            }
+            int take = n < room ? n : room;
+            m->pend_len += take;
+            m->total += take;
+            m->level = peak * 0.85f + m->level * 0.15f;
+            LeaveCriticalSection(&m->lock);
         }
-        if (m->pending_at + n > (int)(sizeof m->pending / sizeof m->pending[0]))
-            n = (int)(sizeof m->pending / sizeof m->pending[0]) - m->pending_at;
-        const int16_t *src = (const int16_t *)hdr->lpData;
-        float peak = m->level;
-        for (int i = 0; i < n; i++) {
-            float v = (float)src[i] * (1.0f / 32768.0f);
-            m->pending[m->pending_at + i] = v;
-            float a = fabsf(v);
-            if (a > peak) peak = a;
-        }
-        m->pending_at += n;
-        if (m->pending_at > m->pending_n) m->pending_n = m->pending_at;
-        m->level = peak * 0.85f + m->level * 0.15f;
-        m->total += n;
+        hdr->dwFlags &= ~WHDR_DONE;
+        hdr->dwBytesRecorded = 0;
+        if (InterlockedCompareExchange(&m->open, 1, 1))
+            waveInAddBuffer(m->h, hdr, sizeof(WAVEHDR));
     }
-    LeaveCriticalSection(&m->lock);
-    waveInAddBuffer(hwi, hdr, sizeof(WAVEHDR));
+    ResetEvent(m->evt);
 }
 
 osa_mic *osa_mic_open(int sample_rate, osa_error *err) {
@@ -77,6 +106,13 @@ osa_mic *osa_mic_open(int sample_rate, osa_error *err) {
     if (!m) { osa_err_set(err, "out of memory"); return NULL; }
     m->sr = sample_rate;
     InitializeCriticalSection(&m->lock);
+    m->evt = CreateEventW(NULL, TRUE, FALSE, NULL);
+    if (!m->evt) {
+        DeleteCriticalSection(&m->lock);
+        free(m);
+        osa_err_set(err, "no microphone available (no event)");
+        return NULL;
+    }
     WAVEFORMATEX wf;
     memset(&wf, 0, sizeof wf);
     wf.wFormatTag = WAVE_FORMAT_PCM;
@@ -85,14 +121,16 @@ osa_mic *osa_mic_open(int sample_rate, osa_error *err) {
     wf.wBitsPerSample = 16;
     wf.nBlockAlign = (WORD)(wf.nChannels * wf.wBitsPerSample / 8);
     wf.nAvgBytesPerSec = wf.nSamplesPerSec * wf.nBlockAlign;
-    MMRESULT r = waveInOpen(&m->h, WAVE_MAPPER, &wf, (DWORD_PTR)mic_cb, (DWORD_PTR)m,
-                            CALLBACK_FUNCTION);
+    MMRESULT r = waveInOpen(&m->h, WAVE_MAPPER, &wf, (DWORD_PTR)m->evt, 0,
+                            CALLBACK_EVENT);
     if (r != MMSYSERR_NOERROR) {
+        CloseHandle(m->evt);
         DeleteCriticalSection(&m->lock);
         free(m);
         osa_err_set(err, "no microphone available (waveIn error %u)", (unsigned)r);
         return NULL;
     }
+    m->n_bufs = 0;
     for (int i = 0; i < MIC_BUFS; i++) {
         memset(&m->bufs[i], 0, sizeof(WAVEHDR));
         m->bufs[i].hdr.lpData = (LPSTR)m->bufs[i].data;
@@ -101,28 +139,30 @@ osa_mic *osa_mic_open(int sample_rate, osa_error *err) {
         if (waveInAddBuffer(m->h, &m->bufs[i].hdr, sizeof(WAVEHDR)) != MMSYSERR_NOERROR) break;
         m->n_bufs++;
     }
+    InterlockedExchange(&m->open, 1);
     if (m->n_bufs == 0 || waveInStart(m->h) != MMSYSERR_NOERROR) {
-        if (m->h) waveInClose(m->h);
+        InterlockedExchange(&m->open, 0);
+        if (m->h) { waveInReset(m->h); waveInClose(m->h); }
+        CloseHandle(m->evt);
         DeleteCriticalSection(&m->lock);
         free(m);
         osa_err_set(err, "microphone could not start");
         return NULL;
     }
-    m->open = true;
     osa_err_ok(err);
     return m;
 }
 
 int osa_mic_read(osa_mic *m, float *out, int max) {
-    if (!m || !out || max <= 0 || !m->open) return 0;
+    if (!m || !out || max <= 0 || !InterlockedCompareExchange(&m->open, 1, 1)) return 0;
+    mic_service(m);
     EnterCriticalSection(&m->lock);
-    int avail = m->pending_n - m->pending_at;
-    int n = avail < max ? avail : max;
-    if (n > 0) {
-        memcpy(out, m->pending + m->pending_at, (size_t)n * sizeof(float));
-        m->pending_at += n;
-        if (m->pending_at >= m->pending_n) { m->pending_at = 0; m->pending_n = 0; }
-    }
+    int cap = (int)(sizeof m->pending / sizeof m->pending[0]);
+    int n = m->pend_len < max ? m->pend_len : max;
+    for (int i = 0; i < n; i++)
+        out[i] = m->pending[(m->pend_start + i) % cap];
+    m->pend_start = (m->pend_start + n) % cap;
+    m->pend_len -= n;
     float lv = m->level;
     LeaveCriticalSection(&m->lock);
     m->level = lv * 0.999f;
@@ -135,14 +175,15 @@ int64_t osa_mic_total(const osa_mic *m) { return m ? m->total : 0; }
 
 void osa_mic_close(osa_mic *m) {
     if (!m) return;
-    if (m->open && m->h) {
+    InterlockedExchange(&m->open, 0);          /* the service loop stops re-queuing */
+    if (m->h) {
         waveInStop(m->h);
-        waveInReset(m->h);
-        for (int i = 0; i < m->n_bufs; i++) {
+        waveInReset(m->h);                     /* returns its buffers to us       */
+        for (int i = 0; i < m->n_bufs; i++)
             waveInUnprepareHeader(m->h, &m->bufs[i].hdr, sizeof(WAVEHDR));
-        }
         waveInClose(m->h);
     }
+    if (m->evt) CloseHandle(m->evt);
     DeleteCriticalSection(&m->lock);
     free(m);
 }

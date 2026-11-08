@@ -99,9 +99,20 @@ def main() -> int:
         if url and not builtin and not url.startswith("https://"):
             fail(errors, "%s url must be https:// or builtin://<id>" % tag)
         # A downloadable entry whose bytes we have not verified is a liability:
-        # either publish the hash, or mark the entry as a manual install.
-        if url and not builtin and not HEX64.match(sha) and m.get("status") == "available":
-            fail(errors, "%s has a url but no verified sha256" % tag)
+        # either publish the hash, or be explicit that the download is only
+        # checked by HTTP length (an upstream file that changes with every
+        # re-upload cannot carry a pin here, and pretending otherwise would be
+        # a lie in the manifest). `verified: "size"` is that statement, and it
+        # is the only value allowed besides a real hash.
+        verified = m.get("verified", "")
+        if url and not builtin and not HEX64.match(sha):
+            if verified != "size":
+                fail(errors, "%s has a url but no verified sha256 (set verified: \"size\" "
+                             "if the upstream file is not pinned)" % tag)
+        if verified and verified not in ("size", "sha256"):
+            fail(errors, "%s verified must be \"size\" or \"sha256\"" % tag)
+        if verified == "size" and HEX64.match(sha):
+            fail(errors, "%s claims a size-only check but carries a sha256" % tag)
         if m.get("status") == "manual" and url:
             fail(errors, "%s is manual-install but also has a url" % tag)
         if m.get("status") == "installed" and url:
@@ -113,9 +124,13 @@ def main() -> int:
         print("  ok   %d entries structurally valid" % len(models))
         builtin = [m for m in models if (m.get("url") or "").startswith("builtin://")]
         manual = [m for m in models if m.get("status") == "manual"]
-        print("  ok   %d installable offline, %d manual-install, %d installed"
-              % (len(builtin), len(manual),
+        remote = [m for m in models if (m.get("url") or "").startswith("https://")]
+        print("  ok   %d installable offline, %d downloadable, %d manual-install, %d installed"
+              % (len(builtin), len(remote), len(manual),
                  len([m for m in models if m.get("status") == "installed"])))
+        if manual:
+            fail(errors, "%d entries cannot be installed from inside the application: %s"
+                 % (len(manual), ", ".join(m["id"] for m in manual)))
 
     if "--hash" in sys.argv:
         print("\nbuiltin containers")

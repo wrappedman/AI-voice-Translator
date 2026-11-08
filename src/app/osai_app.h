@@ -241,6 +241,26 @@ typedef struct osa_train_result {
     char log[1024];
 } osa_train_result;
 
+/* One entry of the in-app training-data catalogue. Training data is picked the
+ * same way a model is: a list inside the application, one row per set, with a
+ * press that makes it available. Nothing here needs a file manager. */
+typedef struct osa_dataset_info {
+    char  id[64];
+    char  name[160];
+    char  language[16];
+    char  notes[320];
+    int   n_pairs;               /* pairs in the set                        */
+    bool  installed;             /* the file is in the data folder already  */
+    bool  installable;           /* the application can build it offline    */
+    char  path[OSAI_MAX_PATH];   /* the file, once installed                */
+} osa_dataset_info;
+
+/* Lists the catalogue (bundled sets, built on press). Returns the count. */
+int  osa_app_datasets(osa_app *app, osa_dataset_info *out, int max);
+/* Builds and installs one set into <data>/Datasets, returning its path. */
+bool osa_app_install_dataset(osa_app *app, const char *id, char *path_out,
+                             size_t cap, osa_error *err);
+
 /* `pairs` is a JSON-ish list of "audio<tab>text" lines, one per recording, as
  * produced by the dataset scanner. When `pairs` is NULL the builtin lexicon's
  * own synthesised samples are used, so the run does something verifiable even

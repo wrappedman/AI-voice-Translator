@@ -42,14 +42,24 @@
 #define WM_APP_CLIPBOARD (WM_APP + 2)
 #define TRAY_UID         1
 
-/* Result the shell posts when it handled a request itself (a native message
- * box, for instance). */
-#define REQ_NONE        0
-#define REQ_PICK_AUDIO  1
-#define REQ_PICK_MODEL  2
-#define REQ_PICK_DATA   3
-#define REQ_OPEN_FOLDER 4
-#define REQ_SAVE_TEXT   5
+/* Requests come straight from shell_request (see shell.h). These used to be a
+ * private numbering with its own values, and they had drifted: the shell's
+ * dataset request (3) landed on this layer's "pick a model" (2), so the training
+ * dataset button opened the wrong dialog and dropped the result. Aliasing the
+ * enum instead of re-declaring integers makes that impossible. */
+#define REQ_NONE        SHELL_REQ_NONE
+#define REQ_PICK_AUDIO  SHELL_REQ_PICK_AUDIO
+#define REQ_PICK_MODEL  SHELL_REQ_PICK_PACK
+#define REQ_PICK_DATA   SHELL_REQ_PICK_DATASET
+#define REQ_OPEN_FOLDER SHELL_REQ_OPEN_FOLDER
+#define REQ_SAVE_TEXT   SHELL_REQ_SAVE_TRANSCRIPT
+/* Compile-time proof that the two enums still line up. They drifted once and the
+ * result was a button that did nothing, so this cannot be left to review. */
+_Static_assert(REQ_PICK_AUDIO  == 1, "shell_request order changed");
+_Static_assert(REQ_PICK_MODEL  == 2, "shell_request order changed");
+_Static_assert(REQ_PICK_DATA   == 3, "shell_request order changed");
+_Static_assert(REQ_OPEN_FOLDER == 4, "shell_request order changed");
+_Static_assert(REQ_SAVE_TEXT   == 5, "shell_request order changed");
 
 typedef struct host {
     HWND         hwnd;
@@ -77,6 +87,10 @@ typedef struct host {
     wchar_t      ofn_file[MAX_PATH * 2];
     bool         dialog_open;
     int          dialog_kind;
+    /* A request raised while one of our own dialogs is running cannot open a
+     * second one on the spot (the modal loop is still dispatching our timer).
+     * It is remembered here and started on the next frame instead. */
+    int          pending_kind;
 } host;
 
 static host g_host;
@@ -193,14 +207,20 @@ static bool start_dialog(host *h, int kind) {
         /* A dataset file, or a single recording chosen from a run folder. */
         h->ofn.lpstrFilter =
             L"Dataset (*.tsv;*.csv;*.txt)\0*.tsv;*.csv;*.txt\0"
-            L"Audio files (*.wav)\0*.wav\0All files\0*.*\0";
+            L"Audio files (*.wav;*.mp3;*.m4a;*.flac;*.ogg)\0*.wav;*.mp3;*.m4a;*.flac;*.ogg\0"
+            L"All files\0*.*\0";
         h->ofn.lpstrTitle = L"فایل داده آموزشی / Training dataset";
     } else if (kind == REQ_PICK_AUDIO) {
+        /* .m4a is what a phone records to, so it is in the first filter rather
+         * than behind "all files": a picker that does not list the format the
+         * user has is the same as not supporting it. */
         h->ofn.lpstrFilter =
-            L"Audio files (*.wav;*.flac;*.ogg)\0*.wav;*.flac;*.ogg\0"
+            L"Audio files (*.wav;*.mp3;*.m4a;*.flac;*.ogg)\0*.wav;*.mp3;*.m4a;*.flac;*.ogg\0"
             L"WAV (*.wav)\0*.wav\0"
+            L"MP3 (*.mp3)\0*.mp3\0"
+            L"M4A / MP4 audio (*.m4a;*.mp4)\0*.m4a;*.mp4\0"
             L"FLAC (*.flac)\0*.flac\0"
-            L"Ogg Vorbis (*.ogg)\0*.ogg\0"
+            L"Ogg Vorbis (*.ogg;*.oga)\0*.ogg;*.oga\0"
             L"All files\0*.*\0";
         h->ofn.lpstrTitle = L"انتخاب فایل صوتی / Choose an audio file";
     } else {
@@ -285,7 +305,18 @@ static void host_frame(host *h) {
     if (req != REQ_NONE) {
         h->shell.request = REQ_NONE;
         if (req == REQ_OPEN_FOLDER) osa_open_in_explorer(osa_path(OSAI_DIR_ROOT));
-        else start_dialog(h, req);
+        else if (start_dialog(h, req)) {
+            /* handled (or the user cancelled) */
+        } else {
+            /* a dialog is already open: keep the request for the next frame
+             * instead of dropping it, which is what made a click on a
+             * secondary picker do nothing at all */
+            h->pending_kind = req;
+        }
+    } else if (!h->dialog_open && h->pending_kind != REQ_NONE) {
+        int k = h->pending_kind;
+        h->pending_kind = REQ_NONE;
+        start_dialog(h, k);
     }
     h->n_typed = 0;
     h->wheel = 0;

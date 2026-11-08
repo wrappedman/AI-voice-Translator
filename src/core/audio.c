@@ -1,4 +1,5 @@
 #include "audio.h"
+#include "audio_m4a.h"
 #include "osai_platform.h"
 #include <math.h>
 
@@ -117,7 +118,35 @@ bool osa_audio_load(const char *path, osa_audio *out, osa_error *err) {
         return ok;
     }
 
-    osa_err_set(err, "unsupported format '%s' (use WAV, MP3, FLAC or OGG)", ext);
+    /* .m4a, .mp4 and .aac: AAC inside an ISO base-media container. No decoder
+     * for that is vendored (see audio_m4a.h), so the platform answers; on
+     * Windows it is Media Foundation, elsewhere this is the weak stub. */
+    if (osa_strieq(ext, ".m4a") || osa_strieq(ext, ".mp4") || osa_strieq(ext, ".aac") ||
+        osa_strieq(ext, ".m4b")) {
+        float *pcm = NULL;
+        int64_t frames = 0;
+        int rate = 0;
+        osa_error derr;
+        osa_err_ok(&derr);
+        if (!osa_m4a_decode(path, &pcm, &frames, &rate, &derr)) {
+            osa_err_set(err, "%s", derr.msg[0] ? derr.msg : "could not decode this AAC file");
+            free(pcm);
+            return false;
+        }
+        if (!pcm || frames <= 0 || rate <= 0) {
+            free(pcm);
+            osa_err_set(err, "the AAC track has no audio");
+            return false;
+        }
+        /* take ownership: `finish` mixes and resamples, the caller keeps the
+         * buffer only until the copy is made */
+        bool ok = finish(out, pcm, frames, 1, rate, path);
+        free(pcm);
+        if (!ok) osa_err_set(err, "decode failed");
+        return ok;
+    }
+
+    osa_err_set(err, "unsupported format '%s' (use WAV, MP3, M4A, FLAC or OGG)", ext);
     return false;
 }
 

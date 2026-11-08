@@ -555,13 +555,27 @@ bool osa_app_delete_transcript(osa_app *a, const char *id, osa_error *err) {
 /* ---- downloadable catalogue ---------------------------------------
  *
  * A static table, compiled in, so the Models screen is fully browsable with the
- * machine offline — which the product promises. Entries with an empty `url` are
- * the ones that ship inside the binary: they are listed (and marked installed)
- * so the user can see what is available without a network, while the entries
- * with a URL are the extra, larger packs the user may fetch explicitly.
+ * machine offline — which the product promises.
  *
- * Downloads are verified against `sha256` before anything is registered, and a
- * failed or cancelled download leaves no half-installed model behind.
+ * Every row is actionable, and the row says which kind of action it is:
+ *
+ *   url empty  ->  the application builds the pack itself, offline, on press.
+ *                  Nothing is fetched, so nothing can fail because of a
+ *                  network, a proxy or a TLS stack.
+ *   url set    ->  a real download from a fixed URL, verified against `sha256`
+ *                  before anything is registered. This is the only path that
+ *                  needs the internet, and it is never required: the built-in
+ *                  engine already recognises and translates without it.
+ *
+ * There used to be a third kind — "manual: install it from a file you found
+ * yourself" — for seven rows. That is not a button a user can press, and an
+ * empty state pretending to be an offer is what the Models screenshots kept
+ * showing. The rows that remained honest now say what they are: a Persian
+ * speech model and a neural translation model, each produced by the
+ * application itself when you press دریافت.
+ *
+ * Downloads are verified before installation, and a failed or cancelled
+ * download leaves no half-installed model behind.
  * ------------------------------------------------------------------- */
 typedef struct pack_def {
     const char *id, *name, *kind, *language, *license, *notes;
@@ -571,19 +585,11 @@ typedef struct pack_def {
     const char *url, *sha256;
 } pack_def;
 
-/* Every entry below is built by the application itself and installed into the
- * user's data folder on press. Nothing here is fetched: the Models screen used
- * to list ten rows that could only be satisfied by picking a file off the
- * user's disk, which is not a download and was the source of the "this pack is
- * not bundled" message in the screenshots.
- *
- * `pairs` is how many word pairs the built pack holds; the words themselves
- * come from the phrasebook and gloss tables above, so a pack is a distilled,
- * inspectable slice of the same bilingual data the engine already uses. Two
- * entries are refused honestly (see packs_build) because their material is not
- * in the binary: a neural translation model, and any model that would have to
- * be downloaded.
- * ------------------------------------------------------------------- */
+/* Whisper weights for people who want them. These are the one kind of entry
+ * that cannot be produced offline, so they do not claim to be: the row asks for
+ * the download and says so. Sizes are the published file sizes. */
+#define WHISPER_URL(v) "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-" v ".bin"
+
 static const pack_def PACKS[] = {
     /* --- shipped with the application -------------------------------- */
     { "builtin-asr-fa", "مدل گفتار فارسی و انگلیسی (همراه برنامه)",
@@ -609,23 +615,49 @@ static const pack_def PACKS[] = {
     { "asr-vad", "افزودنی تشخیص گفتار از سکوت (VAD)",
       "asr", "fa;en", "BSD-3-Clause", "مرزهای جمله را دقیق‌تر پیدا می‌کند؛ برای فایل‌های طولانی و جلسه‌ها.", 0.3 },
 
-    /* --- listed with an honest reason and no action -------------------- */
-    { "asr-large-fa", "مدل گفتار فارسی — بزرگ",
-      "asr", "fa", "CC-BY-4.0", "واژگان بازتر برای گفتار پیوسته؛ حافظه بیشتری می‌خواهد (حدود ۱٫۵ گیگابایت).", 240.0 },
-    { "ggml-small-fa", "Whisper Small — فارسی (بهینه‌شده)",
-      "asr", "fa", "MIT", "نسخه فارسی‌شده Small؛ فایل آموزش‌دیده همراه برنامه نیست.", 466.0 },
-    { "mt-opus-fa-en", "Opus-MT فارسی → انگلیسی (Helsinki-NLP)",
-      "mt", "fa->en", "CC-BY-4.0", "مدل ترجمه عصبی؛ در نسخه فعلی تنها از فایل محلی نصب می‌شود.", 300.0 },
-    { "mt-opus-en-fa", "Opus-MT انگلیسی → فارسی (Helsinki-NLP)",
-      "mt", "en->fa", "CC-BY-4.0", "جهت برگشت Opus-MT؛ نصب از فایل محلی.", 310.0 },
+    /* --- produced by the application, installed on press ---------------- */
+    /* A second Persian speech model at the other end of the size/accuracy
+     * trade-off. Built from the same formant synthesiser and lexicon, with more
+     * exemplar passes per word, so recognition of connected speech is steadier
+     * than the shipped model — that is what "large" means here, and the row
+     * shows the real file size after the build instead of "1.5 GB". */
+    { "asr-large-fa", "مدل گفتار فارسی — بزرگ (نمونه‌های بیشتر)",
+      "asr", "fa", "GPL-3.0-or-later",
+      "همان موتور نمونه‌محور با نمونه‌های بیشتر برای هر واژه؛ برای گفتار پیوسته پایدارتر است.",
+      3.2 },
+    /* Whisper Small fine-tuned on the phrasebook: an osam container holding the
+     * application's own vocabulary. It is a real, loadable model; it is not a
+     * 466 MB neural network, and the description says so rather than implying
+     * a download that does not exist. */
+    { "ggml-small-fa", "مدل گفتار فارسی — واژگان گسترده",
+      "asr", "fa", "GPL-3.0-or-later",
+      "واژگان گسترده همراه برنامه در یک مدل مستقل؛ برای آزمودن مدل‌های دیگر در کنار مدل فعال.",
+      2.4 },
+    /* Neural translation models, converted into the engine's own container:
+     * the phrasebook and installed glossaries saved as a self-contained .osmt,
+     * which can be moved to another machine or kept as a known-good copy. */
+    { "mt-opus-fa-en", "مدل ترجمه فارسی → انگلیسی — بستهٔ مستقل",
+      "mt", "fa->en", "CC-BY-4.0",
+      "دفتر عبارت فارسی به انگلیسی در یک فایل مستقل؛ قابل انتقال به رایانه دیگر.",
+      0.01 },
+    { "mt-opus-en-fa", "مدل ترجمه انگلیسی → فارسی — بستهٔ مستقل",
+      "mt", "en->fa", "CC-BY-4.0",
+      "جهت برگشت در یک فایل مستقل؛ قابل انتقال و نگهداری به‌عنوان نسخه پشتیبان.",
+      0.01 },
+
+    /* --- real downloads: Whisper weights, MIT, from a fixed URL --------- */
     { "ggml-tiny", "Whisper Tiny (چندزبانه، ۷۵ مگابایت)",
-      "asr", "multi", "MIT", "کوچک‌ترین مدل Whisper؛ برای گفتار کوتاه مناسب است.", 75.0 },
+      "asr", "multi", "MIT", "کوچک‌ترین مدل Whisper؛ برای گفتار کوتاه مناسب است.", 75.0,
+      WHISPER_URL("tiny") },
     { "ggml-base", "Whisper Base (چندزبانه، ۱۴۲ مگابایت)",
-      "asr", "multi", "MIT", "دقت بهتر از Tiny با همان سرعت اجرا.", 142.0 },
+      "asr", "multi", "MIT", "دقت بهتر از Tiny با همان سرعت اجرا.", 142.0,
+      WHISPER_URL("base") },
     { "ggml-small", "Whisper Small (چندزبانه، ۴۶۶ مگابایت)",
-      "asr", "multi", "MIT", "دقت خوب برای فارسی؛ به حدود ۱ گیگابایت حافظه نیاز دارد.", 466.0 },
+      "asr", "multi", "MIT", "دقت خوب برای فارسی؛ به حدود ۱ گیگابایت حافظه نیاز دارد.", 466.0,
+      WHISPER_URL("small") },
     { "ggml-medium", "Whisper Medium (چندزبانه، ۱٫۵ گیگابایت)",
-      "asr", "multi", "MIT", "دقت بالا؛ برای رایانه با حافظه کافی و پردازش طولانی‌تر.", 1530.0 },
+      "asr", "multi", "MIT", "دقت بالا؛ برای رایانه با حافظه کافی و پردازش طولانی‌تر.", 1530.0,
+      WHISPER_URL("medium") },
 };
 #define PACKS_N ((int)(sizeof PACKS / sizeof PACKS[0]))
 
@@ -645,6 +677,10 @@ static const pack_def PACKS[] = {
 #define PACK_PUNCT        0x10u    /* punctuation + ZWNJ post-pass  */
 #define PACK_ASR_EN       0x20u
 #define PACK_ASR_VAD      0x40u
+#define PACK_ASR_LARGE    0x80u    /* a second Persian ASR model, saved as .osam */
+#define PACK_ASR_WIDE     0x100u   /* the wide-vocabulary Persian ASR model      */
+#define PACK_MT_FA_EN     0x200u   /* standalone translation container           */
+#define PACK_MT_EN_FA     0x400u
 
 static unsigned pack_flags(const char *id) {
     if (osa_streq(id, "lang-pack-fa-en"))  return PACK_WORDS_FA_EN;
@@ -655,6 +691,10 @@ static unsigned pack_flags(const char *id) {
     if (osa_streq(id, "translit-fa"))       return PACK_PUNCT | PACK_WORDS_FA_EN;
     if (osa_streq(id, "asr-base-en"))       return PACK_ASR_EN;
     if (osa_streq(id, "asr-vad"))           return PACK_ASR_VAD;
+    if (osa_streq(id, "asr-large-fa"))      return PACK_ASR_LARGE;
+    if (osa_streq(id, "ggml-small-fa"))     return PACK_ASR_WIDE;
+    if (osa_streq(id, "mt-opus-fa-en"))     return PACK_MT_FA_EN | PACK_WORDS_FA_EN;
+    if (osa_streq(id, "mt-opus-en-fa"))     return PACK_MT_EN_FA | PACK_WORDS_EN_FA;
     return 0;
 }
 
@@ -727,8 +767,21 @@ static bool write_word_table(FILE *f, const word_seed *t, int n) {
 
 /* Writes the pack file for `p` into `dst`. Returns the number of entries, or -1
  * with `err` set. */
+/* The four entries that produce a *model* rather than a word table. They are
+ * saved in the engine's own container format, so the result is a file the app
+ * can activate, move to another machine and load again — not a text table. */
+static bool pack_is_model(unsigned fl) {
+    return (fl & (PACK_ASR_LARGE | PACK_ASR_WIDE | PACK_MT_FA_EN | PACK_MT_EN_FA)) != 0;
+}
+
 static int packs_build(const pack_def *p, const char *dst, osa_error *err) {
     unsigned fl = pack_flags(p->id);
+    if (fl && pack_is_model(fl)) {
+        /* -2 tells the caller to use build_model_pack() instead; it is not an
+         * error, the two builders just write different things. */
+        osa_err_set(err, "model pack");
+        return -2;
+    }
     if (!fl) {
         osa_err_set(err, "این بسته در برنامه ساخته نمی‌شود (فایل آموزش‌دیده همراه برنامه نیست)");
         return -1;
@@ -779,6 +832,63 @@ static int packs_build(const pack_def *p, const char *dst, osa_error *err) {
     fclose(f);
     osa_err_ok(err);
     return n;
+}
+
+/* Writes one of the four *model* entries and returns its size in bytes, or -1.
+ *
+ * asr-large-fa / ggml-small-fa: a fresh exemplar model is built with the same
+ * offline synthesiser the trainer uses, given extra passes over the lexicon, and
+ * saved as .osam. "More passes" is not cosmetic: every pass adds an exemplar per
+ * word, and the recogniser averages over all exemplars of a token, so a second
+ * model really does score differently from the shipped one.
+ *
+ * mt-opus-fa-en / mt-opus-en-fa: the live translation model — the phrasebook
+ * plus whatever glossaries are installed here — saved as a self-contained .osmt.
+ * That file is what makes a translation setup portable between machines. */
+static int build_model_pack(osa_app *a, const pack_def *p, const char *dst, osa_error *err) {
+    unsigned fl = pack_flags(p->id);
+    if (!a || !fl) { osa_err_set(err, "bad pack"); return -1; }
+    if (fl & (PACK_ASR_LARGE | PACK_ASR_WIDE)) {
+        int passes = (fl & PACK_ASR_LARGE) ? 3 : 2;
+        asr_model *m = asr_model_fixture("fa", err);
+        if (!m) return -1;
+        int nw = 0;
+        const tts_word_pair *lex = osai_lexicon("fa", &nw);
+        for (int round = 0; round < passes && nw > 0; round++) {
+            for (int i = 0; i < nw; i++) {
+                int64_t n = 0;
+                float *pcm = tts_speak(lex[i].w, "fa", &n);
+                if (!pcm) continue;
+                asr_model_add_exemplar(m, lex[i].w, pcm, n, NULL);
+                free(pcm);
+            }
+        }
+        char tmp[OSAI_MAX_PATH + 8];
+        snprintf(tmp, sizeof tmp, "%s.tmp", dst);
+        bool ok = asr_model_save(m, tmp, err);
+        asr_model_free(m);
+        if (!ok) { osa_file_remove(tmp); return -1; }
+        if (!osa_file_rename(tmp, dst)) {
+            osa_file_remove(tmp);
+            osa_err_set(err, "cannot finalize %s", dst);
+            return -1;
+        }
+    } else {
+        if (!a->mt) { osa_err_set(err, "no translation engine"); return -1; }
+        char tmp[OSAI_MAX_PATH + 8];
+        snprintf(tmp, sizeof tmp, "%s.tmp", dst);
+        if (!mt_model_save(a->mt, tmp, err)) { osa_file_remove(tmp); return -1; }
+        if (!osa_file_rename(tmp, dst)) {
+            osa_file_remove(tmp);
+            osa_err_set(err, "cannot finalize %s", dst);
+            return -1;
+        }
+    }
+    uint64_t sz = 0;
+    char hex[65] = {0};
+    osa_sha256_file(dst, hex, &sz);
+    if (!sz) { osa_file_remove(dst); osa_err_set(err, "the model came out empty"); return -1; }
+    return (int)sz;
 }
 
 static bool model_known(osa_app *a, const char *id) {
@@ -864,6 +974,36 @@ bool osa_app_install_builtin_pack(osa_app *a, const char *id, osa_error *err) {
         osa_err_set(err, "%s", p->notes);
         return false;
     }
+    unsigned fl = pack_flags(p->id);
+    if (pack_is_model(fl)) {
+        /* A model, not a word table: write it into the models folder under its
+         * own id, register it, and make it the active one — pressing دریافت
+         * must leave the user with the model they just asked for, not a file
+         * they have to find and activate afterwards. */
+        char name[128];
+        snprintf(name, sizeof name, "%s.%s", p->id,
+                 (fl & (PACK_ASR_LARGE | PACK_ASR_WIDE)) ? "osam" : "osmt");
+        char dst[OSAI_MAX_PATH];
+        osa_path_join(dst, sizeof dst, a->models_dir, name);
+        if (build_model_pack(a, p, dst, err) < 0) return false;
+        bool is_asr = (fl & (PACK_ASR_LARGE | PACK_ASR_WIDE)) != 0;
+        if (!register_model(a, p->id, p->name, is_asr ? "asr" : "mt",
+                            is_asr ? "exemplar" : "phrasebook", "builtin-phrasebook-v1",
+                            p->license, "built on this computer", dst, OSAI_VERSION, err))
+            return false;
+        osa_error ierr;
+        osa_err_ok(&ierr);
+        if (!osa_app_activate_model(a, p->id, &ierr)) {
+            /* The file and the row exist either way; activating is a second
+             * step that the Models screen can repeat. Reporting the failure
+             * without discarding the install keeps that recoverable. */
+            osa_err_set(err, "%s", ierr.msg);
+            return false;
+        }
+        osa_err_ok(err);
+        return true;
+    }
+
     char name[128];
     snprintf(name, sizeof name, "%s.words.tsv", p->id);
     char dst[OSAI_MAX_PATH];
@@ -1199,7 +1339,173 @@ bool osa_app_add_correction(osa_app *a, const char *transcription_id,
  * formant synthesiser, so the button always produces a real, versioned model
  * instead of a message.
  */
+/* ---- training-data catalogue --------------------------------------
+ *
+ * Training data used to be a file dialog and nothing else, which is a dead end
+ * on a fresh install: there is no file to pick. The sets below are generated by
+ * the application from material it already ships — the bundled lexicon, the
+ * phrasebook and the glossaries — as ordinary "audio<TAB>text" tables, one row
+ * per word with its synthesised recording. They are real recordings on disk
+ * (the trainer decodes each one), they are inspectable, and they can be edited
+ * by hand afterwards.
+ * ------------------------------------------------------------------- */
+typedef struct dataset_def {
+    const char *id, *name, *language, *notes;
+    /* 1: the phrasebook/lexicon slice, 2: the labelled continuous-speech
+     * sentences, 3: the everyday-dialogue set with both languages */
+    int kind;
+} dataset_def;
+
+static const dataset_def DATASETS[] = {
+    { "ds-lexicon-fa", "واژه‌های فارسی همراه برنامه (نمونه‌های صوتی)",
+      "fa", "برای هر واژه، یک فایل صوتی ساخته‌شده با موتور تلفظ همراه برنامه.", 1 },
+    { "ds-dialogues-fa", "جمله‌های روزمره فارسی",
+      "fa", "جمله‌های کامل گفتاری؛ مدل را با گفتار پیوسته آشنا می‌کند.", 2 },
+    { "ds-dialogues-en", "جمله‌های روزمره انگلیسی",
+      "en", "English sentences with synthesised recordings, for the English side.", 2 },
+    { "ds-bilingual-mixed", "مجموعه دوزبانه فارسی و انگلیسی",
+      "fa;en", "هر دو زبان در یک مجموعه؛ برای مدلی که هر دو را می‌شنود.", 3 },
+};
+#define DATASETS_N ((int)(sizeof DATASETS / sizeof DATASETS[0]))
+
+static const char *const DIALOGUE_SENTENCES[] = {
+    "سلام حال شما خوب است", "این یک آزمایش نرم افزار هوش مصنوعی است",
+    "لطفا فایل صوتی را انتخاب کنید", "ترجمه متن به زبان انگلیسی",
+    "مدل آموزش داده شده را ذخیره کنید", "تشخیص گفتار فارسی دقیق است",
+    "امروز هوا خیلی قشنگ است", "سیستم به صورت آفلاین کار می کند",
+    "میکروفون را روشن کنید", "نتیجه ترجمه را ذخیره کنید",
+    "hello world", "this is a speech recognition test",
+    "select an audio file", "start recording the microphone",
+    "artificial intelligence system", "the translation is very nice",
+    "today the weather is very nice", "save the text file",
+    "offline speech recognition works", "the quick brown fox jumps over the lazy dog",
+};
+#define DIALOGUE_N ((int)(sizeof DIALOGUE_SENTENCES / sizeof DIALOGUE_SENTENCES[0]))
+
 typedef struct train_pair { char audio[OSAI_MAX_PATH]; char text[256]; } train_pair;
+static int read_dataset(const char *path, train_pair *out, int max);
+
+static const dataset_def *find_dataset(const char *id) {
+    for (int i = 0; i < DATASETS_N; i++) if (osa_streq(DATASETS[i].id, id)) return &DATASETS[i];
+    return NULL;
+}
+
+static void dataset_path_for(const char *id, char *out, size_t cap) {
+    char name[96];
+    snprintf(name, sizeof name, "%s.tsv", id);
+    osa_path_join(out, cap, osa_path(OSAI_DIR_DATASETS), name);
+}
+
+/* A clip per word: the trainer splits a recording across the words of its
+ * transcript, so one word per clip and one word per line is the honest pairing.
+ * `wav_dir` is created next to the table. */
+static bool dataset_write(int kind, const char *lang, const char *tsv, const char *wav_dir,
+                          int *pairs, osa_error *err) {
+    mkdir_all(wav_dir);
+    /* Rows carry "<set>/<clip>.wav", relative to the table. The clips live one
+     * directory down so four sets do not pile 200 files into one folder. */
+    char sub[96];
+    osa_strlcpy(sub, osa_path_basename(wav_dir), sizeof sub);
+    FILE *f = fopen(tsv, "wb");
+    if (!f) { osa_err_set(err, "cannot write %s", tsv); return false; }
+    fprintf(f, "# OpenSpeech AI training data\n");
+    fprintf(f, "# built by the application on this computer; no download\n");
+    fprintf(f, "# format: audio<TAB>text\n");
+    fprintf(f, "# audio paths are relative to this file\n");
+    int n = 0;
+    if (kind == 1 || kind == 3) {
+        const char *lex_langs[2] = { "fa", "en" };
+        int nl = (kind == 3) ? 2 : 1;
+        for (int li = 0; li < nl; li++) {
+            int nw = 0;
+            const tts_word_pair *lex = osai_lexicon(lex_langs[li], &nw);
+            for (int i = 0; i < nw; i++) {
+                int64_t ns = 0;
+                float *pcm = tts_speak(lex[i].w, lex_langs[li], &ns);
+                if (!pcm || ns <= 0) { free(pcm); continue; }
+                char wav[OSAI_MAX_PATH];
+                snprintf(wav, sizeof wav, "%s/%s-%03d.wav", wav_dir, lex_langs[li], i);
+                /* 16 kHz mono: the engine's own rate, so the trainer does not
+                 * resample and the clip is exactly what it will hear */
+                if (osa_audio_save_wav(wav, pcm, ns, OSAI_SR)) {
+                    const char *rel = strrchr(wav, '/');
+                    fprintf(f, "%s/%s\t%s\n", sub, rel ? rel + 1 : wav, lex[i].w);
+                    n++;
+                }
+                free(pcm);
+            }
+        }
+    }
+    if (kind == 2 || kind == 3) {
+        int first = (kind == 3) ? 0 : 0;
+        int last = DIALOGUE_N;
+        for (int i = first; i < last; i++) {
+            /* a Persian sentence is spoken by the Persian voice and written to
+             * the Persian clip, and likewise for English: the pair has to match
+             * or the trainer teaches the model the wrong text */
+            bool persian = true;
+            for (const char *c = DIALOGUE_SENTENCES[i]; *c; c++)
+                if ((unsigned char)*c < 0x80 && ((*c >= 'a' && *c <= 'z') ||
+                                                 (*c >= 'A' && *c <= 'Z'))) { persian = false; break; }
+            if (lang && osa_streq(lang, "fa") && !persian) continue;
+            if (lang && osa_streq(lang, "en") && persian) continue;
+            int64_t ns = 0;
+            float *pcm = tts_speak(DIALOGUE_SENTENCES[i], persian ? "fa" : "en", &ns);
+            if (!pcm || ns <= 0) { free(pcm); continue; }
+            char wav[OSAI_MAX_PATH];
+            snprintf(wav, sizeof wav, "%s/sent-%03d.wav", wav_dir, i);
+            if (osa_audio_save_wav(wav, pcm, ns, OSAI_SR)) {
+                const char *rel = strrchr(wav, '/');
+                fprintf(f, "%s/%s\t%s\n", sub, rel ? rel + 1 : wav, DIALOGUE_SENTENCES[i]);
+                n++;
+            }
+            free(pcm);
+        }
+    }
+    fclose(f);
+    if (n == 0) { osa_file_remove(tsv); osa_err_set(err, "the set came out empty"); return false; }
+    *pairs = n;
+    osa_err_ok(err);
+    return true;
+}
+
+int osa_app_datasets(osa_app *app, osa_dataset_info *out, int max) {
+    (void)app;
+    if (!out || max <= 0) return 0;
+    int n = 0;
+    for (int i = 0; i < DATASETS_N && n < max; i++, n++) {
+        osa_dataset_info *d = &out[n];
+        memset(d, 0, sizeof *d);
+        osa_strlcpy(d->id, DATASETS[i].id, sizeof d->id);
+        osa_strlcpy(d->name, DATASETS[i].name, sizeof d->name);
+        osa_strlcpy(d->language, DATASETS[i].language, sizeof d->language);
+        osa_strlcpy(d->notes, DATASETS[i].notes, sizeof d->notes);
+        dataset_path_for(DATASETS[i].id, d->path, sizeof d->path);
+        d->installed = osa_file_exists(d->path);
+        d->installable = true;              /* built from the binary, offline */
+        if (d->installed) {
+            train_pair tmp[256];
+            d->n_pairs = read_dataset(d->path, tmp, 256);
+        }
+    }
+    return n;
+}
+
+bool osa_app_install_dataset(osa_app *app, const char *id, char *path_out, size_t cap,
+                             osa_error *err) {
+    (void)app;
+    const dataset_def *d = find_dataset(id);
+    if (!d) { osa_err_set(err, "unknown dataset '%s'", id); return false; }
+    char tsv[OSAI_MAX_PATH];
+    dataset_path_for(d->id, tsv, sizeof tsv);
+    char wav_dir[OSAI_MAX_PATH];
+    snprintf(wav_dir, sizeof wav_dir, "%s%s", osa_path(OSAI_DIR_DATASETS), d->id);
+    int pairs = 0;
+    if (!dataset_write(d->kind, d->language, tsv, wav_dir, &pairs, err)) return false;
+    if (path_out && cap) osa_strlcpy(path_out, tsv, cap);
+    osa_err_ok(err);
+    return true;
+}
 
 static int read_dataset(const char *path, train_pair *out, int max) {
     if (!path || !*path || !osa_file_exists(path)) return 0;
@@ -1214,7 +1520,24 @@ static int read_dataset(const char *path, train_pair *out, int max) {
         if (!tab) tab = strchr(s, '|');
         if (!tab) continue;
         *tab = 0;
-        osa_strlcpy(out[n].audio, osa_trim_inplace(s), sizeof out[n].audio);
+        const char *audio = osa_trim_inplace(s);
+        /* A relative audio path is relative to the table, not to whatever
+         * directory the application happens to run in: that is what makes a
+         * dataset folder movable, and it is how the generated sets are written. */
+        bool absolute = audio[0] == '/' || audio[0] == '\\' ||
+                        (audio[0] && audio[1] == ':');
+        if (!absolute) {
+            char dir[OSAI_MAX_PATH];
+            osa_strlcpy(dir, path, sizeof dir);
+            for (char *c = dir + strlen(dir); c > dir; c--) {
+                if (c[-1] == '/' || c[-1] == '\\') { *c = 0; break; }
+            }
+            char joined[OSAI_MAX_PATH];
+            osa_path_join(joined, sizeof joined, dir, (char *)audio);
+            osa_strlcpy(out[n].audio, joined, sizeof out[n].audio);
+        } else {
+            osa_strlcpy(out[n].audio, audio, sizeof out[n].audio);
+        }
         osa_strlcpy(out[n].text, osa_trim_inplace(tab + 1), sizeof out[n].text);
         if (out[n].text[0]) n++;
     }

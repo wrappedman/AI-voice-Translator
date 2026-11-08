@@ -70,6 +70,8 @@ typedef struct shell_state {
     bool          working;
     char          message[512];
     bool          message_is_error;
+    int64_t       message_at_ms;      /* when it was raised (auto-dismiss)   */
+    int64_t       message_life_ms;    /* 0 = use the default for its kind    */
 
     /* waveform + playback */
     float        *peaks;
@@ -101,6 +103,10 @@ typedef struct shell_state {
     bool          train_gpu;
     char          train_log[2048];
     char          dataset_path[OSAI_MAX_PATH];
+    /* Catalogue index of the training set the user picked (-1: the bundled
+     * lexicon). The row shows the set even when its file has not been built
+     * yet, so "install" is visible before it is needed. */
+    int           ds_sel;
     bool          trained;
     bool          training;
 
@@ -181,12 +187,16 @@ const char *tt(shell_lang lang, const char *key);
 /* Synthesises and plays `text` in `lang` (the "listen" buttons). */
 void shell_speak(shell_state *s, const char *text, const char *lang);
 
-/* Writes a transient status line at the bottom of the content area. */
+/* Writes a transient status line at the bottom of the content area. It clears
+ * itself after a few seconds (longer for an error) so a stale band of red can
+ * never sit on a screen that is working. */
 void shell_set_message(shell_state *s, bool err, const char *fmt, ...)
 #if defined(__GNUC__)
     __attribute__((format(printf, 3, 4)))
 #endif
     ;
+/* Drops a message whose display time has elapsed. Called once per frame. */
+void shell_message_tick(shell_state *s);
 
 /* Advances the live-capture state machine by `dt` seconds (called by the
  * platform timer; the headless harness calls it too). */
@@ -207,5 +217,6 @@ void     shell_draw_toast(shell_state *s, ui_context *u, osa_rect body);
 
 /* Two-letter code of the language name for the interface ("fa"/"en"). */
 const char *shell_lang_name(shell_state *s, const char *code);
+void shell_run_translate_silent(shell_state *s);
 
 #endif /* OSAI_SHELL_H */

@@ -12,6 +12,31 @@ import sys
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
+# The exe is a UTF-16LE resource blob on Windows targets and plain ASCII nowhere;
+# a string check has to look for both encodings or it fails on a good build.
+def _contains(haystack: bytes, needle: str) -> bool:
+    if needle.encode("utf-8") in haystack:
+        return True
+    if needle.encode("utf-16-le") in haystack:
+        return True
+    return False
+
+# Strings that must be in the shipped binary because they are the code paths the
+# 1.1.0 bug reports were about. If a link step silently drops a file — or leaves
+# a weak stub in place of the real implementation — the string is missing, and
+# this notices without a Windows machine. Persian literals live in the resource
+# strings, so both encodings are searched.
+REQUIRED = [
+    ("Media Foundation is not available", "the AAC/M4A decoder is linked in"),
+    ("فهرست داده‌ها", "the in-app training-data list"),
+    ("ترجمه انجام شد", "the translate confirmation"),
+]
+# Strings that must NOT appear: a weak fallback next to the real implementation
+# means the linker picked one at random.
+FORBIDDEN = [
+    "no AAC decoder on this platform",
+]
+
 EXPECT_MACHINE = 0x8664        # AMD64
 EXPECT_MAGIC_PE32P = 0x020B
 SUBSYSTEM_GUI = 2
@@ -21,6 +46,12 @@ def check(path: str) -> int:
     with open(path, "rb") as f:
         data = f.read()
     fails = []
+    for needle, why in REQUIRED:
+        if not _contains(data, needle):
+            fails.append("missing %r: %s" % (needle, why))
+    for needle in FORBIDDEN:
+        if _contains(data, needle):
+            fails.append("contains %r, which should not be in a Windows build" % needle)
     if data[:2] != b"MZ":
         fails.append("missing DOS signature")
         return report(fails, path, data)
