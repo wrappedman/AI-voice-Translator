@@ -61,15 +61,40 @@ FT_CORE_SRC := $(FT_DIR)/src/autofit/autofit.c $(FT_DIR)/src/base/ftbase.c \
 HBFLAGS := -DHB_NO_MT -DHAVE_FREETYPE -DHB_EXPERIMENTAL_API \
            -I$(HB_DIR)/src -I$(FT_DIR)/include
 
+# whisper.cpp 1.7.6 (MIT, src/third_party/whisper/LICENSE): the speech engine for
+# ggml model files. C and C++ sources are listed separately; the C++ part and
+# the bridge are the only C++ the application's own code reaches.
+WSP_DIR := $(SRC)/third_party/whisper
+WSP_C   := $(WSP_DIR)/ggml/src/ggml.c $(WSP_DIR)/ggml/src/ggml-alloc.c \
+           $(WSP_DIR)/ggml/src/ggml-quants.c $(WSP_DIR)/ggml/src/ggml-cpu/ggml-cpu.c \
+           $(WSP_DIR)/ggml/src/ggml-cpu/quants.c
+WSP_CPP := $(WSP_DIR)/ggml/src/ggml.cpp $(WSP_DIR)/ggml/src/ggml-backend.cpp \
+           $(WSP_DIR)/ggml/src/ggml-backend-reg.cpp $(WSP_DIR)/ggml/src/ggml-opt.cpp \
+           $(WSP_DIR)/ggml/src/ggml-threading.cpp $(WSP_DIR)/ggml/src/gguf.cpp \
+           $(WSP_DIR)/ggml/src/ggml-cpu/ggml-cpu.cpp $(WSP_DIR)/ggml/src/ggml-cpu/traits.cpp \
+           $(WSP_DIR)/ggml/src/ggml-cpu/ops.cpp $(WSP_DIR)/ggml/src/ggml-cpu/binary-ops.cpp \
+           $(WSP_DIR)/ggml/src/ggml-cpu/unary-ops.cpp $(WSP_DIR)/ggml/src/ggml-cpu/vec.cpp \
+           $(WSP_DIR)/ggml/src/ggml-cpu/hbm.cpp $(WSP_DIR)/ggml/src/ggml-cpu/repack.cpp \
+           $(WSP_DIR)/src/whisper.cpp
+WSP_INC := -I$(WSP_DIR)/include -I$(WSP_DIR)/ggml/include -I$(WSP_DIR)/ggml/src \
+           -I$(WSP_DIR)/ggml/src/ggml-cpu -I$(WSP_DIR)/src
+# Generic CPU kernels: one binary that runs on every x86-64 PC, no SIMD dispatch.
+WSP_DEF := -D_GNU_SOURCE -DNDEBUG -DGGML_USE_CPU -DGGML_CPU_GENERIC -DGGML_USE_LLAMAFILE=0
+WSP_HDR := $(WSP_DIR)/include/whisper.h $(SRC)/engines/whisper_bridge.h
+WSP_BRIDGE_SRC := $(SRC)/engines/whisper_bridge.cpp
+
 # ===========================================================================
 #  Linux (host) — headless host binary used by tests and snapshots
 # ===========================================================================
 LINUX_BIN := $(BUILD)/openspeech
+LINUX_WSP_OBJ := $(patsubst $(WSP_DIR)/%.c,$(BUILD)/lin/third/whisper/%.c.o,$(WSP_C)) \
+                 $(patsubst $(WSP_DIR)/%.cpp,$(BUILD)/lin/third/whisper/%.cpp.o,$(WSP_CPP)) \
+                 $(BUILD)/lin/src/engines/whisper_bridge.o
 LINUX_OBJ := $(patsubst %.c,$(BUILD)/lin/%.o,$(LIB_SRC)) \
              $(BUILD)/lin/src/platform/mic.o \
              $(BUILD)/lin/src/main_linux.o \
              $(BUILD)/lin/sqlite3.o $(BUILD)/lin/stb_vorbis.o \
-             $(BUILD)/lin/ft.a $(BUILD)/lin/hb.o
+             $(BUILD)/lin/ft.a $(BUILD)/lin/hb.o $(LINUX_WSP_OBJ)
 
 .PHONY: linux
 linux: $(LINUX_BIN)
@@ -91,6 +116,18 @@ $(BUILD)/lin/hb.o: $(HB_DIR)/src/harfbuzz.cc
 	@mkdir -p $(dir $@)
 	$(CXX) $(CXXFLAGS_COMMON) $(HBFLAGS) -c $< -o $@
 
+$(BUILD)/lin/third/whisper/%.c.o: $(WSP_DIR)/%.c
+	@mkdir -p $(dir $@)
+	$(CC) -std=c11 -O2 -pthread $(WSP_DEF) $(WSP_INC) -c $< -o $@
+
+$(BUILD)/lin/third/whisper/%.cpp.o: $(WSP_DIR)/%.cpp
+	@mkdir -p $(dir $@)
+	$(CXX) -std=c++17 -O2 -pthread $(WSP_DEF) $(WSP_INC) -c $< -o $@
+
+$(BUILD)/lin/src/engines/whisper_bridge.o: $(WSP_BRIDGE_SRC) $(WSP_HDR)
+	@mkdir -p $(dir $@)
+	$(CXX) -std=c++17 -O2 -pthread $(WSP_DEF) $(WSP_INC) -c $< -o $@
+
 $(BUILD)/lin/ft.a: $(FT_CORE_SRC)
 	@mkdir -p $(BUILD)/lin/ftobj
 	@for f in $(FT_CORE_SRC); do \
@@ -109,12 +146,15 @@ $(LINUX_BIN): $(LINUX_OBJ)
 WIN_BIN  := $(DIST)/bin/OpenSpeechAI.exe
 WIN_CC   := $(ZIG) cc -target x86_64-windows-gnu -O2 -static
 WIN_CXX  := $(ZIG) c++ -target x86_64-windows-gnu -O2 -static
+WIN_WSP_OBJ := $(patsubst $(WSP_DIR)/%.c,$(BUILD)/win/third/whisper/%.c.o,$(WSP_C)) \
+               $(patsubst $(WSP_DIR)/%.cpp,$(BUILD)/win/third/whisper/%.cpp.o,$(WSP_CPP)) \
+               $(BUILD)/win/src/engines/whisper_bridge.o
 WIN_OBJ  := $(patsubst %.c,$(BUILD)/win/%.o,$(LIB_SRC)) \
             $(BUILD)/win/src/platform/mic.o \
             $(BUILD)/win/src/platform/win32/main_win.o \
             $(BUILD)/win/src/platform/win32/m4a_mf.o \
             $(BUILD)/win/sqlite3.o $(BUILD)/win/stb_vorbis.o \
-            $(BUILD)/win/ft.a $(BUILD)/win/hb.o $(BUILD)/win/res.o
+            $(BUILD)/win/ft.a $(BUILD)/win/hb.o $(BUILD)/win/res.o $(WIN_WSP_OBJ)
 # Only system DLLs. No D2D/DWrite: the canvas renders with GDI, which exists on
 # every supported Windows version and keeps the import table tiny.
 # mfplat/mfreadwrite are *not* here on purpose: m4a_mf.c loads them by name, so
@@ -142,6 +182,18 @@ $(BUILD)/win/hb.o: $(HB_DIR)/src/harfbuzz.cc
 	@mkdir -p $(dir $@)
 	$(WIN_CXX) -fno-exceptions -fno-rtti $(HBFLAGS) -c $< -o $@
 
+$(BUILD)/win/third/whisper/%.c.o: $(WSP_DIR)/%.c
+	@mkdir -p $(dir $@)
+	$(WIN_CC) -std=c11 $(WSP_DEF) $(WSP_INC) -c $< -o $@
+
+$(BUILD)/win/third/whisper/%.cpp.o: $(WSP_DIR)/%.cpp
+	@mkdir -p $(dir $@)
+	$(WIN_CXX) -std=c++17 $(WSP_DEF) $(WSP_INC) -c $< -o $@
+
+$(BUILD)/win/src/engines/whisper_bridge.o: $(WSP_BRIDGE_SRC) $(WSP_HDR)
+	@mkdir -p $(dir $@)
+	$(WIN_CXX) -std=c++17 $(WSP_DEF) $(WSP_INC) -c $< -o $@
+
 $(BUILD)/win/ft.a: $(FT_CORE_SRC)
 	@mkdir -p $(BUILD)/win/ftobj
 	@for f in $(FT_CORE_SRC); do \
@@ -165,7 +217,7 @@ $(BUILD)/win/res.o: $(SRC)/platform/win32/app.rc $(SRC)/platform/win32/app.manif
 # driver flag is accepted by zig but does not change the header.
 $(WIN_BIN): $(WIN_OBJ)
 	@mkdir -p $(dir $@)
-	$(WIN_CC) -Wl,--subsystem,windows -o $@ $^ $(WIN_LIBS)
+	$(WIN_CXX) -Wl,--subsystem,windows -o $@ $^ $(WIN_LIBS)
 
 # ===========================================================================
 #  Tests, snapshots, distribution

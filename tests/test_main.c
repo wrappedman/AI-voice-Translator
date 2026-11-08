@@ -12,6 +12,7 @@
  *      calls is covered by the app-layer tests)
  * ===================================================================== */
 #include <stdio.h>
+#include <time.h>
 #include <stdlib.h>
 #include <string.h>
 #include <math.h>
@@ -19,6 +20,7 @@
 #include <unistd.h>
 
 #include "osai_common.h"
+#include "whisper_bridge.h"
 #include "osai_platform.h"
 #include "osai_store.h"
 #include "audio.h"
@@ -862,6 +864,34 @@ static void test_app(void) {
 
 /* ---- platform ----------------------------------------------------- */
 
+/* A damaged whisper file must be refused without ending the program, and must
+ * not leave a row behind. The file carries the ggml magic and then garbage, which
+ * is what whisper.cpp chokes on by throwing. */
+static void test_whisper_guard(void) {
+    char dir[OSAI_MAX_PATH];
+    snprintf(dir, sizeof dir, "/tmp/osai_test_wsp_%ld", (long)time(NULL));
+    char bad[OSAI_MAX_PATH];
+    snprintf(bad, sizeof bad, "%s/bad-tiny.bin", dir);
+    FILE *f = NULL;
+    char cmd[OSAI_MAX_PATH + 32];
+    snprintf(cmd, sizeof cmd, "mkdir -p %s", dir);
+    (void)system(cmd);
+    f = fopen(bad, "wb");
+    CHECK(f != NULL);
+    if (f) {
+        const unsigned char junk[] = {'l', 'm', 'g', 'g', 0, 0, 0, 0, 'g', 'a', 'r', 'b'};
+        fwrite(junk, 1, sizeof junk, f);
+        fclose(f);
+    }
+    CHECK(wsp_is_model_file(bad));
+    char werr[160];
+    wsp_ctx *w = wsp_load(bad, werr, sizeof werr);
+    CHECK(w == NULL);
+    CHECK(werr[0] != 0);
+    wsp_free(w);
+    CHECK(!wsp_is_model_file("/tmp/osai_no_such_file.bin"));
+}
+
 static void test_platform(void) {
     suite("platform");
     const char *root = osa_path(OSAI_DIR_ROOT);
@@ -930,6 +960,14 @@ static void test_platform(void) {
 int main(int argc, char **argv) {
     bool verbose = argc > 1 && osa_streq(argv[1], "-v");
     (void)verbose;
+    /* A fresh data folder every run: the application restores the recogniser
+     * the database says is active, so a shared folder would make these tests
+     * depend on whatever an earlier run trained. */
+    {
+        char tmp[64];
+        snprintf(tmp, sizeof tmp, "/tmp/osai_test_data_%ld", (long)time(NULL));
+        setenv("OSAI_DATA_DIR", tmp, 1);
+    }
     printf("OpenSpeech AI test suite\n");
     printf("=======================\n");
 
@@ -946,6 +984,7 @@ int main(int argc, char **argv) {
     test_vad();
     test_asr();
     test_app();
+    test_whisper_guard();
 
     printf("\n=======================\n");
     printf("%d passed, %d failed\n", g_pass, g_fail);

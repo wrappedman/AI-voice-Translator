@@ -91,6 +91,12 @@ bool osa_app_transcribe_file(osa_app *app, const char *path,
                              osa_app_transcript *out, osa_error *err);
 
 /* Transcribe raw mono float samples (used by the live microphone path). */
+/* Recognition without side effects: text, language and confidence only. Safe to
+ * call from a worker thread; it serialises with every other recogniser use. */
+bool osa_app_recognize(osa_app *app, const float *samples, int64_t n,
+                       char *text, size_t text_cap, char *lang, size_t lang_cap,
+                       float *confidence, osa_error *err);
+
 bool osa_app_transcribe_samples(osa_app *app, const float *samples, int64_t n,
                                 osa_app_transcript *out, osa_error *err);
 

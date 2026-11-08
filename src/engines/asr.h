@@ -58,6 +58,9 @@ typedef struct asr_model {
     float  unigram[ASR_MAX_TOKENS];
     char   path[OSAI_MAX_PATH];
     struct osa_db *db;           /* optional: models are registered in SQLite */
+    /* whisper.cpp model (ggml file). When set, backend is "whisper" and every
+     * other field above is unused: recognition goes through whisper_bridge.h. */
+    struct wsp_ctx *wsp;
 } asr_model;
 
 void asr_init(void);

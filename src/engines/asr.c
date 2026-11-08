@@ -1,5 +1,6 @@
 #include "asr.h"
 #include "nn.h"
+#include "whisper_bridge.h"
 #include "../core/tts.h"
 #include "../core/osai_platform.h"
 #include <math.h>
@@ -42,6 +43,7 @@ static asr_model *model_alloc(void) {
 
 void asr_model_free(asr_model *m) {
     if (!m) return;
+    if (m->wsp) wsp_free(m->wsp);
     if (m->net) nn_free((nn_model *)m->net);
     free(m->tokens);
     free(m->tmpl_feat);
@@ -195,6 +197,7 @@ static bool fixture_build(asr_model *m, const char *lang, osa_error *err) {
 bool asr_model_add_exemplar(asr_model *m, const char *word, const float *samples, int64_t n,
                             osa_error *err) {
     if (!m || !word || !samples || n <= 0) { osa_err_set(err, "bad exemplar input"); return false; }
+    if (m->wsp) { osa_err_set(err, "a whisper model learns from its own training, not from exemplars"); return false; }
     int tok = -1;
     for (int i = 0; i < m->n_tokens; i++) if (osa_streq(m->tokens[i].text, word)) { tok = i; break; }
     if (tok < 0) {
@@ -265,6 +268,7 @@ const char *asr_model_id(const asr_model *m) {
 }
 
 bool asr_model_save(asr_model *m, const char *path, osa_error *err) {
+    if (m && m->wsp) { osa_err_set(err, "a whisper model is not written by this application"); return false; }
     char tmp[OSAI_MAX_PATH];
     snprintf(tmp, sizeof tmp, "%s.tmp", path);
     FILE *f = fopen(tmp, "wb");
@@ -318,6 +322,23 @@ bool asr_model_save(asr_model *m, const char *path, osa_error *err) {
 }
 
 asr_model *asr_model_load(const char *path, osa_error *err) {
+    if (wsp_is_model_file(path)) {
+        char werr[160];
+        wsp_ctx *w = wsp_load(path, werr, sizeof werr);
+        if (!w) { osa_err_set(err, "%s", werr); return NULL; }
+        asr_model *m = (asr_model *)calloc(1, sizeof *m);
+        if (!m) { wsp_free(w); osa_err_set(err, "out of memory"); return NULL; }
+        m->wsp = w;
+        osa_strlcpy(m->backend, "whisper", sizeof m->backend);
+        osa_strlcpy(m->name, wsp_model_name(w), sizeof m->name);
+        osa_strlcpy(m->language, "multi", sizeof m->language);
+        osa_strlcpy(m->version, "ggml", sizeof m->version);
+        osa_strlcpy(m->base_model, "openai-whisper", sizeof m->base_model);
+        osa_strlcpy(m->license, "MIT (OpenAI Whisper weights)", sizeof m->license);
+        osa_strlcpy(m->path, path, sizeof m->path);
+        osa_err_ok(err);
+        return m;
+    }
     FILE *f = fopen(path, "rb");
     if (!f) { osa_err_set(err, "cannot open model %s", path); return NULL; }
     osam_header h;
@@ -1068,6 +1089,27 @@ bool asr_transcribe_samples(asr_model *m, const float *samples, int64_t n,
     }
     memset(out, 0, sizeof *out);
     int64_t t0 = osa_now_ms();
+    if (m->wsp) {
+        /* whisper.cpp: the whole clip at once, language forced or detected */
+        wsp_result wr;
+        char werr[160];
+        const char *lang = (force_lang && *force_lang && !osa_strieq(force_lang, "auto"))
+                           ? force_lang : NULL;
+        if (!wsp_transcribe(m->wsp, samples, n, lang, &wr, werr, sizeof werr)) {
+            osa_err_set(err, "%s", werr);
+            return false;
+        }
+        osa_strlcpy(out->text, wr.text, sizeof out->text);
+        osa_strlcpy(out->language, wr.language[0] ? wr.language : (lang ? lang : "fa"),
+                    sizeof out->language);
+        out->confidence = wr.confidence;
+        out->duration_s = (double)n / OSAI_SR;
+        out->proc_ms = (double)(osa_now_ms() - t0);
+        out->model_name = m->name;
+        out->used_fixture = false;
+        osa_err_ok(err);
+        return true;
+    }
     const char *lang = (force_lang && *force_lang && !osa_strieq(force_lang, "auto"))
                        ? force_lang : asr_detect_language(samples, n);
     osa_strlcpy(out->language, lang, sizeof out->language);

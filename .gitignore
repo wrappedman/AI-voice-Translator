@@ -49,3 +49,6 @@ src/platform/win32/app_version.h
 # python bytecode from the helper scripts
 __pycache__/
 *.pyc
+
+# Whisper weights are large (ggml-tiny is 77 MB): they are shipped in the zip, not in git.
+dist/bin/models/*.bin

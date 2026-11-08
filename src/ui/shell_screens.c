@@ -88,6 +88,7 @@ static void stat_tile(ui_context *u, osa_rect r, const char *label, const char *
 
 static struct {
     osa_mic *mic;
+    struct live_job *job;            /* the pass in flight, or NULL */
     float    ring[OSAI_SR * 30];
     int64_t  n;
     double   since_emit;
@@ -113,33 +114,84 @@ static void live_join(char *dst, size_t cap, const char *a, const char *b) {
     else osa_strlcpy(dst, (a && *a) ? a : (b ? b : ""), cap);
 }
 
-/* Recognises the current segment and updates the panes. Returns true when the
- * text changed. */
-static bool live_emit(shell_state *s) {
+/* ---- recognition worker -------------------------------------------
+ * A pass recognises the whole segment, which takes seconds with the whisper
+ * engine. Passes run on a worker thread so the window keeps painting: the pass
+ * sees a private copy of the audio, one pass is in flight at a time, and its
+ * result is applied on the UI thread by live_reap(). */
+typedef struct live_job {
+    float    *pcm;
+    int64_t   n;
+    osa_app  *app;
+    char      text[8192];
+    char      lang[8];
+    float     conf;
+    bool      ok;
+    volatile int done;
+    osa_thread th;
+} live_job;
+
+static void live_worker(void *ud) {
+    live_job *j = (live_job *)ud;
+    osa_error e;
+    osa_err_ok(&e);
+    j->ok = osa_app_recognize(j->app, j->pcm, j->n, j->text, sizeof j->text,
+                              j->lang, sizeof j->lang, &j->conf, &e);
+    j->done = 1;
+}
+
+static bool live_start_pass(shell_state *s) {
+    if (g_live.job) return false;
     if (g_live.n < (int64_t)(OSAI_SR * LIVE_MIN_S)) return false;
-    osa_app_transcript tr;
-    osa_error err;
-    osa_err_ok(&err);
-    if (!osa_app_transcribe_samples(s->app, g_live.ring, g_live.n, &tr, &err)) return false;
-    if (!tr.text[0]) return false;
-    osa_strlcpy(g_live.partial, tr.text, sizeof g_live.partial);
+    live_job *j = (live_job *)calloc(1, sizeof *j);
+    if (!j) return false;
+    j->pcm = (float *)malloc((size_t)g_live.n * sizeof(float));
+    if (!j->pcm) { free(j); return false; }
+    memcpy(j->pcm, g_live.ring, (size_t)g_live.n * sizeof(float));
+    j->n = g_live.n;
+    j->app = s->app;
+    if (!osa_thread_start(&j->th, live_worker, j)) { free(j->pcm); free(j); return false; }
+    g_live.job = j;
+    return true;
+}
+
+/* Shows the result of a finished pass. */
+static void live_apply(shell_state *s, const live_job *j) {
+    if (!j->ok || !j->text[0]) return;
+    osa_strlcpy(g_live.partial, j->text, sizeof g_live.partial);
     char joined[4096];
     live_join(joined, sizeof joined, g_live.committed, g_live.partial);
-    if (osa_streq(joined, g_live.final_text)) return false;
+    if (osa_streq(joined, g_live.final_text)) return;
     osa_strlcpy(g_live.final_text, joined, sizeof g_live.final_text);
     osa_app_translation mt;
+    osa_error err;
     osa_err_ok(&err);
     if (osa_app_translate(s->app, g_live.final_text, "", &mt, &err))
         osa_strlcpy(g_live.translation, mt.text, sizeof g_live.translation);
     s->live_words = 0;
     for (const char *c = g_live.final_text; *c; c++) if (*c == ' ') s->live_words++;
     if (g_live.final_text[0]) s->live_words++;
-    return true;
+}
+
+/* Collects a finished pass. Joined here, on the UI thread, so the worker's
+ * handle is never used after it has been released. */
+static void live_finish_job(shell_state *s) {
+    live_job *j = g_live.job;
+    osa_thread_join(&j->th);
+    live_apply(s, j);
+    free(j->pcm);
+    free(j);
+    g_live.job = NULL;
+}
+
+static void live_reap(shell_state *s) {
+    if (!g_live.job || !g_live.job->done) return;
+    live_finish_job(s);
 }
 
 /* A segment that has grown past the window is committed and the buffer starts
- * again from empty. Doing it in the recognition path (not on a timer) keeps the
- * commit aligned with text the user has already seen. */
+ * again from empty. Only called with no pass in flight, so the commit and the
+ * pass cannot disagree about which text is partial. */
 static void live_commit_if_long(shell_state *s) {
     if (g_live.n < (int64_t)(OSAI_SR * LIVE_SEG_MAX_S)) return;
     if (g_live.partial[0]) {
@@ -157,9 +209,14 @@ static void live_commit_if_long(shell_state *s) {
 }
 
 static void live_stop(shell_state *s) {
-    /* one last pass over whatever was captured after the previous one, so the
-     * end of the sentence is not lost to the 700 ms cadence */
-    bool got = live_emit(s);
+    /* let a pass in flight finish, then one last pass over everything captured,
+     * so the end of the sentence is not lost to the 0.7 s cadence */
+    if (g_live.job) live_finish_job(s);
+    bool ran = false;
+    if (live_start_pass(s)) {
+        ran = true;
+        live_finish_job(s);
+    }
     if (g_live.mic) { osa_mic_close(g_live.mic); g_live.mic = NULL; }
     s->live = false;
     s->live_level = 0;
@@ -170,8 +227,8 @@ static void live_stop(shell_state *s) {
         s->history_json = osa_app_history_json(s->app, 100, NULL);
     } else {
         /* Silence, a muted microphone or a device that recorded nothing used to
-         * end in a cheerful "done" with two empty panes. Say which it is. */
-        shell_set_message(s, !got, "%s", kl(s, got ? "live.nothing" : "live.silent"));
+         * end in a cheerful \"done\" with two empty panes. Say which it is. */
+        shell_set_message(s, !ran, "%s", kl(s, ran ? "live.nothing" : "live.silent"));
     }
 }
 
@@ -188,11 +245,12 @@ void shell_live_tick(shell_state *s, double dt) {
         if (g_live.n >= (int64_t)(sizeof g_live.ring / sizeof g_live.ring[0])) break;
     }
     s->live_level = osa_mic_level(g_live.mic);
+    live_reap(s);
+    if (!g_live.job) live_commit_if_long(s);
     g_live.since_emit += dt;
-    if (g_live.since_emit >= 0.7) {
+    if (g_live.since_emit >= 0.7 && !g_live.job) {
         g_live.since_emit = 0;
-        live_emit(s);
-        live_commit_if_long(s);
+        live_start_pass(s);
     }
 }
 

@@ -4,6 +4,7 @@
 #include "osai_app.h"
 #include "../core/osai_platform.h"
 #include "../core/tts.h"
+#include "../engines/whisper_bridge.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -12,6 +13,9 @@
 struct osa_app {
     osa_db   *db;
     bool      db_ready;
+    /* The recogniser can be replaced, and whisper.cpp is not reentrant: every
+     * use of a->asr and every swap of it happens under this lock. */
+    osa_mutex asr_mu;
     asr_model *asr;
     char      asr_model_id[40];
     mt_model *mt;
@@ -119,6 +123,28 @@ static void seed_from_dist(void) {
     seed_dir("packs", OSAI_DIR_PACKS);
 }
 
+/* Id of the active model of `kind`, copied into out. Returns false when none is
+ * active or the query fails. out may be NULL to only test for one. */
+static bool active_model_id(osa_app *a, const char *kind, char *out, size_t cap) {
+    osa_rs rs;
+    osa_error e;
+    osa_buf sql;
+    osa_buf_init(&sql);
+    osa_arena ar;
+    osa_arena_init(&ar);
+    osa_buf_printf(&sql, "SELECT id FROM Models WHERE kind='%s' AND active=1 LIMIT 1",
+                   osa_sql_escape(&ar, kind));
+    bool found = false;
+    if (osa_sql_query(a->db, sql.data, &rs, &e) && rs.nrows > 0) {
+        found = true;
+        if (out && cap) osa_strlcpy(out, osa_rs_val(&rs, 0, "id"), cap);
+    }
+    osa_rs_free(&rs);
+    osa_buf_free(&sql);
+    osa_arena_free(&ar);
+    return found;
+}
+
 static bool ensure_builtin_models(osa_app *a, osa_error *err) {
     /* ASR: synthesise the exemplar pack once and keep it on disk, so the
      * "Builtin" model behaves like any other installed model (it appears in the
@@ -153,9 +179,55 @@ static bool ensure_builtin_models(osa_app *a, osa_error *err) {
      * active=0, so a fresh install would otherwise show no active model. The
      * previously active one is only deselected within its own kind, and it stays
      * installed for rollback. */
-    if (!osa_store_model_set_active(a->db, asr_id, err)) return false;
+    /* The builtin recogniser is the fallback, not the choice: it is made active
+     * only when no recogniser is active yet. Re-asserting it on every start
+     * (as this used to) silently undid the user's model choice. */
+    if (!active_model_id(a, "asr", NULL, 0)) {
+        if (!osa_store_model_set_active(a->db, asr_id, err)) return false;
+    }
     if (!osa_store_model_set_active(a->db, "builtin-mt", err)) return false;
     return true;
+}
+
+/* The ggml-tiny file is the default recogniser. It is adopted the first time it
+ * is seen in the models folder: registered and activated. After that the user's
+ * choice stands, even if they switch back to the builtin model. */
+static void adopt_default_asr(osa_app *a) {
+    char path[OSAI_MAX_PATH];
+    osa_path_join(path, sizeof path, a->models_dir, "ggml-tiny.bin");
+    if (!osa_file_exists(path) || !wsp_is_model_file(path)) return;
+    osa_error e;
+    osa_rs rs;
+    osa_buf sql;
+    osa_buf_init(&sql);
+    osa_arena ar;
+    osa_arena_init(&ar);
+    osa_buf_printf(&sql, "SELECT id FROM Models WHERE id='ggml-tiny'");
+    bool known = osa_sql_query(a->db, sql.data, &rs, &e) && rs.nrows > 0;
+    osa_rs_free(&rs);
+    osa_buf_free(&sql);
+    osa_arena_free(&ar);
+    if (known) return;
+    /* prove the file loads before it is recorded: a broken file must not become
+     * a permanent "installed" row that is never retried */
+    char werr[160];
+    wsp_ctx *probe = wsp_load(path, werr, sizeof werr);
+    if (!probe) return;
+    wsp_free(probe);
+    if (!register_model(a, "ggml-tiny", "Whisper tiny (ggml)", "asr", "whisper",
+                        "openai-whisper-tiny", "MIT (OpenAI Whisper weights)",
+                        "ggml-tiny.bin shipped with the application", path, "1.0.0", &e))
+        return;
+    osa_app_activate_model(a, "ggml-tiny", &e);
+}
+
+/* Loads the recogniser the database says is active, so a restart keeps it. */
+static void restore_active_asr(osa_app *a) {
+    char id[64];
+    if (!active_model_id(a, "asr", id, sizeof id)) return;
+    if (osa_streq(id, a->asr_model_id)) return;
+    osa_error e;
+    osa_app_activate_model(a, id, &e);
 }
 
 /* ---- lifecycle ---------------------------------------------------- */
@@ -165,6 +237,7 @@ static void load_word_packs(osa_app *a);
 osa_app *osa_app_create(osa_error *err) {
     osa_app *a = (osa_app *)calloc(1, sizeof *a);
     if (!a) { osa_err_set(err, "out of memory"); return NULL; }
+    osa_mutex_init(&a->asr_mu);
 
     /* 1. directory tree (created on first run, never inside the exe folder) */
     osa_strlcpy(a->models_dir, osa_path(OSAI_DIR_MODELS), sizeof a->models_dir);
@@ -205,8 +278,11 @@ osa_app *osa_app_create(osa_error *err) {
     /* 4. models the release ships next to the exe (a fresh copy of dist/ has
      *    to work on a machine that never ran the program) */
     seed_from_dist();
-    /* 5. register the builtins so the model manager is never empty */
+    /* 5. register the builtins so the model manager is never empty, then the
+     *    default recogniser if its file is present, then whatever the user chose */
     ensure_builtin_models(a, err);
+    adopt_default_asr(a);
+    restore_active_asr(a);
     /* 6. word packs the user installed earlier: the engine has to read them
      *    before the first translation, or a restart would silently undo an
      *    install that the Models screen still lists. */
@@ -217,6 +293,7 @@ osa_app *osa_app_create(osa_error *err) {
 
 void osa_app_destroy(osa_app *a) {
     if (!a) return;
+    osa_mutex_destroy(&a->asr_mu);
     if (a->asr) asr_model_free(a->asr);
     if (a->mt) mt_model_free(a->mt);
     if (a->db) osa_db_close(a->db);
@@ -313,7 +390,9 @@ bool osa_app_transcribe_file(osa_app *a, const char *path,
     if (!osa_audio_load(path, &au, err)) return false;
     int64_t t0 = osa_now_us();
     asr_result r;
+    osa_mutex_lock(&a->asr_mu);
     bool ok = asr_transcribe_samples(a->asr, au.samples, au.n, NULL, &r, err);
+    osa_mutex_unlock(&a->asr_mu);
     double proc_ms = (double)(osa_now_us() - t0) / 1000.0;
     double dur = osa_audio_duration_s(&au);
     if (ok) {
@@ -344,12 +423,34 @@ bool osa_app_transcribe_samples(osa_app *a, const float *samples, int64_t n,
     au.src_rate = OSAI_SR;
     int64_t t0 = osa_now_us();
     asr_result r;
+    osa_mutex_lock(&a->asr_mu);
     bool ok = asr_transcribe_samples(a->asr, au.samples, au.n, NULL, &r, err);
+    osa_mutex_unlock(&a->asr_mu);
     double proc_ms = (double)(osa_now_us() - t0) / 1000.0;
     if (ok) {
         fill_transcript(a, &r, (double)n / OSAI_SR, proc_ms, "", out, err);
         asr_result_free(&r);
     }
+    return ok;
+}
+
+/* Recognition only: no transcript row, no audio copy, no history. The live
+ * screen calls this from a worker thread on every pass, so it must not write
+ * to the database (a pass every 0.7 s would fill the history). */
+bool osa_app_recognize(osa_app *a, const float *samples, int64_t n,
+                       char *text, size_t text_cap, char *lang, size_t lang_cap,
+                       float *confidence, osa_error *err) {
+    if (!a || !samples || n <= 0) { osa_err_set(err, "no audio"); return false; }
+    osa_mutex_lock(&a->asr_mu);
+    asr_result r;
+    bool ok = a->asr && asr_transcribe_samples(a->asr, samples, n, NULL, &r, err);
+    if (ok) {
+        if (text && text_cap) osa_strlcpy(text, r.text, text_cap);
+        if (lang && lang_cap) osa_strlcpy(lang, r.language, lang_cap);
+        if (confidence) *confidence = r.confidence;
+        asr_result_free(&r);
+    }
+    osa_mutex_unlock(&a->asr_mu);
     return ok;
 }
 
@@ -1080,9 +1181,41 @@ int osa_app_download_pack(osa_app *a, const char *id,
  * pack: line-oriented "word<TAB>word" pairs that extend the phrasebook for one
  * direction. Both are installed into the user's data folder; nothing is ever
  * written next to the executable. */
+/* A whisper.cpp ggml file (ggml-tiny.bin, ...) is a recogniser, not a word
+ * table. It is checked by loading it, copied into the models folder under its
+ * own name, registered as an ASR model and activated: installing it is the
+ * user asking for it. The download may have arrived under any extension. */
+static bool install_whisper_file(osa_app *a, const char *path, osa_error *err) {
+    char werr[160];
+    wsp_ctx *probe = wsp_load(path, werr, sizeof werr);
+    if (!probe) { osa_err_set(err, "%s", werr); return false; }
+    wsp_free(probe);
+    char stem[64];
+    osa_strlcpy(stem, osa_path_basename(path), sizeof stem);
+    char *dot = strrchr(stem, '.');
+    if (dot) *dot = 0;
+    if (!stem[0]) { osa_err_set(err, "bad model file name"); return false; }
+    char file[OSAI_MAX_PATH];
+    snprintf(file, sizeof file, "%s.bin", stem);
+    char dst[OSAI_MAX_PATH];
+    osa_path_join(dst, sizeof dst, a->models_dir, file);
+    if (!osa_streq(path, dst) && !osa_file_copy(path, dst)) {
+        osa_err_set(err, "نمی‌توان مدل را در پوشه مدل‌ها کپی کرد");
+        return false;
+    }
+    char name[96];
+    snprintf(name, sizeof name, "Whisper %s (ggml)", stem);
+    if (!register_model(a, stem, name, "asr", "whisper", "openai-whisper",
+                        "MIT (OpenAI Whisper weights)", "catalogue download", dst,
+                        "1.0.0", err))
+        return false;
+    return osa_app_activate_model(a, stem, err);
+}
+
 bool osa_app_install_pack_file(osa_app *a, const char *path, osa_error *err) {
     if (!a || !path) { osa_err_set(err, "bad arguments"); return false; }
     if (!osa_file_exists(path)) { osa_err_set(err, "فایل پیدا نشد"); return false; }
+    if (wsp_is_model_file(path)) return install_whisper_file(a, path, err);
     const char *ext = osa_path_ext(path);
     if (ext && (osa_strieq(ext, ".osam") || osa_strieq(ext, ".osmt"))) {
         char id[64];
@@ -1199,8 +1332,10 @@ bool osa_app_activate_model(osa_app *a, const char *id, osa_error *err) {
             if (disk) { asr_model_free(nm); nm = disk; loaded = true; }
         }
         if (!nm) { osa_err_set(err, "cannot load ASR model"); return false; }
+        osa_mutex_lock(&a->asr_mu);
         asr_model_free(a->asr);
         a->asr = nm;
+        osa_mutex_unlock(&a->asr_mu);
         osa_strlcpy(a->asr_model_id, m.id, sizeof a->asr_model_id);
         (void)loaded;
     } else if (osa_streq(kind, "mt")) {
@@ -1561,9 +1696,9 @@ static int read_dataset(const char *path, train_pair *out, int max) {
     return n;
 }
 
-bool osa_app_train(osa_app *a, const char *dataset_path, int epochs,
-                   osa_train_result *out, osa_error *err) {
-    if (!a || !a->asr || !out) { osa_err_set(err, "bad arguments"); return false; }
+static bool train_on(osa_app *a, asr_model *base, const char *dataset_path, int epochs,
+                     osa_train_result *out, osa_error *err) {
+    if (!a || !base || !out) { osa_err_set(err, "bad arguments"); return false; }
     memset(out, 0, sizeof *out);
     if (epochs < 1) epochs = 1;
     if (epochs > 64) epochs = 64;
@@ -1587,7 +1722,7 @@ bool osa_app_train(osa_app *a, const char *dataset_path, int epochs,
                 snprintf(phrase, sizeof phrase, "%s", lex[i].w);
                 float *pcm = tts_speak(phrase, "fa", &n);
                 if (!pcm || n <= 0) { free(pcm); continue; }
-                if (asr_model_add_exemplar(a->asr, lex[i].w, pcm, n, NULL)) {
+                if (asr_model_add_exemplar(base, lex[i].w, pcm, n, NULL)) {
                     out->n_added++;
                     words_total++;
                 }
@@ -1619,7 +1754,7 @@ bool osa_app_train(osa_app *a, const char *dataset_path, int epochs,
                     int64_t per = au.n / nwd;
                     for (int k = 0; k < nwd; k++) {
                         int64_t start = (int64_t)k * per;
-                        if (asr_model_add_exemplar(a->asr, words[k], au.samples + start, per, NULL)) {
+                        if (asr_model_add_exemplar(base, words[k], au.samples + start, per, NULL)) {
                             out->n_added++;
                             words_total++;
                         }
@@ -1636,7 +1771,7 @@ bool osa_app_train(osa_app *a, const char *dataset_path, int epochs,
     char id[64];
     snprintf(id, sizeof id, "trained-asr-%lld", (long long)(osa_now_ms() / 1000));
     snprintf(out->model_path, sizeof out->model_path, "%s%s.osam", a->models_dir, id);
-    if (!asr_model_save(a->asr, out->model_path, err)) {
+    if (!asr_model_save(base, out->model_path, err)) {
         osa_buf_printf(&log, "ذخیره مدل ناموفق بود\n");
         osa_strlcpy(out->log, log.data ? log.data : "", sizeof out->log);
         osa_buf_free(&log);
@@ -1645,8 +1780,8 @@ bool osa_app_train(osa_app *a, const char *dataset_path, int epochs,
     osa_strlcpy(out->model_id, id, sizeof out->model_id);
     char name[128];
     snprintf(name, sizeof name, "مدل آموزش‌دیده %s", a->last_language[0] ? a->last_language : "fa");
-    if (!register_model(a, id, name, "asr", asr_model_backend(a->asr),
-                        a->asr_model_id, "GPL-3.0-or-later (derived)",
+    if (!register_model(a, id, name, "asr", asr_model_backend(base),
+                        asr_model_id(base), "GPL-3.0-or-later (derived)",
                         "trained in the application", out->model_path, "1.0.0", NULL)) {
         osa_buf_printf(&log, "ثبت مدل جدید ناموفق بود\n");
     } else {
@@ -1669,6 +1804,20 @@ bool osa_app_train(osa_app *a, const char *dataset_path, int epochs,
     osa_buf_free(&log);
     osa_err_ok(err);
     return true;
+}
+
+/* A whisper model cannot take exemplars, so training always starts from the
+ * exemplar model that ships with the application; the result is then a new
+ * exemplar model, which is what the rest of the training flow expects. */
+bool osa_app_train(osa_app *a, const char *dataset_path, int epochs,
+                   osa_train_result *out, osa_error *err) {
+    if (!a || !a->asr || !out) { osa_err_set(err, "bad arguments"); return false; }
+    if (!a->asr->wsp) return train_on(a, a->asr, dataset_path, epochs, out, err);
+    asr_model *base = asr_model_fixture("fa", err);
+    if (!base) return false;
+    bool ok = train_on(a, base, dataset_path, epochs, out, err);
+    asr_model_free(base);
+    return ok;
 }
 
 /* ---- evaluation --------------------------------------------------- */
@@ -1731,7 +1880,10 @@ char *osa_app_evaluate(osa_app *a, osa_error *err) {
             osa_error lerr;
             memset(&r, 0, sizeof r);
             memset(&lerr, 0, sizeof lerr);
-            if (asr_transcribe_samples(a->asr, pcm, n, lang, &r, &lerr)) {
+            osa_mutex_lock(&a->asr_mu);
+            bool rec = asr_transcribe_samples(a->asr, pcm, n, lang, &r, &lerr);
+            osa_mutex_unlock(&a->asr_mu);
+            if (rec) {
                 double w = asr_wer(set[i], r.text, lang);
                 double c = asr_cer(set[i], r.text);
                 if (counted) osa_buf_putc(&group, ',');
