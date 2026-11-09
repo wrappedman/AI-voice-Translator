@@ -291,6 +291,7 @@ static const char *const UI_STRINGS[][3] = {
     {"settings.choosefolder", "انتخاب پوشه", "Choose folder"},
     {"settings.sync", "همگام‌سازی", "Sync"},
     {"settings.syncing", "بررسی فایل‌ها… %s", "Checking files… %s"},
+    {"settings.syncbig", "%s — در حال خواندن فایل بزرگ %s", "%s — reading a large file, %s"},
     {"settings.synchint", "فایل‌های موجود در پوشه با فهرست رسمی تطبیق داده می‌شوند؛ مدل‌های شناخته‌شده به «نصب‌شده» اضافه می‌شوند تا خودتان فعالشان کنید.", "Files in the folder are matched against the official catalogue; recognised models appear under Installed so you can activate them."},
     {"settings.syncdone", "همگام‌سازی: %s مدل جدید، %s از قبل ثبت‌شده، %s ناشناخته.", "Sync: %s new, %s already registered, %s unrecognised."},
     {"settings.syncunknown", "فایل‌های ناشناخته: %s", "Unrecognised files: %s"},

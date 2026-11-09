@@ -461,6 +461,97 @@ static void test_activation_diagnostics(void){
     clean_root();
 }
 
+/* The reported bug: a GGUF that llama.cpp refuses produced one opaque sentence
+ * that named neither the reason nor the file. Each cause must now be distinct,
+ * and the tooling that survives it must say where the full log is. */
+static void test_model_load_diagnostics(void){
+    suite("model load diagnostics name the real cause");
+    const char *exe="build/OpenSpeechWorker";
+    if(!osa_file_exists(exe)){printf("  SKIP worker binary not built (%s)\n",exe);return;}
+    char dir[256];snprintf(dir,sizeof dir,"/tmp/osai-mldiag-XXXXXX");
+    if(!mkdtemp(dir)){CHECK_MSG(false,"mkdtemp");return;}
+
+    /* 1. a file that is not GGUF at all */
+    char notgguf[400];snprintf(notgguf,sizeof notgguf,"%s/not.gguf",dir);
+    unsigned char junk[4096];memset(junk,0x5a,sizeof junk);
+    CHECK(osa_file_write(notgguf,junk,sizeof junk));
+    const char *a1[]={exe,"--kind","mt","--model",notgguf,"--threads","2",NULL};
+    osa_error err;osa_err_ok(&err);
+    osa_process *p=osa_process_start(a1,&err);
+    CHECK_MSG(p!=NULL,"worker starts on a non-GGUF file: %s",p?"ok":err.msg);
+    if(p){
+        char *line=NULL;
+        CHECK(osa_process_line(p,20000,NULL,&line,&err));
+        CHECK_MSG(line&&strstr(line,"\"ok\":false"),"it reports a failure, not ready");
+        CHECK_MSG(line&&strstr(line,"not a GGUF")!=NULL,
+                  "the message says the file is not a GGUF container: %s",line?line:"?");
+        free(line);osa_process_stop(p);
+    }
+
+    /* 2. a fastText model handed to the translation engine, and the reverse:
+     *    each engine names the other format instead of "wrong file format" */
+    char ft[400];snprintf(ft,sizeof ft,"%s/real.ftz",dir);
+    FILE *f=fopen(ft,"wb");
+    CHECK(f!=NULL);
+    if(f){
+        int32_t magic=793712314,version=12;
+        fwrite(&magic,sizeof magic,1,f);fwrite(&version,sizeof version,1,f);
+        unsigned char pad[9000];memset(pad,1,sizeof pad);fwrite(pad,1,sizeof pad,f);
+        fclose(f);
+    }
+    const char *a2[]={exe,"--kind","mt","--model",ft,"--threads","2",NULL};
+    p=osa_process_start(a2,&err);
+    if(p){
+        char *line=NULL;
+        CHECK(osa_process_line(p,20000,NULL,&line,&err));
+        CHECK_MSG(line&&strstr(line,"fastText")!=NULL&&strstr(line,"GGUF")!=NULL,
+                  "a fastText file is named as such, not blamed on memory: %s",line?line:"?");
+        free(line);osa_process_stop(p);
+    }
+    const char *a3[]={exe,"--kind","lang","--model",notgguf,NULL};
+    p=osa_process_start(a3,&err);
+    if(p){
+        char *line=NULL;
+        CHECK(osa_process_line(p,20000,NULL,&line,&err));
+        CHECK_MSG(line&&strstr(line,"fastText")!=NULL,
+                  "the language engine says it did not get a fastText model: %s",line?line:"?");
+        free(line);osa_process_stop(p);
+    }
+    remove(notgguf);remove(ft);
+    char cmd[512];snprintf(cmd,sizeof cmd,"rmdir %s 2>/dev/null",dir);system(cmd);
+}
+
+/* Hashes must be cancellable: Sync runs on a background thread whose Cancel and
+ * window-close paths wait for it, so an uninterruptible multi-gigabyte read is
+ * exactly what made the window freeze. */
+static void test_hash_cancel(void){
+    suite("cancellable hashing");
+    char path[256];snprintf(path,sizeof path,"/tmp/osai-hash-XXXXXX");
+    int fd=mkstemp(path);
+    CHECK(fd>=0);
+    if(fd<0)return;
+    char chunk[65536];memset(chunk,3,sizeof chunk);
+    for(int i=0;i<160;i++){                       /* ~10 MB */
+        if(write(fd,chunk,sizeof chunk)!=(ssize_t)sizeof chunk)break;
+    }
+    close(fd);
+
+    char a[65]={0},b[65]={0};uint64_t na=0,nb=0;
+    CHECK(osa_sha256_file_ex(path,a,&na,NULL,NULL,NULL));
+    osa_sha256_file(path,b,&nb);
+    CHECK_MSG(na==nb&&na>0,"the extended hash reports the same size");
+    CHECK_MSG(osa_streq(a,b),"the extended hash agrees with osa_sha256_file");
+    CHECK_MSG(strlen(a)==64,"the digest is 64 hex characters");
+
+    volatile int stop=1;
+    char c[65]={0};uint64_t nc=0;
+    bool ok=osa_sha256_file_ex(path,c,&nc,&stop,NULL,NULL);
+    CHECK_MSG(!ok,"an already-cancelled hash returns false");
+    CHECK_MSG(c[0]==0,"a cancelled hash leaves no digest behind");
+
+    remove(path);
+}
+
 static void test_portable_data_dir(void){
     suite("portable data folder + profile migration");
     const char *host="build/openspeech";
@@ -550,6 +641,8 @@ int main(void){
     test_worker_protocol();
     test_models_folder_and_sync();
     test_activation_diagnostics();
+    test_model_load_diagnostics();
+    test_hash_cancel();
     test_portable_data_dir();
     test_optional_real_models();
     printf("\n%d passed, %d failed\n",g_pass,g_fail);

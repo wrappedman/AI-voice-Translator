@@ -1421,10 +1421,19 @@ static void draw_settings(shell_state *s, ui_context *u, osa_rect body) {
             s->request = SHELL_REQ_PICK_MODELS_DIR;
         bool syncing = s->syncing;
         if (syncing) {
-            char raw[64], loc[128], label[192];
+            char raw[64], loc[128], label[256];
             snprintf(raw, sizeof raw, "%d / %d", s->sync_done, s->sync_total);
             text_localize_digits(raw, s->lang == UI_FA ? "fa" : "en", loc, sizeof loc);
-            snprintf(label, sizeof label, tt(s->lang, "settings.syncing"), loc);
+            /* Verifying a multi-gigabyte model takes minutes and the file count
+             * cannot move meanwhile, so say which file is being read. "0 / 6"
+             * on its own looked exactly like a frozen window. */
+            if (s->sync_reading[0]) {
+                char first[160];
+                snprintf(first, sizeof first, tt(s->lang, "settings.syncing"), loc);
+                snprintf(label, sizeof label, tt(s->lang, "settings.syncbig"), first, s->sync_reading);
+            } else {
+                snprintf(label, sizeof label, tt(s->lang, "settings.syncing"), loc);
+            }
             c_fill_round(u->c, syncb, u->L.radius_sm, u->t.panel_alt);
             ui_label(u, syncb, label, UI_FS_TINY * u->L.scale, u->t.accent, 1);
         } else if (ui_button(u, 8401, syncb, kl(s, "settings.sync"), !s->job)) {

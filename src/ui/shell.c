@@ -279,7 +279,7 @@ bool shell_select_audio(shell_state *s,const char *path){
     return shell_start_job(s,SHELL_JOB_LOAD_AUDIO,path);
 }
 bool shell_delete_model(shell_state *s,const char *id){return shell_start_job(s,SHELL_JOB_DELETE,id);}
-bool shell_sync_models(shell_state *s){s->sync_valid=false;s->sync_done=s->sync_total=0;return shell_start_job(s,SHELL_JOB_SYNC,NULL);}
+bool shell_sync_models(shell_state *s){s->sync_valid=false;s->sync_done=s->sync_total=0;s->sync_reading[0]=0;return shell_start_job(s,SHELL_JOB_SYNC,NULL);}
 void shell_refresh_models_dir(shell_state *s){if(s&&s->app)osa_app_models_dir(s->app,s->models_dir,sizeof s->models_dir);}
 void shell_set_models_dir(shell_state *s,const char *path){
     if(!s||!s->app||!path||!*path)return;
@@ -1008,19 +1008,35 @@ bool shell_start_job(shell_state*s,shell_job_kind kind,const char*arg){
     if((kind==SHELL_JOB_TRANSCRIBE||kind==SHELL_JOB_TRANSLATE)&&!s->models_ready){shell_set_message(s,true,"%s",tt(s->lang,"models.required"));return false;}
     shell_job*j=calloc(1,sizeof*j);if(!j)return false;j->kind=kind;j->app=s->app;if(arg)osa_strlcpy(j->arg,arg,sizeof j->arg);
     if(kind==SHELL_JOB_TRANSLATE){j->input=osa_strdup(s->tr_in);if(!j->input){free(j);return false;}}
+    /* An abandoned job (see shell_cancel_jobs) is still running and still reads
+     * its `app` pointer. Starting a new job over it used to overwrite s->job,
+     * leak the old shell_job, and leave two background jobs racing on the same
+     * app. Refuse instead, and say why. */
+    if(s->abandoned){shell_set_message(s,true,"%s",tt(s->lang,"live.stopfirst"));free(j->input);free(j);return false;}
     if(!osa_thread_start(&j->th,job_worker,j)){free(j->input);free(j);return false;}
     s->job=j;s->working=kind!=SHELL_JOB_DOWNLOAD;s->downloading=kind==SHELL_JOB_DOWNLOAD;
     s->activating=kind==SHELL_JOB_ACTIVATE;s->syncing=kind==SHELL_JOB_SYNC;s->message[0]=0;
     if(s->activating)shell_set_message(s,false,"%s",tt(s->lang,"models.activating"));
     if(kind==SHELL_JOB_DELETE)shell_set_message(s,false,"%s",tt(s->lang,"models.deleting"));
-    if(kind==SHELL_JOB_SYNC){s->sync_done=s->sync_total=0;shell_set_message(s,false,"%s",tt(s->lang,"settings.synchint"));}
+    if(kind==SHELL_JOB_SYNC){s->sync_done=s->sync_total=0;s->sync_reading[0]=0;shell_set_message(s,false,"%s",tt(s->lang,"settings.synchint"));}
     if(kind==SHELL_JOB_DOWNLOAD){s->dl_progress=0;s->dl_got=s->dl_total=0;osa_strlcpy(s->dl_pack,arg,sizeof s->dl_pack);}return true;
 }
 void shell_job_tick(shell_state*s){
-    if(!s||!s->job)return;shell_job*j=s->job;
+    if(!s)return;
+    if(!s->job){
+        /* An abandoned job owns its own memory; drop the block once the app is
+         * no longer busy so the next Sync/Activate can run. */
+        if(s->abandoned&&!s->working&&!s->syncing&&!s->activating)s->abandoned=false;
+        return;
+    }
+    shell_job*j=s->job;
     if(j->kind==SHELL_JOB_DOWNLOAD){s->dl_progress=j->permille/1000.0;s->dl_got=j->got;s->dl_total=j->total;}
-    if(j->kind==SHELL_JOB_SYNC){s->sync_done=(int)j->got;s->sync_total=(int)j->total;}if(!osa_atomic_load(&j->done))return;
-    osa_thread_join(&j->th);s->job=NULL;s->working=false;s->downloading=false;s->activating=false;s->syncing=false;s->restoring=false;s->models_ready=osa_app_ready(s->app);s->status_valid=false;
+    if(j->kind==SHELL_JOB_SYNC){
+        s->sync_done=(int)j->got;s->sync_total=(int)j->total;
+        osa_strlcpy(s->sync_reading,j->sync.current,sizeof s->sync_reading);
+    }
+    if(!osa_atomic_load(&j->done))return;
+    osa_thread_join(&j->th);s->job=NULL;s->working=false;s->sync_reading[0]=0;s->downloading=false;s->activating=false;s->syncing=false;s->restoring=false;s->models_ready=osa_app_ready(s->app);s->status_valid=false;
     if(j->ok){
       switch(j->kind){
         case SHELL_JOB_RESTORE:osa_app_get_languages(s->app,s->lang_src,sizeof s->lang_src,s->lang_dst,sizeof s->lang_dst);s->style=osa_app_style(s->app);if(!s->models_ready)s->screen=SCREEN_MODELS;break;
@@ -1079,7 +1095,34 @@ void shell_job_tick(shell_state*s){
     }
     s->dl_pack[0]=0;s->dl_progress=0;s->dl_got=s->dl_total=0;free(j->input);free(j->peaks);free(j->eval_json);free(j);
 }
-void shell_cancel_jobs(shell_state*s){if(!s)return;osa_app_cancel(s->app);if(s->job){shell_job*j=s->job;__sync_lock_test_and_set(&j->cancel,1);osa_thread_join(&j->th);free(j->input);free(j->peaks);free(j->eval_json);free(j);s->job=NULL;}s->working=s->downloading=s->activating=s->syncing=s->restoring=false;}
+/* Cancel, then wait a *bounded* time for the job to stop. This runs on the UI
+ * thread (Cancel button, and window close), so an unbounded join meant the
+ * whole window froze until a hash or a download noticed the flag. Everything
+ * here is now cancellable, so the wait is short; if it is still not done the
+ * job is abandoned to finish on its own and its thread is detached, because
+ * the window must never hang on background work. */
+#define SHELL_JOB_STOP_MS 4000
+void shell_cancel_jobs(shell_state*s){
+    if(!s)return;
+    osa_app_cancel(s->app);
+    if(s->job){
+        shell_job*j=s->job;
+        __sync_lock_test_and_set(&j->cancel,1);
+        if(osa_thread_join_timeout(&j->th,SHELL_JOB_STOP_MS)){
+            free(j->input);free(j->peaks);free(j->eval_json);free(j);
+            s->abandoned=false;
+        }else{
+            /* Still finishing: let the thread own its own memory. It reads
+             * nothing from shell_state, so detaching is safe — but no new job
+             * may start while it still holds the app, or two engines would be
+             * driven at once. s->abandoned records that until it is reaped. */
+            osa_thread_detach(&j->th);
+            s->abandoned=true;
+        }
+        s->job=NULL;
+    }
+    s->working=s->downloading=s->activating=s->syncing=s->restoring=false;
+}
 /* Legacy entry points now share the same job queue; installation never happens on the UI thread. */
 bool shell_download_start(shell_state*s,const char*id){return shell_start_job(s,SHELL_JOB_DOWNLOAD,id);}
 void shell_download_tick(shell_state*s){shell_job_tick(s);}

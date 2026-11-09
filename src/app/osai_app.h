@@ -248,6 +248,10 @@ typedef struct osa_sync_result {
     int existing;                /* already registered, nothing to do      */
     int unknown;                 /* not in the verified catalogue          */
     char unknown_names[400];     /* a few names, for an honest report      */
+    /* The file being read right now. Hashing one large model takes minutes and
+     * the file counter cannot move meanwhile, so the UI shows this instead of
+     * an apparently frozen "0 / 6". */
+    char current[128];
 } osa_sync_result;
 
 /* Identifies the files already present in the models folder by SHA-256 against

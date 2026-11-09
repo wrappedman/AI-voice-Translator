@@ -14,6 +14,7 @@
 #include <string>
 #include <vector>
 #include <thread>
+#include <mutex>
 #ifdef _WIN32
 #include <io.h>
 #include <fcntl.h>
@@ -24,6 +25,62 @@ using json = nlohmann::json;
 
 static void send(const json &j) { std::cout << j.dump(-1, ' ', false, json::error_handler_t::replace) << '\n' << std::flush; }
 static void fail(const std::string &s) { send({{"ok",false},{"error",s}}); }
+
+/* llama.cpp reports the reason a GGUF was refused through its log callback,
+ * not through a return value: llama_model_load_from_file only hands back NULL.
+ * This used to install a callback that threw every message away and then raise
+ * one catch-all sentence ("unsupported or not enough free memory"), so a moved
+ * file, a truncated download, a tensor full of infinities and a genuinely
+ * unsupported architecture all looked identical to the user.
+ *
+ * The last error the loader emitted is kept here (and mirrored to stderr, which
+ * the parent already redirects into data/Logs/worker.log) so the JSON reply can
+ * carry the real sentence. It is a single-threaded, one-model-per-process
+ * worker, so a plain static is enough; it is guarded anyway because llama.cpp
+ * logs from the threads it spawns while loading. */
+static std::mutex g_log_mu;
+static std::string g_best_error;      /* most specific ERROR-level message  */
+static std::string g_last_line;       /* last message of any level           */
+/* llama.cpp always ends a failed load with these, whatever actually went
+ * wrong, so they are the one thing worth discarding. */
+static bool is_generic_tail(const std::string &s) {
+    static const char *tails[] = {
+        "failed to load model",
+        "error loading model",
+    };
+    for (const char *t : tails) {
+        size_t n = std::strlen(t);
+        if (s.size() >= n && s.compare(s.size() - n, n, t) == 0) return true;
+    }
+    return false;
+}
+static void capture_log(ggml_log_level level, const char *text, void *) {
+    if (!text || !*text) return;
+    std::string s(text);
+    while (!s.empty() && (s.back() == '\n' || s.back() == '\r' || s.back() == ' ')) s.pop_back();
+    if (s.empty()) return;
+    std::fprintf(stderr, "%s\n", text);            /* worker.log keeps everything */
+    std::lock_guard<std::mutex> lock(g_log_mu);
+    g_last_line = s;
+    /* Keep the *first* specific error: the reason arrives first ("failed to
+     * open GGUF file", "found tensors with invalid data") and every later line
+     * is a wrapper that only says the load failed. */
+    if (level == GGML_LOG_LEVEL_ERROR && g_best_error.empty() && !is_generic_tail(s))
+        g_best_error = s;
+}
+/* The sentence to show the user: the loader's most specific error, else the
+ * last line it printed, else empty (the caller then supplies its own wording). */
+static std::string last_load_diagnostic() {
+    std::lock_guard<std::mutex> lock(g_log_mu);
+    if (!g_best_error.empty()) {
+        /* "llama_model_load: error loading model: <reason>" — keep <reason>. */
+        const std::string prefix = "error loading model: ";
+        size_t at = g_best_error.find(prefix);
+        if (at != std::string::npos) return g_best_error.substr(at + prefix.size());
+        return g_best_error;
+    }
+    return g_last_line;
+}
 static void silent(ggml_log_level, const char *, void *) {}
 static void ftsilent(std::ostream &) {} // fastText has no global logger; load diagnostics are caught below.
 
@@ -121,11 +178,40 @@ static std::wstring utf8_wide(const std::string &s) {
 }
 #endif
 
+/* fastText models start with a little-endian magic (793712893) and a format
+ * version. Checking it here means a whisper ggml .bin, a .gguf or a truncated
+ * download gets a sentence that names the actual problem instead of fastText's
+ * bare "has wrong file format!" — or, worse, a stream exception with no text. */
+static bool fasttext_magic_ok(const std::string &path, std::string &problem) {
+    FILE *f = std::fopen(path.c_str(), "rb");
+    if (!f) return true;                    /* let fastText report the open error */
+    int32_t magic = 0, version = 0;
+    size_t n1 = std::fread(&magic, 1, sizeof magic, f);
+    size_t n2 = std::fread(&version, 1, sizeof version, f);
+    std::fclose(f);
+    if (n1 < sizeof magic) { problem = "the file is empty or truncated"; return false; }
+    if (magic != 793712314) {   /* FASTTEXT_FILEFORMAT_MAGIC_INT32 */
+        if (n1 >= 4 && std::memcmp(&magic, "ggml", 4) == 0)
+            problem = "this is a whisper (.bin) model, not a fastText language model";
+        else if (n1 >= 4 && std::memcmp(&magic, "GGUF", 4) == 0)
+            problem = "this is a GGUF translation model, not a fastText language model";
+        else
+            problem = "the file is not a fastText model (wrong header)";
+        return false;
+    }
+    if (n2 < sizeof version) { problem = "the file is truncated"; return false; }
+    if (version > 12) { /* upstream FASTTEXT_VERSION */ problem = "the fastText format is newer than this build supports"; return false; }
+    return true;
+}
+
 struct LanguageModel {
     fasttext::FastText ft;
     std::vector<std::string> labels;
     void load(const std::string &path) {
         std::fprintf(stderr, "fastText: loading %s\n", path.c_str());
+        std::string problem;
+        if (!fasttext_magic_ok(path, problem))
+            throw std::runtime_error("cannot load the language model (" + path + "): " + problem);
 #ifdef _WIN32
         FILE *fp=_wfopen(utf8_wide(path).c_str(),L"rb");
         if(!fp) throw std::runtime_error("cannot open the language model file: "+path);
@@ -140,7 +226,9 @@ struct LanguageModel {
 #endif
         std::fprintf(stderr, "fastText: loaded, %d labels\n", (int)ft.getDictionary()->nlabels());
         auto dict=ft.getDictionary();
-        if (dict->nlabels() < 2) throw std::runtime_error("not a language-identification model");
+        if (dict->nlabels() < 2) throw std::runtime_error(
+            "the file is a fastText model but not a language-identification one "
+            "(it has fewer than two labels)");
         // nwords() + nlabels() covers the whole dictionary; iterating only
         // nwords() stopped before the labels and produced an empty list.
         const int32_t total=dict->nwords()+dict->nlabels();
@@ -171,6 +259,27 @@ struct LanguageModel {
     }
 };
 
+/* A cheap sanity check on the file's magic before handing it to llama.cpp:
+ * only "GGUF" is accepted. A whisper .bin, a fastText .ftz or an interrupted
+ * download with a .gguf name then says so, instead of failing deep inside the
+ * loader with a sentence about memory. */
+static bool gguf_magic_bad(const std::string &path, std::string &problem) {
+    FILE *f = std::fopen(path.c_str(), "rb");
+    if (!f) return false;              /* let the loader report the real error */
+    unsigned char magic[4] = {0,0,0,0};
+    size_t n = std::fread(magic, 1, sizeof magic, f);
+    std::fclose(f);
+    if (n < sizeof magic) { problem = "the file is empty or truncated, not a GGUF model"; return true; }
+    if (magic[0]=='G' && magic[1]=='G' && magic[2]=='U' && magic[3]=='F') return false;
+    if (std::memcmp(magic, "ggml", 4) == 0)
+        problem = "this is a whisper (.bin) model, not a GGUF translation model";
+    else if (magic[0]==0xba && magic[1]==0x16 && magic[2]==0x4f && magic[3]==0x2f)
+        problem = "this is a fastText language model, not a GGUF translation model";  /* 793712314 LE */
+    else
+        problem = "the file is not a GGUF model (wrong header)";
+    return true;
+}
+
 struct TranslationModel {
     llama_model *model=nullptr;
     llama_context *ctx=nullptr;
@@ -180,13 +289,28 @@ struct TranslationModel {
     ~TranslationModel() { if(ctx) llama_free(ctx); if(model) llama_model_free(model); llama_backend_free(); }
     void load(const std::string &path,int nthreads) {
         threads=std::clamp(nthreads,1,16);
-        llama_log_set(silent,nullptr);
+        /* Keep llama.cpp's diagnostics: they are the only thing that says why a
+         * GGUF was refused. They go to stderr (the parent's worker.log) and the
+         * last error is carried into the JSON reply below. */
+        llama_log_set(capture_log,nullptr);
         llama_backend_init();
         auto mp=llama_model_default_params();
         mp.n_gpu_layers=0; mp.use_mmap=true; mp.use_mlock=false; mp.check_tensors=true;
         std::fprintf(stderr,"llama.cpp: loading %s (threads=%d)\n",path.c_str(),threads);
+        {
+            std::string bad;
+            if (gguf_magic_bad(path, bad))
+                throw std::runtime_error("cannot load the GGUF translation model (" + path + "): " + bad);
+        }
         model=llama_model_load_from_file(path.c_str(),mp);
-        if(!model) throw std::runtime_error("cannot load the GGUF translation model: the file is unsupported or there is not enough free memory (try a smaller quantization)");
+        if(!model) {
+            /* Both cases used to be one sentence that named neither. */
+            std::string why=last_load_diagnostic();
+            std::string head="cannot load the GGUF translation model";
+            if(!why.empty()) throw std::runtime_error(head+": "+why);
+            throw std::runtime_error(head+": the file is not a valid GGUF model (it may be truncated, "
+                                     "or downloaded for another engine)");
+        }
         vocab=llama_model_get_vocab(model);
         if(llama_vocab_type(vocab)!=LLAMA_VOCAB_TYPE_NONE && !llama_model_chat_template(model,nullptr)) {
             throw std::runtime_error("model has no supported instruction chat template");

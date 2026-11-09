@@ -40,19 +40,55 @@ static const char *dir_names[OSAI_DIR_COUNT] = {
     "Backups", "Audio", "Exports", "Cache", "Checkpoints", "LanguagePacks"
 };
 
+#ifdef _WIN32
+/* ---- UTF-8 <-> UTF-16 for the Win32 file API -----------------------
+ * Every path in this program is UTF-8. The *A (ANSI) Win32 variants silently
+ * reinterpret those bytes in the OEM/ANSI code page, so a models folder called
+ * "مدل ها" or "Bücher" was simply not found: osa_dir_exists() returned false,
+ * Sync reported "the models folder does not exist" and activation could not
+ * see a file that Windows Explorer was happily showing. The Unicode *W
+ * variants are the only correct ones; these helpers convert on the way in.
+ * Callers must free() the result (it is a fresh heap block). */
+static wchar_t *wpath(const char *utf8) {
+    if (!utf8) return NULL;
+    int n = MultiByteToWideChar(CP_UTF8, 0, utf8, -1, NULL, 0);
+    if (n <= 0) return NULL;
+    wchar_t *w = (wchar_t *)calloc((size_t)n, sizeof *w);
+    if (!w) return NULL;
+    if (!MultiByteToWideChar(CP_UTF8, 0, utf8, -1, w, n)) { free(w); return NULL; }
+    return w;
+}
+/* UTF-16 -> UTF-8 into a caller buffer. */
+static void wchar_to_utf8(const wchar_t *w, char *out, size_t cap) {
+    out[0] = 0;
+    if (!w || !cap) return;
+    int n = WideCharToMultiByte(CP_UTF8, 0, w, -1, out, (int)cap, NULL, NULL);
+    if (n <= 0) out[0] = 0;
+}
+#endif
+
 static bool mkdirs_impl(const char *path) {
 #ifdef _WIN32
+    /* Walk the components as UTF-8 and create each with CreateDirectoryW. */
     char tmp[OSAI_MAX_PATH];
     osa_strlcpy(tmp, path, sizeof tmp);
     for (char *p = tmp + 1; *p; p++) {
         if (*p == '\\' || *p == '/') {
             char c = *p; *p = 0;
-            _mkdir(tmp);
+            wchar_t *w = wpath(tmp);
+            if (w) { CreateDirectoryW(w, NULL); free(w); }
             *p = c;
         }
     }
-    _mkdir(tmp);
-    return true;
+    {
+        wchar_t *w = wpath(tmp);
+        bool ok = true;
+        if (w) {
+            if (!CreateDirectoryW(w, NULL) && GetLastError() != ERROR_ALREADY_EXISTS) ok = false;
+            free(w);
+        } else ok = false;
+        return ok;
+    }
 #else
     char tmp[OSAI_MAX_PATH];
     osa_strlcpy(tmp, path, sizeof tmp);
@@ -128,19 +164,27 @@ static bool copy_tree(const char *from, const char *to) {
     if (!osa_mkdirs(to)) return false;
     bool ok = true;
 #ifdef _WIN32
-    char pattern[OSAI_MAX_PATH];
-    snprintf(pattern, sizeof pattern, "%s\\*", from);
-    WIN32_FIND_DATAA fd;
-    HANDLE h = FindFirstFileA(pattern, &fd);
+    /* Unicode scan: an ANSI one skipped every non-ASCII name (see wpath). */
+    wchar_t *wfrom = wpath(from);
+    if (!wfrom) return false;
+    wchar_t wpattern[OSAI_MAX_PATH];
+    _snwprintf(wpattern, OSAI_MAX_PATH, L"%s\\*", wfrom);
+    wpattern[OSAI_MAX_PATH - 1] = 0;
+    WIN32_FIND_DATAW fd;
+    HANDLE h = FindFirstFileW(wpattern, &fd);
+    free(wfrom);
     if (h == INVALID_HANDLE_VALUE) return false;
     do {
-        if (!strcmp(fd.cFileName, ".") || !strcmp(fd.cFileName, "..")) continue;
+        if (!wcscmp(fd.cFileName, L".") || !wcscmp(fd.cFileName, L"..")) continue;
+        char name[OSAI_MAX_PATH];
+        wchar_to_utf8(fd.cFileName, name, sizeof name);
+        if (!name[0]) continue;
         char src[OSAI_MAX_PATH], dst[OSAI_MAX_PATH];
-        osa_path_join(src, sizeof src, from, fd.cFileName);
-        osa_path_join(dst, sizeof dst, to, fd.cFileName);
+        osa_path_join(src, sizeof src, from, name);
+        osa_path_join(dst, sizeof dst, to, name);
         if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) ok = copy_tree(src, dst) && ok;
         else ok = osa_file_copy(src, dst) && ok;
-    } while (FindNextFileA(h, &fd));
+    } while (FindNextFileW(h, &fd));
     FindClose(h);
 #else
     DIR *d = opendir(from);
@@ -280,7 +324,10 @@ int64_t osa_disk_free(const char *path) {
 bool osa_file_exists(const char *path) {
     if (!path || !*path) return false;
 #ifdef _WIN32
-    DWORD a = GetFileAttributesA(path);
+    wchar_t *w = wpath(path);
+    if (!w) return false;
+    DWORD a = GetFileAttributesW(w);
+    free(w);
     return a != INVALID_FILE_ATTRIBUTES && !(a & FILE_ATTRIBUTE_DIRECTORY);
 #else
     struct stat st;
@@ -291,7 +338,10 @@ bool osa_file_exists(const char *path) {
 bool osa_dir_exists(const char *path) {
     if (!path || !*path) return false;
 #ifdef _WIN32
-    DWORD a = GetFileAttributesA(path);
+    wchar_t *w = wpath(path);
+    if (!w) return false;
+    DWORD a = GetFileAttributesW(w);
+    free(w);
     return a != INVALID_FILE_ATTRIBUTES && (a & FILE_ATTRIBUTE_DIRECTORY);
 #else
     struct stat st;
@@ -301,8 +351,12 @@ bool osa_dir_exists(const char *path) {
 
 int64_t osa_file_size(const char *path) {
 #ifdef _WIN32
+    wchar_t *w = wpath(path);
+    if (!w) return -1;
     WIN32_FILE_ATTRIBUTE_DATA d;
-    if (!GetFileAttributesExA(path, GetFileExInfoStandard, &d)) return -1;
+    BOOL got = GetFileAttributesExW(w, GetFileExInfoStandard, &d);
+    free(w);
+    if (!got) return -1;
     return ((int64_t)d.nFileSizeHigh << 32) | d.nFileSizeLow;
 #else
     struct stat st;
@@ -313,8 +367,12 @@ int64_t osa_file_size(const char *path) {
 
 int64_t osa_file_mtime(const char *path) {
 #ifdef _WIN32
+    wchar_t *w = wpath(path);
+    if (!w) return 0;
     WIN32_FILE_ATTRIBUTE_DATA d;
-    if (!GetFileAttributesExA(path, GetFileExInfoStandard, &d)) return 0;
+    BOOL got = GetFileAttributesExW(w, GetFileExInfoStandard, &d);
+    free(w);
+    if (!got) return 0;
     return ((int64_t)d.ftLastWriteTime.dwHighDateTime << 32 | d.ftLastWriteTime.dwLowDateTime) / 10000 - 11644473600000ll;
 #else
     struct stat st;
@@ -323,9 +381,26 @@ int64_t osa_file_mtime(const char *path) {
 #endif
 }
 
+/* fopen() takes an ANSI path on Windows, so it failed on exactly the same
+ * non-ASCII folders as the *A calls above. These two wrappers are the single
+ * place the program opens a file by name. */
+static FILE *uopen(const char *path, const char *mode) {
+#ifdef _WIN32
+    wchar_t *w = wpath(path);
+    if (!w) return NULL;
+    wchar_t wm[8];
+    if (!MultiByteToWideChar(CP_UTF8, 0, mode, -1, wm, 8)) { free(w); return NULL; }
+    FILE *f = _wfopen(w, wm);
+    free(w);
+    return f;
+#else
+    return fopen(path, mode);
+#endif
+}
+
 bool osa_file_read(const char *path, osa_buf *out) {
     osa_buf_reset(out);
-    FILE *f = fopen(path, "rb");
+    FILE *f = uopen(path, "rb");
     if (!f) return false;
     char tmp[65536];
     size_t n;
@@ -335,7 +410,7 @@ bool osa_file_read(const char *path, osa_buf *out) {
 }
 
 bool osa_file_write(const char *path, const void *data, size_t n) {
-    FILE *f = fopen(path, "wb");
+    FILE *f = uopen(path, "wb");
     if (!f) return false;
     bool ok = n == 0 || fwrite(data, 1, n, f) == n;
     if (fclose(f) != 0) ok = false;
@@ -351,7 +426,7 @@ bool osa_file_write_atomic(const char *path, const void *data, size_t n) {
 }
 
 bool osa_file_append(const char *path, const void *data, size_t n) {
-    FILE *f = fopen(path, "ab");
+    FILE *f = uopen(path, "ab");
     if (!f) return false;
     bool ok = fwrite(data, 1, n, f) == n;
     fclose(f);
@@ -360,7 +435,11 @@ bool osa_file_append(const char *path, const void *data, size_t n) {
 
 bool osa_file_remove(const char *path) {
 #ifdef _WIN32
-    return DeleteFileA(path) != 0;
+    wchar_t *w = wpath(path);
+    if (!w) return false;
+    bool ok = DeleteFileW(w) != 0;
+    free(w);
+    return ok;
 #else
     return unlink(path) == 0;
 #endif
@@ -368,17 +447,20 @@ bool osa_file_remove(const char *path) {
 
 bool osa_file_rename(const char *from, const char *to) {
 #ifdef _WIN32
-    if (MoveFileExA(from, to, MOVEFILE_REPLACE_EXISTING)) return true;
-    return false;
+    wchar_t *wf = wpath(from), *wt = wpath(to);
+    if (!wf || !wt) { free(wf); free(wt); return false; }
+    bool ok = MoveFileExW(wf, wt, MOVEFILE_REPLACE_EXISTING) != 0;
+    free(wf); free(wt);
+    return ok;
 #else
     return rename(from, to) == 0;
 #endif
 }
 
 bool osa_file_copy(const char *from, const char *to) {
-    FILE *fi = fopen(from, "rb");
+    FILE *fi = uopen(from, "rb");
     if (!fi) return false;
-    FILE *fo = fopen(to, "wb");
+    FILE *fo = uopen(to, "wb");
     if (!fo) { fclose(fi); return false; }
     char buf[1 << 16];
     size_t n; bool ok = true;
@@ -394,19 +476,29 @@ int osa_dir_scan(const char *dir, const char *ext_filter, char ***names, int max
     int count = 0, cap = 0;
     char **list = NULL;
 #ifdef _WIN32
-    char pattern[OSAI_MAX_PATH];
-    snprintf(pattern, sizeof pattern, "%s\\*", dir);
-    WIN32_FIND_DATAA fd;
-    HANDLE h = FindFirstFileA(pattern, &fd);
-    if (h == INVALID_HANDLE_VALUE) return 0;
+    /* FindFirstFileW: see the note on wpath(). An ANSI scan of a folder whose
+     * *name* is non-ASCII returned nothing at all, so Sync saw zero models even
+     * though the folder was full of them. */
+    wchar_t *wdir = wpath(dir);
+    if (!wdir) return 0;
+    wchar_t wpattern[OSAI_MAX_PATH];
+    _snwprintf(wpattern, OSAI_MAX_PATH, L"%s\\*", wdir);
+    wpattern[OSAI_MAX_PATH - 1] = 0;
+    WIN32_FIND_DATAW fd;
+    HANDLE h = FindFirstFileW(wpattern, &fd);
+    if (h == INVALID_HANDLE_VALUE) { free(wdir); return 0; }
     do {
         if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) continue;
-        if (ext_filter && *ext_filter && !osa_ends(fd.cFileName, ext_filter)) continue;
+        char name[OSAI_MAX_PATH];
+        wchar_to_utf8(fd.cFileName, name, sizeof name);
+        if (!name[0]) continue;
+        if (ext_filter && *ext_filter && !osa_ends(name, ext_filter)) continue;
         if (count == cap) { cap = cap ? cap * 2 : 32; list = (char **)realloc(list, (size_t)cap * sizeof(char *)); }
-        list[count++] = osa_strdup(fd.cFileName);
+        list[count++] = osa_strdup(name);
         if (count >= max_names) break;
-    } while (FindNextFileA(h, &fd));
+    } while (FindNextFileW(h, &fd));
     FindClose(h);
+    free(wdir);
 #else
     DIR *d = opendir(dir);
     if (!d) return 0;
@@ -458,7 +550,11 @@ bool osa_dir_remove_recursive(const char *dir) {
     }
     osa_dir_free_list(names, n);
 #ifdef _WIN32
-    return RemoveDirectoryA(dir) != 0;
+    wchar_t *w = wpath(dir);
+    if (!w) return false;
+    bool ok = RemoveDirectoryW(w) != 0;
+    free(w);
+    return ok;
 #else
     return rmdir(dir) == 0;
 #endif
@@ -479,18 +575,22 @@ void osa_mutex_destroy(osa_mutex *m) {
 void osa_mutex_lock(osa_mutex *m) { EnterCriticalSection((CRITICAL_SECTION *)m->h); }
 void osa_mutex_unlock(osa_mutex *m) { LeaveCriticalSection((CRITICAL_SECTION *)m->h); }
 
-typedef struct { osa_thread_fn fn; void *ud; } win_thunk;
+typedef struct { osa_thread_fn fn; void *ud; volatile int *done; } win_thunk;
 static DWORD WINAPI win_thread_main(LPVOID p) {
     win_thunk *t = (win_thunk *)p;
     t->fn(t->ud);
+    if (t->done) __sync_lock_test_and_set(t->done, 1);
     free(t);
     return 0;
 }
 bool osa_thread_start(osa_thread *t, osa_thread_fn fn, void *ud) {
+    t->done = 0;
     win_thunk *th = (win_thunk *)malloc(sizeof *th);
-    th->fn = fn; th->ud = ud;
+    if (!th) { t->h = NULL; return false; }
+    th->fn = fn; th->ud = ud; th->done = &t->done;
     HANDLE h = CreateThread(NULL, 0, win_thread_main, th, 0, NULL);
     t->h = h;
+    if (!h) free(th);
     return h != NULL;
 }
 void osa_thread_join(osa_thread *t) {
@@ -498,6 +598,13 @@ void osa_thread_join(osa_thread *t) {
     WaitForSingleObject((HANDLE)t->h, INFINITE);
     CloseHandle((HANDLE)t->h);
     t->h = NULL;
+}
+bool osa_thread_join_timeout(osa_thread *t, int ms) {
+    if (!t->h) return true;
+    if (WaitForSingleObject((HANDLE)t->h, (DWORD)(ms > 0 ? ms : 0)) != WAIT_OBJECT_0) return false;
+    CloseHandle((HANDLE)t->h);
+    t->h = NULL;
+    return true;
 }
 void osa_thread_detach(osa_thread *t) { if (t->h) { CloseHandle((HANDLE)t->h); t->h = NULL; } }
 void osa_thread_exit(void) { ExitThread(0); }
@@ -516,9 +623,21 @@ void osa_mutex_destroy(osa_mutex *m) {
 void osa_mutex_lock(osa_mutex *m) { pthread_mutex_lock((pthread_mutex_t *)m->h); }
 void osa_mutex_unlock(osa_mutex *m) { pthread_mutex_unlock((pthread_mutex_t *)m->h); }
 
+typedef struct { osa_thread_fn fn; void *ud; volatile int *done; } posix_thunk;
+static void *posix_thread_main(void *p) {
+    posix_thunk *t = (posix_thunk *)p;
+    t->fn(t->ud);
+    if (t->done) __sync_lock_test_and_set(t->done, 1);   /* published last */
+    free(t);
+    return NULL;
+}
 bool osa_thread_start(osa_thread *t, osa_thread_fn fn, void *ud) {
+    t->done = 0;
     pthread_t *pt = (pthread_t *)malloc(sizeof(pthread_t));
-    if (pthread_create(pt, NULL, (void *(*)(void *))fn, ud) != 0) { free(pt); t->h = NULL; return false; }
+    posix_thunk *th = (posix_thunk *)malloc(sizeof *th);
+    if (!pt || !th) { free(pt); free(th); t->h = NULL; return false; }
+    th->fn = fn; th->ud = ud; th->done = &t->done;
+    if (pthread_create(pt, NULL, posix_thread_main, th) != 0) { free(pt); free(th); t->h = NULL; return false; }
     t->h = pt;
     return true;
 }
@@ -526,6 +645,21 @@ void osa_thread_join(osa_thread *t) {
     if (!t->h) return;
     pthread_join(*(pthread_t *)t->h, NULL);
     free(t->h); t->h = NULL;
+}
+bool osa_thread_join_timeout(osa_thread *t, int ms) {
+    if (!t->h) return true;
+    /* A bounded wait keeps a stalled job from freezing the window. There is no
+     * portable timed pthread_join, so the thread publishes a done flag and this
+     * polls it; the join below is then immediate. */
+    int waited = 0;
+    while (!__sync_add_and_fetch(&t->done, 0)) {
+        if (waited >= ms) return false;
+        osa_sleep_ms(5);
+        waited += 5;
+    }
+    pthread_join(*(pthread_t *)t->h, NULL);
+    free(t->h); t->h = NULL;
+    return true;
 }
 void osa_thread_detach(osa_thread *t) {
     if (!t->h) return;
@@ -820,7 +954,7 @@ int osa_http_download(const char *url, const char *dest_path, bool resume,
                                 WINHTTP_HEADER_NAME_BY_INDEX, &clen, &cl, WINHTTP_NO_HEADER_INDEX))
             total = (int64_t)clen + (appending ? have : 0);
     }
-    FILE *f = fopen(part, appending ? "ab" : "wb");
+    FILE *f = uopen(part, appending ? "ab" : "wb");
     if (!f) {
         osa_err_set(err, "cannot write %s", part);
         WinHttpCloseHandle(req); WinHttpCloseHandle(con); WinHttpCloseHandle(ses);

@@ -168,6 +168,16 @@ static int free_ram_mb(void){
  * The attempt and the outcome are also appended to <data>/Logs/worker.log. */
 static osa_process *start_worker(const char*kind,const char*path,volatile int*cancel,osa_error*err){
     char exe[OSAI_MAX_PATH];
+    /* Say which precondition failed before a process is spawned. A worker that
+     * cannot open its model exits with a generic sentence, and "the file is
+     * missing" is the one cause the user can fix in a second. */
+    if(!path||!*path){osa_err_set(err,"no model file is selected for the %s engine",osa_streq(kind,"mt")?"translation":"language-identification");return NULL;}
+    if(!osa_file_exists(path)){
+        char p[OSAI_MAX_PATH];osa_strlcpy(p,path,sizeof p);
+        osa_worker_log_note("activate kind=%s: model file is missing: %s",kind,p);
+        osa_err_set(err,"the model file is missing: %s — run Sync in Settings or download it again",p);
+        return NULL;
+    }
     if(!osa_worker_path(exe,sizeof exe,err))return NULL;
     char threads[8];snprintf(threads,sizeof threads,"%d",osa_clampi(osa_cpu_count()/2,1,8));
     const char*argv[]={exe,"--kind",kind,"--model",path,"--threads",threads,NULL};
@@ -186,14 +196,14 @@ static osa_process *start_worker(const char*kind,const char*path,volatile int*ca
         osa_worker_log_note("handshake failed: %s",err&&err->msg[0]?err->msg:"?");
         return NULL;
     }
-    bool ok=false;char event[32]={0},msg[512]={0};
+    bool ok=false;char event[32]={0};char msg[OSAI_MAX_MSG]={0};
     osa_json_get_bool(line,"ok",&ok);osa_json_get_string(line,"event",event,sizeof event);
     osa_json_get_string(line,"error",msg,sizeof msg);
     free(line);
     if(!ok||!osa_streq(event,"ready")){
         int code=-1;bool exited=osa_process_exited(p,&code);
         osa_process_stop(p);
-        if(!msg[0]){char tail[512]={0};if(osa_worker_log_tail(tail,sizeof tail))osa_strlcpy(msg,tail,sizeof msg);}
+        if(!msg[0]){char tail[OSAI_MAX_MSG]={0};if(osa_worker_log_tail(tail,sizeof tail))osa_strlcpy(msg,tail,sizeof msg);}
         if(!msg[0])snprintf(msg,sizeof msg,"unexpected reply from the model worker (exit code %d)",exited?code:-1);
         const char*label=osa_streq(kind,"mt")?"translation":"language-identification";
         osa_err_set(err,"the %s model could not be loaded: %s",label,msg);
@@ -381,6 +391,29 @@ static void append_name(char*buf,size_t cap,const char*name){
 static bool model_ext(const char*name){
     return osa_ends(name,".gguf")||osa_ends(name,".bin")||osa_ends(name,".ftz");
 }
+/* Bridges the byte-level hash progress into the file-level progress the UI
+ * already draws, so a 4 GB model shows movement instead of a frozen "0 / 6". */
+/* Bridges the byte-level hash progress into the file-level progress the UI
+ * already draws, so a 4 GB model shows movement instead of a frozen "0 / 6".
+ * Progress is reported in bytes over the whole batch: it never jumps back to
+ * zero when the next file starts counting from its own first byte. */
+typedef struct {int64_t index,total;void(*progress)(int64_t,int64_t,void*);void*ud;} sync_prog;
+/* The UI reports "checked / found" in files, so `total` stays the file count and
+ * `done` a file index. While one file is being read the count stays on that
+ * file: it never jumps backwards when the next file starts, and it never shows
+ * a half-file in a label that means files. */
+static void sync_hash_progress(int64_t done,int64_t unused,void*ud){
+    (void)done;(void)unused;
+    sync_prog*p=ud;
+    if(p->progress)p->progress(p->index,p->total,p->ud);
+}
+/* Reports which file is being read. Called once per file, not per chunk: the
+ * UI samples it every frame, so a per-chunk callback would be wasted work. */
+static void sync_note_current(osa_sync_result*out,const char*name){
+    if(!out)return;
+    osa_strlcpy(out->current,name?name:"",sizeof out->current);
+}
+static bool sync_cancelled(volatile int*cancel){return cancel&&osa_atomic_load(cancel);}
 bool osa_app_sync_models(osa_app*a,volatile int*cancel,
                          void(*progress)(int64_t,int64_t,void*),void*ud,
                          osa_sync_result*out,osa_error*err){
@@ -396,9 +429,12 @@ bool osa_app_sync_models(osa_app*a,volatile int*cancel,
         char full[OSAI_MAX_PATH];osa_path_join(full,sizeof full,dir,names[i]);
         if(model_ext(names[i])&&!osa_ends(names[i],".part")&&osa_file_size(full)>65536)keep[total++]=i;
     }
+    sync_prog sp;memset(&sp,0,sizeof sp);
+    sp.total=total;sp.progress=progress;sp.ud=ud;
     bool ok=true;
     for(int k=0;k<total;k++){
-        if(cancel&&osa_atomic_load(cancel)){ok=false;osa_err_set(err,"cancelled");break;}
+        if(sync_cancelled(cancel)){ok=false;osa_err_set(err,"cancelled");break;}
+        sp.index=k;
         if(progress)progress(k,total,ud);
         const char*name=names[keep[k]];
         char full[OSAI_MAX_PATH];osa_path_join(full,sizeof full,dir,name);
@@ -408,7 +444,18 @@ bool osa_app_sync_models(osa_app*a,volatile int*cancel,
         /* Size first: it rejects almost everything without reading a byte. */
         for(int i=0;i<NPACKS;i++)if(PACKS[i].bytes==size){match=PACKS+i;break;}
         if(!match){out->unknown++;append_name(out->unknown_names,sizeof out->unknown_names,name);continue;}
-        char hex[65]={0};uint64_t got=0;osa_sha256_file(full,hex,&got);
+        char hex[65]={0};uint64_t got=0;
+        sync_note_current(out,name);
+        /* Cancellable: closing the app during Sync must not block on a
+         * multi-gigabyte read of a model the user is not installing. */
+        bool hashed=osa_sha256_file_ex(full,hex,&got,cancel,sync_hash_progress,&sp);
+        sync_note_current(out,NULL);
+        if(!hashed){
+            ok=false;
+            if(sync_cancelled(cancel))osa_err_set(err,"cancelled");
+            else osa_err_set(err,"cannot read %s",name);
+            break;
+        }
         if((int64_t)got!=match->bytes||!osa_strieq(hex,match->sha256)){
             out->unknown++;append_name(out->unknown_names,sizeof out->unknown_names,name);continue;}
         osa_model existing;osa_error ignored;osa_err_ok(&ignored);

@@ -456,19 +456,43 @@ void osa_sha256_hex(const void *data, size_t n, char out[65]) {
     osa_hex(d, 32, out);
 }
 
-void osa_sha256_file(const char *path, char out[65], uint64_t *size_out) {
+/* The read buffer used to be a function-level `static`: two threads hashing at
+ * the same time (Sync in the background while a download verifies, or two
+ * verifications racing) then interleaved their matches in the same 64 KiB and
+ * produced digests that matched neither file. Correctness first: the buffer
+ * lives on the caller's stack. 64 KiB of stack is nothing next to a digest that
+ * silently decides a model is corrupt. */
+bool osa_sha256_file_ex(const char *path, char out[65], uint64_t *size_out,
+                        volatile int *cancel,
+                        void (*progress)(int64_t, int64_t, void *), void *ud) {
     out[0] = 0;
     if (size_out) *size_out = 0;
     FILE *f = fopen(path, "rb");
-    if (!f) return;
+    if (!f) return false;
     osa_sha256 c; osa_sha256_init(&c);
-    static uint8_t tmp[1 << 16];
+    uint8_t tmp[1 << 16];
     size_t n; uint64_t total = 0;
-    while ((n = fread(tmp, 1, sizeof tmp, f)) > 0) { osa_sha256_update(&c, tmp, n); total += n; }
+    bool ok = true;
+    while ((n = fread(tmp, 1, sizeof tmp, f)) > 0) {
+        /* Volatile read, no atomics needed: a stop request is a one-way flag
+         * and a missed poll costs one more 64 KiB chunk, not correctness. */
+        if (cancel && *cancel) { ok = false; break; }
+        osa_sha256_update(&c, tmp, n); total += n;
+        /* total is passed as both figures: the caller knows the file size and
+         * can scale it, and this file must not depend on the platform layer. */
+        if (progress) progress((int64_t)total, 0, ud);
+    }
+    if (ferror(f)) ok = false;
     fclose(f);
+    if (!ok) return false;
     uint8_t d[32]; osa_sha256_final(&c, d);
     osa_hex(d, 32, out);
     if (size_out) *size_out = total;
+    return true;
+}
+
+void osa_sha256_file(const char *path, char out[65], uint64_t *size_out) {
+    osa_sha256_file_ex(path, out, size_out, NULL, NULL, NULL);
 }
 
 uint32_t osa_crc32(uint32_t seed, const void *data, size_t n) {

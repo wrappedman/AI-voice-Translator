@@ -161,6 +161,8 @@ typedef struct shell_state {
     osa_sync_result sync;                /* last sync report */
     bool          sync_valid;
     int           sync_done, sync_total; /* progress while syncing */
+    bool          abandoned;             /* a cancelled job is still winding down */
+    char          sync_reading[128];     /* file currently being verified */
 
     /* ui bookkeeping */
     int           frame;
