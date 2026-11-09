@@ -788,6 +788,10 @@ static void test_thread_budget(void){
     CHECK_MSG(def>=1,"the default budget is at least one thread (got %d)",def);
     CHECK_MSG(def<=8,"the default budget never takes a small PC's everything (got %d of %d cores)",def,cores);
     if(cores>2) CHECK_MSG(def<=cores-1,"one core is always left for the window (%d of %d)",def,cores);
+    /* On a 2-core machine the old default was "all of it": Task Manager showed
+     * 100% for the whole translation, which is the report from the i3-4160. */
+    if(cores>=2&&cores<=2) CHECK_MSG(def<cores,
+        "a 2-core machine keeps a core for the window instead of taking both (%d of %d)",def,cores);
     osa_app_set_threads(app,3);
     CHECK_MSG(osa_app_threads(app)==3,"the budget can be lowered (got %d)",osa_app_threads(app));
     osa_app_set_threads(app,0);
@@ -1082,8 +1086,8 @@ static void test_pronunciation_languages(void){
     /* The same sentence in two languages must not come out the same: the language
      * tag really selects a reader. */
     char de[256],fr[256];
-    mt_pronounce_ex("danke","de",de,sizeof de,&uns);
-    mt_pronounce_ex("danke","fr",fr,sizeof fr,&uns);
+    mt_pronounce_ex("zeit","de",de,sizeof de,&uns);
+    mt_pronounce_ex("zeit","fr",fr,sizeof fr,&uns);
     CHECK_MSG(strcmp(de,fr)!=0,"language selects the reading rules (%s vs %s)",de,fr);
     /* A German ü is یو, not a folded u: the language table is consulted before
      * the accent is folded away. */
@@ -1140,6 +1144,208 @@ static void test_translation_target_script(void){
     CHECK(osa_script_for_tag("ja") == OSA_SCRIPT_KANA);
 }
 
+
+/* ---- آوانویسی: the diacritics must be readable --------------------------
+ * A short vowel on ا/آ is the mistake a Persian reader sees first: alef is a long
+ * vowel, so «تاِیم» is not a word. These checks walk real output instead of a
+ * table, so they also catch a bad dictionary entry and a bad rule.
+ */
+static int cp_at(const unsigned char *p, int *len) {
+    if (*p < 0x80) { *len = 1; return *p; }
+    if ((*p & 0xE0) == 0xC0) { *len = 2; return ((*p & 0x1F) << 6) | (p[1] & 0x3F); }
+    *len = 3;
+    return ((*p & 0x0F) << 12) | ((p[1] & 0x3F) << 6) | (p[2] & 0x3F);
+}
+static bool arabic_consonant(int cp) {
+    if (cp < 0x0621 || cp > 0x06D2) return false;
+    return cp != 0x0627 && cp != 0x0622 && cp != 0x0623 && cp != 0x0625 &&
+           cp != 0x0624 && cp != 0x0626 && cp != 0x0648 && cp != 0x06CC && cp != 0x0649;
+}
+/* Returns the first offending offset, or -1. */
+static int diacritic_problem(const char *s) {
+    const unsigned char *p = (const unsigned char *)s;
+    int prev = 0, prev_diac = 0, offset = 0;
+    while (*p) {
+        int len = 0;
+        int cp = cp_at(p, &len);
+        int is_diac = cp >= 0x064B && cp <= 0x0652;
+        if (is_diac && prev_diac) return offset;                 /* doubled */
+        if (is_diac && (prev == 0x0627 || prev == 0x0622) &&     /* on a long alef */
+            arabic_consonant(prev)) return offset;
+        prev_diac = is_diac;
+        if (!is_diac) prev = cp;
+        p += len;
+        offset += len;
+    }
+    return -1;
+}
+
+static void test_pronunciation_diacritics(void) {
+    suite("آوانویسی: diacritics are readable in every language");
+
+    /* Every word of the built-in English dictionary, plus sentences in the other
+     * readers, must produce marks that can actually be read aloud. */
+    static const char *words[] = {
+        "the","a","you","meet","too","time","size","speed","video","audio",
+        "account","question","answer","network","password","software","table",
+        "make","note","use","excited","station","understand","coffee","please",
+        "thanks","morning","school","important","university","application",
+        "engine","input","output","storage","language","translate","pronounce",
+        "computer","telephone","information","beautiful","government","country",
+        NULL
+    };
+    char out[512];
+    bool uns = false;
+    for (int i = 0; words[i]; i++) {
+        CHECK(mt_pronounce_ex(words[i], "en", out, sizeof out, &uns));
+        int bad = diacritic_problem(out);
+        CHECK_MSG(bad < 0, "no unreadable diacritic in '%s' (%s)", words[i], out);
+    }
+    static const struct { const char *text, *tag; } S[] = {
+        {"danke schön", "de"}, {"wie geht es Ihnen", "de"}, {"bonjour tout le monde", "fr"},
+        {"je ne comprends pas", "fr"}, {"buenos días", "es"}, {"¿dónde está la estación", "es"},
+        {"grazie mille", "it"}, {"спасибо большое", "ru"}, {"я не понимаю", "ru"},
+        {"καλημέρα σας", "el"}, {"شكرا جزيلا", "ar"}, {"obrigado", "pt"},
+        {"dziękuję bardzo", "pl"}, {"teşekkür ederim", "tr"}, {"köszönöm szépen", "hu"},
+        {"שלום עולם", "he"}, {NULL, NULL}
+    };
+    for (int i = 0; S[i].text; i++) {
+        out[0] = 0;
+        CHECK(mt_pronounce_ex(S[i].text, S[i].tag, out, sizeof out, &uns));
+        int bad = diacritic_problem(out);
+        CHECK_MSG(bad < 0, "no unreadable diacritic in '%s' (%s) -> %s",
+                  S[i].tag, S[i].text, out);
+        /* the line is Persian letters: it must contain at least one */
+        CHECK_MSG(strstr(out, "\xd8") != NULL, "'%s' is written in Persian letters", S[i].tag);
+    }
+}
+
+/* ---- آوانویسی: the readings themselves --------------------------------- */
+static void test_pronunciation_readings(void) {
+    suite("آوانویسی: known words read the way they are said");
+    struct { const char *text, *tag; const char *want; } T[] = {
+        /* English spellings that a letter-by-letter reader gets wrong */
+        {"make", "en", "مِیک"},
+        {"time", "en", "تِیم"},
+        {"table", "en", "تِیبِل"},
+        {"the", "en", "دِ"},
+        {"you", "en", "یُو"},
+        {"too", "en", "تُو"},
+        /* German: a final e is a schwa, umlauts keep their sound */
+        {"danke", "de", "دَنکِ"},
+        {"schön", "de", "شُن"},
+        {"danke schön", "de", "دَنکِ شُن"},
+        /* Russian: a word-initial я is "ya", an inner е is "e" */
+        {"я не понимаю", "ru", NULL},
+        /* Spanish: the written accent is the stressed, long vowel */
+        {"días", "es", "دیاس"},
+        {NULL, NULL, NULL}
+    };
+    char out[512];
+    bool uns = false;
+    for (int i = 0; T[i].text; i++) {
+        CHECK(mt_pronounce_ex(T[i].text, T[i].tag, out, sizeof out, &uns));
+        if (T[i].want) CHECK_MSG(osa_streq(out, T[i].want), "%s -> %s (expected %s)",
+                                 T[i].text, out, T[i].want);
+    }
+    /* Russian «я» at the start of a word begins with a y-sound; inside a word it
+     * is a plain vowel. The old reader wrote both as a bare «ی». */
+    mt_pronounce_ex("я не понимаю", "ru", out, sizeof out, &uns);
+    CHECK_MSG(strstr(out, "یَ") != NULL, "word-initial я reads \"ya\" (%s)", out);
+}
+
+
+/* ---- compute device honesty --------------------------------------------
+ * Reported from a real PC: «پردازش روی گرافیک تنظیم شده اما در هنگام ترجمه سی‌پی‌یو
+ * کامل درگیره» — the GPU was selected, the CPU was pinned at 100%, and nothing
+ * said why. Three separate defects made that possible:
+ *   1. the package has no GPU backend at all (built with -DGGML_USE_CPU), and
+ *      nothing asked the worker that question before a translation;
+ *   2. the device was only stored, never applied: ensure_worker() reused the
+ *      process that had been started with --device cpu;
+ *   3. the thread budget reached the recogniser but not the translator.
+ * The probe is the fix for (1): it answers from llama.cpp's registry. */
+static void test_compute_device_probe(void){
+    suite("compute device: the build is asked, not assumed");
+    const char *exe="build/OpenSpeechWorker";
+    if(!osa_file_exists(exe)){printf("  SKIP worker binary not built (%s)\n",exe);return;}
+    osa_error err;osa_err_ok(&err);
+    const char *argv[]={exe,"--probe",NULL};
+    osa_process *p=osa_process_start(argv,&err);
+    CHECK_MSG(p!=NULL,"the probe runs without a model: %s",p?"ok":err.msg);
+    if(!p)return;
+    char *line=NULL;
+    bool got=osa_process_line(p,10000,NULL,&line,&err);
+    CHECK_MSG(got,"the probe answers immediately (no model load): %s",got?"ok":err.msg);
+    if(got){
+        bool ok=false,avail=true;double gpu=0;char event[16]={0};
+        osa_json_get_bool(line,"ok",&ok);
+        osa_json_get_string(line,"event",event,sizeof event);
+        osa_json_get_bool(line,"gpu_available",&avail);
+        osa_json_get_num(line,"gpu_count",&gpu);   /* JSON numbers are double */
+        CHECK(ok);
+        CHECK_STR(event,"probe");
+        /* The device list is the evidence behind the answer, not a guess. */
+        CHECK_MSG(strstr(line,"\"devices\"")!=NULL,"the probe lists the devices it found");
+        CHECK_MSG(strstr(line,"\"type\":\"cpu\"")!=NULL,"the CPU device is always reported");
+        /* These two must agree: "available" is only true when a GPU was counted. */
+        CHECK_MSG(avail==(gpu>0),"gpu_available agrees with the device list (gpu_count=%d)",(int)gpu);
+        if(!avail)
+            printf("  note this package has no GPU backend; the GPU option must stay off\n");
+        free(line);
+    }
+    osa_process_stop(p);
+}
+
+static void test_device_setting_forces_reload(void){
+    suite("compute device: a changed choice reaches the next request");
+    use_temp_root("device");
+    osa_error err;osa_app *app=osa_app_create(&err);
+    CHECK_MSG(app!=NULL,"app create: %s",app?err.msg:"ok");
+    if(!app){clean_root();return;}
+    /* Creating the app asks the worker what it can do; the answer is cached. */
+    bool avail=osa_app_gpu_available(app,false);
+    const char *tok=osa_app_device_status(app);
+    /* A build with no GPU backend must never report "gpu", whatever was chosen
+     * before — that was the lie on screen. */
+    if(!avail){
+        osa_app_set_device(app,true);            /* the user picks GPU anyway */
+        CHECK_STR(osa_app_device_status(app),"cpu-only");
+        CHECK_MSG(strcmp(osa_app_device_status(app),"gpu")!=0,
+                  "a CPU-only build never claims to be on the GPU");
+        /* and the status token must be one the UI knows how to translate */
+        CHECK_MSG(strcmp(tok,"cpu-only")==0||strcmp(tok,"cpu")==0||
+                  strcmp(tok,"gpu")==0||strcmp(tok,"gpu-requested-cpu")==0,
+                  "the status token is one the UI localises (%s)",tok);
+        osa_app_set_device(app,false);
+        CHECK_STR(osa_app_device_status(app),"cpu-only");
+    }else{
+        /* On a GPU build the toggle is real: it must be honoured or explained. */
+        osa_app_set_device(app,true);
+        const char *t=osa_app_device_status(app);
+        CHECK_MSG(strcmp(t,"gpu-requested-cpu")==0||strcmp(t,"gpu")==0,
+                  "a GPU request on a GPU build is either honoured or explained (%s)",t);
+        osa_app_set_device(app,false);
+    }
+    osa_app_destroy(app);clean_root();
+}
+
+/* The budget is one number shared by both engines, and changing it has to reach
+ * the translation worker: that is the process that pins the CPU. */
+static void test_thread_budget_shared(void){
+    suite("CPU budget reaches the translator too");
+    use_temp_root("threads2");
+    osa_error err;osa_app *app=osa_app_create(&err);
+    CHECK(app!=NULL);
+    if(!app){clean_root();return;}
+    osa_app_set_threads(app,2);
+    CHECK_MSG(osa_app_threads(app)==2,"the recogniser budget is 2");
+    osa_app_set_threads(app,5);
+    CHECK_MSG(osa_app_threads(app)==5,
+              "the budget is shared, so the translator sees the new number as well");
+    osa_app_destroy(app);clean_root();
+}
+
 int main(void){
     test_json_unicode();
     test_catalog_and_gate();
@@ -1157,12 +1363,17 @@ int main(void){
     test_hash_cancel();
     test_live_endpoint();
     test_thread_budget();
+    test_compute_device_probe();
+    test_device_setting_forces_reload();
+    test_thread_budget_shared();
     test_speech_fallback();
     test_speak_path();
     test_live_capture_pipeline();
     test_fasttext_language_model();
     test_pronunciation_languages();
     test_translation_target_script();
+    test_pronunciation_diacritics();
+    test_pronunciation_readings();
     test_portable_data_dir();
     test_optional_real_models();
     printf("\n%d passed, %d failed\n",g_pass,g_fail);

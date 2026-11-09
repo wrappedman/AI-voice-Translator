@@ -667,6 +667,14 @@ bool ui_row(ui_context *u, int id, osa_rect r, bool selected) {
 /* ---- controls ------------------------------------------------------ */
 
 bool ui_segmented(ui_context *u, int id, osa_rect r, const char *labels, int *value, int n) {
+    return ui_segmented_disabled(u, id, r, labels, value, n, -1);
+}
+
+/* A segment the machine cannot honour: drawn, but visibly inactive and not
+ * clickable. A greyed-out option that still accepts the click is the same lie as
+ * no hint at all — the user selects it and wonders why nothing changed. */
+bool ui_segmented_disabled(ui_context *u, int id, osa_rect r, const char *labels,
+                           int *value, int n, int disabled_slot) {
     if (n <= 0) return false;
     c_fill_round(u->c, r, r.h * 0.5f, u->t.panel_alt);
     c_stroke_round(u->c, r, r.h * 0.5f, 1.0f, u->t.border_soft);
@@ -685,12 +693,13 @@ bool ui_segmented(ui_context *u, int id, osa_rect r, const char *labels, int *va
         int slot = u->L.rtl ? (n - 1 - i) : i;
         osa_rect sr = rectf(r.x + slot * seg_w + 2, r.y + 2, seg_w - 4, r.h - 4);
         bool sel = *value == i;
-        if (sel) {
+        bool off = i == disabled_slot;
+        if (sel && !off) {
             c_fill_round(u->c, sr, sr.h * 0.5f, u->t.accent);
         }
         ui_label(u, sr, part, UI_FS_SMALL * u->L.scale,
-                 sel ? u->t.on_accent : u->t.text_dim, 1);
-        if (hover(u, sr) && u->in.clicked && !u->consumed_click && !sel) {
+                 off ? u->t.text_faint : (sel ? u->t.on_accent : u->t.text_dim), 1);
+        if (!off && hover(u, sr) && u->in.clicked && !u->consumed_click && !sel) {
             u->consumed_click = true;
             *value = i;
             changed = true;

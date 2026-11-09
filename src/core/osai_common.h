@@ -18,7 +18,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 
-#define OSAI_VERSION        "1.6.0"
+#define OSAI_VERSION        "1.6.1"
 #define OSAI_APP_NAME       "OpenSpeech AI"
 #define OSAI_APP_ID         "OpenSpeechAI"
 

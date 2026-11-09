@@ -41,6 +41,7 @@
 #include "../core/osai_common.h"
 #include <string.h>
 #include <stdio.h>
+#include <stdlib.h>
 
 /* ---- Persian letters ---------------------------------------------- */
 #define L_ALEF   "ا"
@@ -104,12 +105,12 @@ enum cons {
 
 static const char *CONS_CHAR[C_COUNT] = {
     L_BE, L_PE, L_TE, L_SIN, L_JIM, L_CHE, L_HEH, L_KHE, L_DAL, L_ZE, L_RE, L_ZHE,
-    L_SHIN, L_FE, L_KAF, L_GAF, L_LAM, L_MIM, L_NUN, L_VAV, L_YE, L_SE, L_ZAL,
+    L_SHIN, L_FE, L_KAF, L_GAF, L_LAM, L_MIM, L_NUN, L_VAV, L_YE, L_SE, L_DAL,
     "\u0646\u06AF", L_EYN
 };
 
 enum vow { V_A = 0, V_E, V_I, V_O, V_U, V_AA, V_EE, V_OO, V_AY, V_OW, V_OH,
-           V_YE, V_YO, V_YU, V_YI, V_WA };
+           V_YA, V_YE, V_YO, V_YU, V_YI, V_WA, V_EI };
 
 /* ---- the emitter --------------------------------------------------- */
 typedef struct pron_out {
@@ -210,13 +211,17 @@ static void emit_vowel(pron_out *o, int v) {
         case V_OO:
         case V_OH: emit_long(o, L_VAV);  break;
         case V_AY: emit_short(o, D_FATH); emit_cons(o, C_Y); break;
+        case V_EI: emit_short(o, D_KASR); emit_cons(o, C_Y); break;  /* «اِی» */
         case V_OW: emit_short(o, D_DAMM); emit_cons(o, C_V); break;
         case V_WA: emit_cons(o, C_V); emit_long(o, L_ALEF); break;  /* oi  -> وا */
 
+        /* я/е/ё/ю are a y-sound plus a vowel: «یَ»، «یِ»، «یُ»، «یو». Writing only
+         * ی lost the vowel (спасибо for "я не понимаю" came out «یِ نیِ ...»). */
+        case V_YA: emit_cons(o, C_Y); emit_short(o, D_FATH); break;
         case V_YE: emit_cons(o, C_Y); emit_short(o, D_KASR); break;
-        case V_YI: emit_cons(o, C_Y); emit_short(o, D_KASR); break;
+        case V_YI: emit_cons(o, C_Y); emit_long(o, L_YE);   break;
         case V_YO: emit_cons(o, C_Y); emit_short(o, D_DAMM); break;
-        case V_YU: emit_cons(o, C_Y); emit_short(o, D_DAMM); break;
+        case V_YU: emit_cons(o, C_Y); emit_long(o, L_VAV);  break;
         default: break;
     }
 }
@@ -228,6 +233,8 @@ enum rkind {
     R_VOWEL,        /* a vowel: a diacritic, or a letter in a full-vowel script */
     R_LIT,          /* a literal Persian string */
     R_FINAL,        /* a vowel, but only at the end of a word (val 0 = silent) */
+    R_VOWEL_INITIAL,/* "y + vowel" at the start of a word, plain vowel inside it:
+                     * «я» is «یا» in "я не понимаю" but «а» in "тям" */
     R_CONS_FINAL,   /* a consonant, only at the end of a word */
     R_INITIAL,      /* a consonant, only at the start of a word ("y" in "yes") */
     R_NASAL         /* a French nasal vowel: vowel + light n */
@@ -253,6 +260,7 @@ static void apply_rule(pron_out *o, const pron_rule *r) {
             break;
         case R_CONS:   emit_cons(o, r->val); break;
         case R_VOWEL:  emit_vowel(o, r->val); break;
+        case R_VOWEL_INITIAL: emit_vowel(o, r->val); break;
         case R_FINAL:  if (r->val) emit_vowel(o, r->val); break;  /* 0 = silent */
         case R_INITIAL:
         case R_CONS_FINAL: emit_cons(o, r->val); break;
@@ -275,12 +283,15 @@ static void apply_rule(pron_out *o, const pron_rule *r) {
 /* Same, but a rule marked R_FINAL is skipped unless it ends the word: English
  * "y" is a consonant in "yes" and a vowel in "happy". */
 static const pron_rule *match_rule_at(const pron_rule *rules, const char *at,
-                                      const char *word_start) {
+                                      const char *word_start, int prev_vowel) {
     for (const pron_rule *r = rules; r->from; r++) {
         size_t n = strlen(r->from);
         if (strncmp(at, r->from, n) != 0) continue;
         if ((r->kind == R_FINAL || r->kind == R_CONS_FINAL) && at[n] != 0) continue;
         if (r->kind == R_INITIAL && at != word_start) continue;
+        /* "я/е/ю/ё" take their y-sound at the start of a word and after a vowel
+         * ("понимаю" is پونیمایو); after a consonant they are plain vowels. */
+        if (r->kind == R_VOWEL_INITIAL && at != word_start && !prev_vowel) continue;
         return r;
     }
     return NULL;
@@ -317,20 +328,26 @@ static const pron_rule LATIN_BASE[] = {
 /* English. Irregular common words come from the dictionary in translit.c before
  * this reader is consulted; this table handles the spellings of everything else. */
 static const pron_rule LATIN_EN[] = {
-    {"eigh", R_VOWEL, V_AY, NULL}, {"ough", R_VOWEL, V_O, NULL},
+    /* Suffixes first: the "e" in "-tion"/"-ture" is not a vowel of its own. */
+    {"tions", R_LIT,  0,    "شِنز"},{"tional", R_LIT, 0, "شِنال"},
     {"tion", R_LIT,   0,    "شِن"},{"sion", R_LIT,  0,   "ژِن"},
-    {"ture", R_LIT,   0,    "چِر"},{"igh",  R_VOWEL, V_AY, NULL},
+    {"ture", R_LIT,   0,    "چِر"},{"ous",  R_LIT,  0,   "ِس"},
+    {"eigh", R_VOWEL, V_AY, NULL}, {"ough", R_VOWEL, V_O, NULL},
+    {"igh",  R_VOWEL, V_AY, NULL},
     {"ee",  R_VOWEL,  V_EE, NULL}, {"ea",   R_VOWEL, V_EE, NULL},
     {"oo",  R_VOWEL,  V_OO, NULL}, {"ou",   R_VOWEL, V_OW, NULL},
     {"ow",  R_VOWEL,  V_OW, NULL}, {"oi",   R_VOWEL, V_AY, NULL},
     {"oy",  R_VOWEL,  V_AY, NULL}, {"ai",   R_VOWEL, V_AY, NULL},
     {"ay",  R_VOWEL,  V_AY, NULL}, {"au",   R_VOWEL, V_O,  NULL},
     {"aw",  R_VOWEL,  V_O,  NULL}, {"ie",   R_VOWEL, V_EE, NULL},
-    {"ei",  R_VOWEL,  V_AY, NULL}, {"oa",   R_VOWEL, V_OH, NULL},
+    /* English "ei"/"ay" is the long a sound, «اِی» in Persian, not «اَی». */
+    {"ei",  R_VOWEL,  V_EI, NULL}, {"oa",   R_VOWEL, V_OH, NULL},
     {"wh",  R_CONS,   C_V,  NULL}, {"kn",   R_CONS,  C_N,  NULL},
     {"wr",  R_CONS,   C_R,  NULL}, {"dg",   R_CONS,  C_J,  NULL},
     /* "th" is ث in English only: thank, think, three. */
     {"th",  R_CONS,   C_TH, NULL},
+    {"ing", R_LIT,   0,    "ینگ"},{"ck",   R_CONS,  C_K,  NULL}, {"qu",   R_CONS,  C_K,  NULL},
+    {"ph",  R_CONS,   C_F,  NULL}, {"wh",   R_CONS,  C_V,  NULL},
     {"y",   R_INITIAL, C_Y, NULL}, {"y",   R_FINAL,  V_EE, NULL},
     {"y",   R_VOWEL,  V_I,  NULL}, {"u",    R_VOWEL, V_A,  NULL},
     RULE_END
@@ -342,6 +359,10 @@ static const pron_rule LATIN_DE[] = {
     {"ei",   R_VOWEL, V_AY, NULL},{"ai",  R_VOWEL, V_AY, NULL},
     {"eu",   R_VOWEL, V_OW, NULL},{"au",  R_VOWEL, V_OW, NULL},
     {"ie",   R_VOWEL, V_EE, NULL},
+    /* "Kaffee", "Boot": a doubled vowel is long, which Persian writes with the
+     * short reading when there is no long e. */
+    {"ee",   R_VOWEL, V_E,  NULL}, {"oo",   R_VOWEL, V_O,  NULL},
+    {"aa",   R_VOWEL, V_AA, NULL},
     {"ä",    R_VOWEL, V_E,  NULL}, {"ö",   R_VOWEL, V_O,  NULL},
     {"ü",    R_VOWEL, V_YU, NULL}, {"ß",   R_CONS,  C_S,  NULL},
     {"z",    R_LIT,   0,    "تس"}, {"v",   R_CONS,  C_F, NULL},
@@ -378,7 +399,9 @@ static const pron_rule LATIN_FR[] = {
     {"h",    R_SILENT, 0,   NULL}, {"j",    R_CONS,  C_ZH, NULL},
     {"s",    R_FINAL, 0,    NULL}, {"t",    R_FINAL, 0,    NULL},
     {"d",    R_FINAL, 0,    NULL}, {"x",    R_FINAL, 0,    NULL},
-    {"e",    R_FINAL, 0,    NULL},
+    /* A final e is a schwa for a reader who has to say the word out loud. Dropping
+     * it left "je ne" as «ژ ن», which is not sayable. */
+    {"e",    R_FINAL, V_E,  NULL},
     RULE_END
 };
 
@@ -386,6 +409,10 @@ static const pron_rule LATIN_ES[] = {
     {"ch",  R_CONS,  C_CH, NULL}, {"ll",  R_CONS, C_Y,  NULL},
     {"rr",  R_CONS,  C_R,  NULL}, {"qu",  R_CONS, C_K,  NULL},
     {"gu",  R_LIT,   0,    "گ"},
+    /* A written accent marks the stressed vowel, which in Persian letters is a
+     * long letter: "días" is دیاس, not دِاس. */
+    {"á",   R_VOWEL, V_AA, NULL}, {"í",   R_VOWEL, V_EE, NULL},
+    {"ó",   R_VOWEL, V_OH, NULL}, {"ú",   R_VOWEL, V_OO, NULL},
     /* ce/ci are "s" in Spain and most of Latin America. */
     {"ce",  R_LIT,   0,    "س"},  {"ci",  R_LIT,  0,    "سی"},
     {"ñ",   R_LIT,   0,    "نی"}, {"ü",   R_VOWEL, V_U,  NULL},
@@ -401,9 +428,9 @@ static const pron_rule LATIN_IT[] = {
     {"gli", R_LIT,   0,    "لی"}, {"gn",  R_LIT,  0,    "نی"},
     {"ch",  R_CONS,  C_K,  NULL}, {"gh",  R_CONS, C_G,  NULL},
     {"zz",  R_LIT,   0,    "تس"}, {"z",   R_LIT,  0,    "تس"},
-    {"à",   R_VOWEL, V_A,  NULL}, {"è",   R_VOWEL, V_E,  NULL},
-    {"é",   R_VOWEL, V_E,  NULL}, {"ì",   R_VOWEL, V_I,  NULL},
-    {"ò",   R_VOWEL, V_O,  NULL}, {"ù",   R_VOWEL, V_U,  NULL},
+    {"à",   R_VOWEL, V_AA, NULL}, {"è",   R_VOWEL, V_E,  NULL},
+    {"é",   R_VOWEL, V_E,  NULL}, {"ì",   R_VOWEL, V_EE, NULL},
+    {"ò",   R_VOWEL, V_OH, NULL}, {"ù",   R_VOWEL, V_OO, NULL},
     {"h",   R_SILENT, 0,   NULL},
     RULE_END
 };
@@ -547,8 +574,13 @@ static const pron_rule *latin_table_for(const char *tag) {
 /* ---- Cyrillic ------------------------------------------------------ */
 static const pron_rule CYR_BASE[] = {
     {"дж",  R_LIT,   0,    "ج"},  {"й",   R_CONS, C_Y,  NULL},
-    {"ё",   R_VOWEL, V_YO, NULL}, {"ю",   R_VOWEL, V_YU, NULL},
-    {"я",   R_VOWEL, V_YE, NULL}, {"е",   R_VOWEL, V_YE, NULL},
+    /* At the start of a word «я/е/ю/ё» begin with a y-sound; after a consonant
+     * they are plain vowels ("не" is «نِ», not «نیِ»). */
+    {"ё",   R_VOWEL_INITIAL, V_YO, NULL}, {"ю", R_VOWEL_INITIAL, V_YU, NULL},
+    {"я",   R_VOWEL_INITIAL, V_YA, NULL}, {"е", R_VOWEL_INITIAL, V_YE, NULL},
+    {"ё",   R_VOWEL, V_O,  NULL}, {"ю",   R_VOWEL, V_U,  NULL},
+    {"я",   R_VOWEL, V_A,  NULL}, {"е",   R_FINAL, V_YE, NULL},
+    {"е",   R_VOWEL, V_E,  NULL},
     {"э",   R_VOWEL, V_E,  NULL}, {"ы",   R_VOWEL, V_I,  NULL},
     {"и",   R_VOWEL, V_I,  NULL}, {"а",   R_VOWEL, V_A,  NULL},
     {"о",   R_VOWEL, V_O,  NULL}, {"у",   R_VOWEL, V_U,  NULL},
@@ -734,6 +766,9 @@ const char *mt_pronounce_script(const char *tag) {
 
 static void read_word(char *word, const pron_rule *table, const pron_rule *extra,
                       pron_out *o);
+static size_t english_shape(char *w);
+static void copy_word(char *dst, size_t cap, const char *src);
+static char *sanitise_diacritics(char *text, size_t cap);
 
 /* Reads one run of one script and appends it to `out`. Returns false when there
  * was nothing it could read. */
@@ -783,7 +818,7 @@ static bool read_run(const char *run, size_t len, const char *tag, pron_out *o) 
              * یو, Czech č is چ, Turkish ş is ش. Those rules come first. */
             char one[5] = {0};
             memcpy(one, q, (size_t)(n < 4 ? n : 4));
-            if (extra && match_rule_at(extra, one, one)) base = 0;
+            if (extra && match_rule_at(extra, one, one, 0)) base = 0;
             if (cp >= 0xC0 && base) {
                 folded[fn++] = base;
                 q += n;
@@ -811,6 +846,8 @@ static bool read_run(const char *run, size_t len, const char *tag, pron_out *o) 
          * یُو, not یَؤ. The same words are read by rule in other languages, where
          * they are usually regular ("a" in Spanish, "the" nowhere else). */
         if (extra == LATIN_EN) {
+            /* The dictionary is consulted on the word as *written* ("you", not
+             * "yoo"); the shape rules then apply to whatever is left. */
             char plain[64];
             size_t pn = 0;
             for (size_t i = 0; word[i] && pn + 1 < sizeof plain; i++) {
@@ -822,8 +859,16 @@ static bool read_run(const char *run, size_t len, const char *tag, pron_out *o) 
             plain[pn] = 0;
             const char *known = mt_pronounce_known(plain);
             if (known) { put(o, known); return true; }
+            wn = english_shape(word);
+            if (wn > sizeof word - 1) wn = sizeof word - 1;
         }
-        /* elisions: "d'accord", "l'homme" — the apostrophe splits two words */
+        /* Elisions: "d'accord", "l'homme" are two words. Italian "dov'è" is not:
+         * there the apostrophe only marks a dropped vowel, so it is removed. */
+        if (extra != LATIN_FR && extra != LATIN_EN) {
+            char *q = word;
+            for (char *r = word; *r; r++) if (*r != '\'') *q++ = *r;
+            *q = 0;
+        }
         char *ap;
         while ((ap = strchr(word, '\'')) != NULL) {
             *ap = 0;
@@ -836,18 +881,123 @@ static bool read_run(const char *run, size_t len, const char *tag, pron_out *o) 
         if (*p) put(o, " ");
         o->last_class = 0;      /* the carrier rule restarts at every word */
         o->last_diac = 0;
+        o->prev_vowel = 0;      /* and so does the iotated-vowel rule */
         while (*p == ' ') p++;
     }
     return true;
 }
 
+/* English spellings that a letter-by-letter table cannot express, applied before
+ * the rules run. Only English uses this; the other Latin languages spell their
+ * vowels out.
+ *
+ *   make  -> mayk  -> مَیک   (the final e makes the vowel long and is not spoken)
+ *   table -> tabel -> تِیبِل (-le after a consonant is a syllable of its own)
+ *   city  -> sity  -> سیتی   (c before e/i/y is "s")
+ *   excite-> ekssit -> اِکسِت (/ks spelled out, c softened)
+ */
+/* Copy a string into a fixed buffer, always terminated. */
+static void copy_word(char *dst, size_t cap, const char *src) {
+    size_t n = strlen(src);
+    if (n >= cap) n = cap - 1;
+    memcpy(dst, src, n);
+    dst[n] = 0;
+}
+
+static size_t english_shape(char *w) {
+    char out[256];
+    size_t n = strlen(w);
+
+    /* -le at the end closes a syllable of its own: "table" -> "taybel",
+     * "little" -> "laittel". The vowel before it takes its long reading. */
+    if (n >= 4 && w[n - 1] == 'e' && w[n - 2] == 'l') {
+        size_t v = n - 3;
+        while (v > 0 && !strchr("aeiou", w[v])) v--;
+        if (strchr("aeiou", w[v]) && v + 1 < n - 2) {
+            const char *lg = w[v] == 'a' ? "ei" : w[v] == 'e' ? "ee" : w[v] == 'i' ? "ei" :
+                             w[v] == 'o' ? "oa" : "oo";
+            snprintf(out, sizeof out, "%.*s%s%.*sel", (int)v, w, lg, (int)(n - 2 - (v + 1)), w + v + 1);
+            copy_word(w, 256, out);
+            return strlen(w);
+        }
+    }
+
+    /* -ed after a voiced consonant is one syllable (walked); after t/d it is two
+     * (wanted) and the e is a vowel of its own, so that case is left alone. */
+    if (n >= 4 && w[n - 1] == 'd' && w[n - 2] == 'e') {
+        if (w[n - 3] != 't' && w[n - 3] != 'd') {
+            w[n - 2] = 'd';
+            w[n - 1] = 0;
+            n = strlen(w);
+        }
+    }
+
+    /* Magic e: vowel, one consonant, final e. The vowel is long and the e is not
+     * spoken: "make" -> "mayk", "time" -> "taim", "note" -> "noat". */
+    if (n >= 4 && w[n - 1] == 'e' && !strchr("aeiou", w[n - 2]) &&
+        strchr("aeiou", w[n - 3]) && w[n - 2] != 'r' && w[n - 2] != 'w' &&
+        w[n - 2] != 'y' && w[n - 3] != w[n - 4]) {
+        char v = w[n - 3];
+        /* "a" and "i" both become «ای» in Persian letters («مِیک», «تِیم»); the
+         * other three have a long letter of their own. */
+        const char *lg = v == 'a' ? "ei" : v == 'e' ? "ee" : v == 'i' ? "ei" :
+                         v == 'o' ? "oa" : v == 'u' ? "oo" : NULL;
+        if (lg) {
+            size_t pre = n - 3;
+            snprintf(out, sizeof out, "%.*s%s%.*s", (int)pre, w, lg, (int)(n - 1 - (pre + 1)), w + pre + 1);
+            copy_word(w, 256, out);
+            n = strlen(w);
+        }
+    }
+
+    /* A final e after a consonant is silent ("note" is نوت, "make" is مَیک):
+     * dropping it here covers the words the magic-e rule above does not touch. */
+    if (n >= 3 && w[n - 1] == 'e' && !strchr("aeiou", w[n - 2])) {
+        w[n - 1] = 0;
+        n = strlen(w);
+    }
+
+    /* Soft c and g before e/i/y ("city" -> "sity", "page" -> "paje"), and a
+     * doubled consonant gets a short vowel in front of it rather than being read
+     * as one long letter: "little" -> "littel", already handled by -le. */
+    size_t o = 0;
+    for (size_t i = 0; i < n && o + 4 < sizeof out; i++) {
+        char c = w[i], next = (i + 1 < n) ? w[i + 1] : 0;
+        if (c == 'c' && strchr("eiy", next)) { out[o++] = 's'; continue; }
+        if (c == 'g' && strchr("eiy", next)) { out[o++] = 'j'; continue; }
+        if (c == 'x') { out[o++] = 'k'; out[o++] = 's'; continue; }
+        /* a double consonant after a single vowel: "coffee" -> "cofee" */
+        if (i + 2 < n && c == next && !strchr("aeiou", c) &&
+            i >= 1 && strchr("aeiou", w[i - 1]) && !strchr("aeiou", w[i + 1])) {
+            out[o++] = c;
+            i++;                       /* skip the second one */
+            continue;
+        }
+        out[o++] = c;
+    }
+    out[o] = 0;
+    copy_word(w, 256, out);
+    return strlen(w);
+}
+
 /* One word, with the rules of one table set. */
 static void read_word(char *word, const pron_rule *table, const pron_rule *extra, pron_out *o) {
+    /* "Kaffee", "bitte", "letter": a doubled consonant is one sound. Persian has no
+     * way to write a long consonant, and «کَففِ» reads as two f's. Only when a
+     * vowel precedes it, so a digraph like "ss" in the tables still wins. */
+    if (table == LATIN_BASE || extra) {
+        for (char *q = word; q[0] && q[1]; q++) {
+            if (q[0] == q[1] && strchr("bcdfgklmnprstvz", q[0]) &&
+                (q == word || strchr("aeiou", q[-1]))) {
+                memmove(q + 1, q + 2, strlen(q + 2) + 1);
+            }
+        }
+    }
     const char *p = word;
     while (*p) {
-        const pron_rule *r = extra ? match_rule_at(extra, p, word) : NULL;
-        if (!r) r = match_rule_at(LATIN_INTL, p, word);
-        if (!r) r = match_rule_at(table, p, word);
+        const pron_rule *r = extra ? match_rule_at(extra, p, word, o->prev_vowel) : NULL;
+        if (!r) r = match_rule_at(LATIN_INTL, p, word, o->prev_vowel);
+        if (!r) r = match_rule_at(table, p, word, o->prev_vowel);
         if (r) {
             apply_rule(o, r);
             p += strlen(r->from);
@@ -879,6 +1029,153 @@ static void read_word(char *word, const pron_rule *table, const pron_rule *extra
         }
         p += n;
     }
+}
+
+
+/* A Persian consonant letter: what a short vowel can sit on. */
+
+/* The last line of defence for the diacritics, applied to the whole result.
+ *
+ * Every reader aims to place short vowels on the consonant before them, but a
+ * dictionary entry, a literal or a mixed-script sentence can still slip past. A
+ * diacritic on ا/ی/و is the single thing a Persian reader notices first
+ * ("تاِیم" instead of «تِیم»), so it is also corrected here, once, for the whole
+ * string: the mark is dropped, or moved onto the consonant before the long vowel
+ * when there is one and it can still be read that way.
+ *
+ * Returns `text` (edited in place) for convenience.
+ */
+static int is_consonant(uint32_t cp) {
+    if (cp < 0x0621 || cp > 0x06D2) return 0;
+    return cp != 0x0627 && cp != 0x0622 && cp != 0x0623 && cp != 0x0625 &&
+           cp != 0x0624 && cp != 0x0626 && cp != 0x0648 && cp != 0x06CC &&
+           cp != 0x0649 && cp != 0x0629;
+}
+
+
+static char *sanitise_diacritics(char *text, size_t cap) {
+    size_t n = strlen(text);
+    char *out = (char *)malloc(cap ? cap : 1);
+    if (!out) return text;
+    size_t o = 0;
+
+    /* Walk the string and decode each character once. `prev`, `prev_len`,
+     * `mark_at` and `has_mark` describe the word being built, which is everything
+     * the two rules below need to know. */
+    uint32_t prev = 0;        /* last character that was not a diacritic */
+    size_t   prev_at = 0;     /* where it starts in `out` */
+    size_t   prev_len = 0;
+    int      has_mark = 0;    /* it already carries a short vowel */
+    size_t   mark_at = 0;     /* where that vowel sits in `out` */
+
+    for (size_t i = 0; i < n; ) {
+        uint32_t cp = 0;
+        int len = 1;
+        unsigned char b = (unsigned char)text[i];
+        if (b < 0x80) { cp = b; len = 1; }
+        else if ((b & 0xE0) == 0xC0) { cp = ((uint32_t)(b & 0x1FU) << 6) | ((unsigned char)text[i + 1] & 0x3F); len = 2; }
+        else if ((b & 0xF0) == 0xE0) {
+            cp = ((uint32_t)(b & 0x0F) << 12) | ((uint32_t)((unsigned char)text[i + 1] & 0x3F) << 6) |
+                 ((unsigned char)text[i + 2] & 0x3F);
+            len = 3;
+        } else { cp = b; len = 1; }
+
+        int is_diac = (cp >= 0x064B && cp <= 0x0652) || cp == 0x0670;
+
+        if (is_diac) {
+            if (has_mark) { i += len; continue; }        /* never doubled */
+            if (prev == 0) { i += len; continue; }       /* no letter to sit on */
+
+            /* A short vowel can sit on a consonant, or on a word-initial alef used
+             * as a carrier («اِخ» for "ich"). It cannot sit on ا/ی/و when those
+             * are long vowels, which is what the rule below detects. */
+            int long_letter = (prev == 0x0627 || prev == 0x0622 || prev == 0x06CC || prev == 0x0648);
+            if (long_letter) {
+                /* The letter before the long vowel decides what the long vowel is. */
+                uint32_t before = 0;
+                size_t k = 0, before_end = 0;
+                {
+                    size_t j = prev_at;
+                    while (j > 0 && ((unsigned char)out[j - 1] & 0xC0) == 0x80) j--;
+                    k = j;
+                    while (k > 0 && ((unsigned char)out[k - 1] & 0xC0) == 0x80) k--;
+                    unsigned char c0 = (unsigned char)out[k];
+                    if (c0 < 0x80) before = c0;
+                    else if ((c0 & 0xE0) == 0xC0) before = ((uint32_t)(c0 & 0x1FU) << 6) | ((unsigned char)out[k + 1] & 0x3F);
+                    else before = ((uint32_t)(c0 & 0x0F) << 12) |
+                                  ((uint32_t)((unsigned char)out[k + 1] & 0x3F) << 6) |
+                                  ((unsigned char)out[k + 2] & 0x3F);
+                    before_end = k + (((c0 & 0xF0) == 0xE0) ? 3 : ((c0 & 0xE0) == 0xC0) ? 2 : 1);
+                }
+                if (!is_consonant(before)) {
+                    /* Word-initial: the letter is a carrier, so the mark is right. */
+                    if (o + (size_t)len < cap) {
+                        memcpy(out + o, text + i, (size_t)len);
+                        o += (size_t)len;
+                        out[o] = 0;
+                        mark_at = o;
+                        has_mark = 1;
+                    }
+                    i += len;
+                    continue;
+                }
+                if (prev == 0x0627 || prev == 0x0622) {
+                    /* The alef before this mark is a long vowel (a consonant precedes
+                     * it), so the vowel belongs on that consonant: «تاِیم» for
+                     * "time" becomes «تِیم». */
+                    if (o + (size_t)len < cap) {
+                        memmove(out + before_end + len, out + before_end, o - before_end);
+                        memcpy(out + before_end, text + i, (size_t)len);
+                        o += (size_t)len;
+                        out[o] = 0;
+                        prev_at += (size_t)len;
+                        mark_at = before_end;
+                        has_mark = 1;
+                    }
+                    i += len;
+                    continue;
+                }
+                /* ی or و after a consonant carries a variant vowel (یُ, وُ) and the
+                 * mark is legitimate: "question" is «کوِستچِن», "video" is
+                 * «ویدِیُو». Dropping it would lose a syllable. */
+                if (o + (size_t)len < cap) {
+                    memcpy(out + o, text + i, (size_t)len);
+                    o += (size_t)len;
+                    out[o] = 0;
+                    mark_at = o;
+                    has_mark = 1;
+                }
+                i += len;
+                continue;
+            }
+
+            /* A consonant: the mark goes right after it. */
+            if (o + (size_t)len < cap) {
+                memcpy(out + o, text + i, (size_t)len);
+                o += (size_t)len;
+                out[o] = 0;
+                mark_at = o;
+                has_mark = 1;
+            }
+            i += len;
+            continue;
+        }
+
+        /* A real character. */
+        if (o + (size_t)len >= cap) { i += len; continue; }
+        prev = cp;
+        prev_at = o;
+        prev_len = (size_t)len;
+        has_mark = 0;
+        memcpy(out + o, text + i, (size_t)len);
+        o += (size_t)len;
+        i += len;
+    }
+    out[o] = 0;
+    memcpy(text, out, o + 1);
+    free(out);
+    (void)prev_len; (void)mark_at;
+    return text;
 }
 
 bool mt_pronounce_ex(const char *text, const char *tag, char *out, size_t cap,
@@ -941,5 +1238,7 @@ bool mt_pronounce_ex(const char *text, const char *tag, char *out, size_t cap,
     }
     while (o.n > 0 && out[o.n - 1] == ' ') out[--o.n] = 0;
     (void)skipped;
-    return any && o.n > 0;
+    if (!any || o.n == 0) return false;
+    sanitise_diacritics(out, cap);
+    return true;
 }

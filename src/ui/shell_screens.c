@@ -1573,10 +1573,17 @@ static void draw_settings(shell_state *s, ui_context *u, osa_rect body) {
     /* Compute device: CPU or GPU. The hint is not decorative — it says what this
      * build can do, because a package with the CPU backend cannot honour a GPU
      * request and must say so instead of quietly ignoring it. */
+    bool gpu_possible = false;
     {
         /* The status is a token from the app, localised here: an English
          * sentence in the middle of a Persian row reads like a bug. */
         const char *tok = osa_app_device_status(s->app);
+        gpu_possible = !osa_streq(tok, "cpu-only");
+        /* "cpu-only" is the honest case: this package was built with the CPU
+         * backend and no CUDA/Vulkan sources at all, so a GPU request can never
+         * be honoured. Measured with `OpenSpeechWorker --probe`, which registers
+         * zero GPU devices. Saying so here is the difference between a setting
+         * that silently does nothing and one the user understands. */
         const char *hint = osa_streq(tok, "gpu") ? kl(s, "settings.dev.gpu")
                          : osa_streq(tok, "gpu-requested-cpu") ? kl(s, "settings.dev.gpureq")
                          : osa_streq(tok, "cpu-only") ? kl(s, "settings.dev.cpuonly")
@@ -1591,8 +1598,10 @@ static void draw_settings(shell_state *s, ui_context *u, osa_rect body) {
         char labels[96];
         snprintf(labels, sizeof labels, "%s|%s", kl(s, "settings.devicecpu"),
                  kl(s, "settings.devicegpu"));
-        int sel = osa_app_gpu(s->app) ? 1 : 0;
-        if (ui_segmented(u, 8005, sr, labels, &sel, 2)) {
+        /* A CPU-only build shows the GPU segment greyed out and unclickable, so
+         * it can never be left selected and then quietly ignored. */
+        int sel = (gpu_possible && osa_app_gpu(s->app)) ? 1 : 0;
+        if (ui_segmented_disabled(u, 8005, sr, labels, &sel, 2, gpu_possible ? -1 : 1)) {
             osa_app_set_device(s->app, sel == 1);
             shell_save_prefs(s);
         }

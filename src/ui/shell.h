@@ -147,6 +147,7 @@ typedef struct shell_state {
     char          tr_phonetic[4096];
     char          tr_out_lang[8];
     double        tr_score;
+    bool          tr_same_lang;   /* the two languages were the same: no translation */
 
     /* Set by the UI when it needs the platform layer to run a modal dialog.
      * The host consumes the request, fills in the result and clears it; the UI

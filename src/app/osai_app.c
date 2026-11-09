@@ -15,6 +15,9 @@
 #define TEXT_LIMIT 65536
 #define CHUNK_BYTES 2400
 #define WORKER_TIMEOUT_MS 600000
+/* The capability probe answers immediately and touches no model; a few seconds
+ * is generous, and a hung probe must never hold up the window. */
+#define PROBE_TIMEOUT_MS 5000
 
 typedef struct pack_def {
     const char *id, *name, *kind, *languages, *license, *url, *sha256, *notes, *ext;
@@ -131,6 +134,7 @@ struct osa_app {
     int  worker_threads;
     bool use_gpu;                 /* the user's choice; the worker says if it can */
     bool gpu_compiled;            /* this build has a GPU backend at all */
+    bool gpu_probed;              /* osa_app_gpu_available() has run at least once */
     char device_note[96];         /* what the last load reported */
     mt_style style; volatile int cancel;
 };
@@ -251,13 +255,64 @@ osa_app *osa_app_create(osa_error*err){
          size_t n=strlen(a->models_dir);if(n&&a->models_dir[n-1]!=OSAI_PATH_SEP[0]&&n+1<sizeof a->models_dir){a->models_dir[n]=OSAI_PATH_SEP[0];a->models_dir[n+1]=0;}}
      osa_arena_free(&ar2);}
     lockd(a);osa_arena ar;osa_arena_init(&ar);char*s=osa_db_get_setting(a->db,"lang_src",&ar,"auto");char*d=osa_db_get_setting(a->db,"lang_dst",&ar,"fa");char*st=osa_db_get_setting(a->db,"mt_style",&ar,"0");osa_strlcpy(a->lang_src,s,sizeof a->lang_src);osa_strlcpy(a->lang_dst,d,sizeof a->lang_dst);a->style=(mt_style)osa_clampi(atoi(st),0,2);
-    /* Leave a core or two for the window, the OS and audio: using every core is
-     * what made the machine sit at 100% while translating. */
-    {int cores=osa_cpu_count();a->worker_threads=osa_clampi(cores>2?cores-1:cores,1,8);}
-    {char*g=osa_db_get_setting(a->db,"device",&ar,"cpu");a->use_gpu=osa_streq(g,"gpu");}osa_arena_free(&ar);unlockd(a);return a;
+    /* Always leave at least one logical processor for the window, the OS and
+     * audio. The old default only trimmed on machines with more than two cores,
+     * so a 2-core/4-thread CPU (an i3-4160, reported from a real PC) ran the
+     * worker on every core it had and Task Manager showed 100% for the whole
+     * translation. On a single-core machine the budget still has to be one. */
+    {int cores=osa_cpu_count();a->worker_threads=cores>2?osa_clampi(cores-1,2,8):1;}
+    {char*g=osa_db_get_setting(a->db,"device",&ar,"cpu");a->use_gpu=osa_streq(g,"gpu");}osa_arena_free(&ar);unlockd(a);
+    /* Learn what this package can compute on before the first frame, so Settings
+     * never offers a GPU the build cannot use — and never reports "GPU" for a
+     * translation that is really running on the CPU. One short-lived
+     * `--probe` process, no model loaded. */
+    osa_app_gpu_available(a,true);
+    return a;
 }
 void osa_app_destroy(osa_app*a){if(!a)return;osa_atomic_inc(&a->cancel);osa_mutex_lock(&a->life_mu);locke(a);if(a->asr){wsp_free(a->asr);a->asr=NULL;}osa_process*mt=a->mt,*lid=a->lid;a->mt=a->lid=NULL;unlocke(a);osa_process_stop(mt);osa_process_stop(lid);lockd(a);osa_db_close(a->db);a->db=NULL;unlockd(a);osa_mutex_unlock(&a->life_mu);osa_mutex_destroy(&a->life_mu);osa_mutex_destroy(&a->engine_mu);osa_mutex_destroy(&a->db_mu);free(a);}
-void osa_app_set_device(osa_app*a,bool gpu){if(!a)return;locke(a);a->use_gpu=gpu;unlocke(a);lockd(a);osa_db_set_setting(a->db,"device",gpu?"gpu":"cpu");unlockd(a);}
+/* Ask the worker what it can compute on, without loading a model. The answer is
+ * a property of the package, not of the user's hardware, so one probe per run is
+ * enough; `refresh` exists for tests and for a future GPU build that might want
+ * to re-check after a driver change. Failure is reported as "no GPU", which is
+ * the honest default: the app must never claim an accelerator it cannot use. */
+bool osa_app_gpu_available(osa_app*a,bool refresh){
+    if(!a)return false;
+    locke(a);
+    if(a->gpu_probed&&!refresh){bool v=a->gpu_compiled;unlocke(a);return v;}
+    unlocke(a);
+    bool avail=false;
+    char exe[OSAI_MAX_PATH];
+    osa_error err;osa_err_ok(&err);
+    if(osa_worker_path(exe,sizeof exe,&err)){
+        const char*argv[]={exe,"--probe",NULL};
+        osa_process*p=osa_process_start(argv,&err);
+        if(p){
+            char*line=NULL;
+            if(osa_process_line(p,PROBE_TIMEOUT_MS,NULL,&line,&err)&&line){
+                osa_json_get_bool(line,"gpu_available",&avail);
+                free(line);
+            }
+            osa_process_stop(p);
+        }
+        osa_worker_log_note("probe: gpu_available=%d",(int)avail);
+    }
+    locke(a);a->gpu_compiled=avail;a->gpu_probed=true;unlocke(a);
+    return avail;
+}
+/* Changing the device restarts the translation worker. Without that, the process
+ * started with --device cpu kept serving every request: the setting appeared to
+ * change and the CPU stayed pinned, which is exactly what the user reported. */
+void osa_app_set_device(osa_app*a,bool gpu){
+    if(!a)return;
+    locke(a);
+    bool changed=a->use_gpu!=gpu;
+    a->use_gpu=gpu;
+    osa_process*old=changed?a->mt:NULL;
+    if(old)a->mt=NULL;
+    unlocke(a);
+    if(old)osa_process_stop(old);   /* the next request starts on the chosen device */
+    lockd(a);osa_db_set_setting(a->db,"device",gpu?"gpu":"cpu");unlockd(a);
+}
 bool osa_app_gpu(osa_app*a){if(!a)return false;locke(a);bool g=a->use_gpu;unlocke(a);return g;}
 /* A stable token, not a sentence: the UI localises it. Four honest answers —
  * "gpu" (offloaded), "gpu-requested-cpu" (asked, not possible here),
@@ -267,12 +322,28 @@ const char*osa_app_device_status(osa_app*a){
     if(!a)return "cpu";
     locke(a);
     const char *t;
-    if(a->gpu_compiled) t = osa_streq(a->device_note,"gpu") ? "gpu" : (a->use_gpu ? "gpu-requested-cpu" : "cpu");
-    else t = "cpu-only";
+    if(!a->gpu_compiled) t="cpu-only";                 /* no backend: never "gpu" */
+    else if(osa_streq(a->device_note,"gpu")) t="gpu";   /* the worker really offloaded */
+    else t=a->use_gpu ? "gpu-requested-cpu" : "cpu";
     unlocke(a);
     return t;
 }
-void osa_app_set_threads(osa_app*a,int n){if(!a)return;locke(a);a->worker_threads=osa_clampi(n,1,16);if(a->asr)wsp_set_threads(a->asr,a->worker_threads);unlocke(a);}
+/* The budget applies to the recogniser *and* the translator. The translation
+ * worker used to keep the thread count it was started with, so lowering the
+ * number in Settings did nothing while a translation was the thing pinning the
+ * CPU. Like the device, a changed budget restarts that worker. */
+void osa_app_set_threads(osa_app*a,int n){
+    if(!a)return;
+    locke(a);
+    int want=osa_clampi(n,1,16);
+    bool changed=a->worker_threads!=want;
+    a->worker_threads=want;
+    if(a->asr)wsp_set_threads(a->asr,a->worker_threads);
+    osa_process*old=changed?a->mt:NULL;
+    if(old)a->mt=NULL;
+    unlocke(a);
+    if(old)osa_process_stop(old);
+}
 int  osa_app_threads(osa_app*a){if(!a)return 1;locke(a);int n=a->worker_threads;unlocke(a);return n>0?n:1;}
 void osa_app_cancel(osa_app*a){if(a)osa_atomic_inc(&a->cancel);} void osa_app_reset_cancel(osa_app*a){if(a)__sync_lock_test_and_set(&a->cancel,0);}
 bool osa_app_ready(osa_app*a){if(!a)return false;locke(a);bool ok=a->asr&&a->mt_loaded&&a->lid_loaded;unlocke(a);return ok;}
@@ -558,7 +629,7 @@ static bool translate_all(osa_app*a,const char*text,const char*src,const char*ds
     while(text[pos]){if(osa_atomic_load(&a->cancel)){osa_err_set(err,"cancelled");return false;}char sep[3]={0};size_t n=split_chunk(text,pos,sep);if(!n){pos++;continue;}char*chunk=osa_strndup(text+pos,n);if(!chunk){osa_err_set(err,"out of memory");return false;}osa_arena ar;osa_arena_init(&ar);osa_buf req;osa_buf_init(&req);osa_buf_printf(&req,"{\"op\":\"translate\",\"src\":%s,\"dst\":%s,\"style\":%d,\"max_tokens\":2048,\"text\":%s}",osa_json_escape(&ar,src),osa_json_escape(&ar,dst),(int)style,osa_json_escape(&ar,chunk));char*line=worker_reply(a->mt,req.data,&a->cancel,err);osa_buf_free(&req);osa_arena_free(&ar);free(chunk);if(!line){if(a->mt){osa_process_stop(a->mt);a->mt=NULL;}a->mt_loaded=false;return false;}char*part=osa_json_string_dup(line,"text");bool complete=false;osa_json_get_bool(line,"complete",&complete);free(line);if(!part||!complete){free(part);osa_err_set(err,"translation was incomplete; nothing was saved");return false;}size_t pn=strlen(part),sn=strlen(sep);if(used+pn+sn>=cap){free(part);osa_err_set(err,"translation exceeds 64 KiB; split the input");return false;}memcpy(out+used,part,pn);used+=pn;free(part);if(text[pos+n]&&sn){memcpy(out+used,sep,sn);used+=sn;}out[used]=0;pos+=n+(sep[0]?1:0);}
     return used>0;
 }
-static bool translate_core(osa_app*a,const char*text,const char*src,osa_app_translation*out,bool store,osa_error*err){if(!a||!text||!out){osa_err_set(err,"bad arguments");return false;}if(!osa_app_ready(a)){osa_err_set(err,"download and activate speech, translation and language models first");return false;}size_t len=strlen(text);if(!len||len>=TEXT_LIMIT||!osa_utf8_valid(text,len)){osa_err_set(err,"enter valid UTF-8 text under 64 KiB");return false;}locke(a);char s[8],d[8];osa_strlcpy(s,src&&*src?src:a->lang_src,8);osa_strlcpy(d,a->lang_dst,8);mt_style style=a->style;const char*alangs=a->mt_langs[0]?a->mt_langs:QWEN_LANGS;if(!has_token(alangs,d)||(!osa_streq(s,"auto")&&!has_token(alangs,s))){unlocke(a);osa_err_set(err,"language pair is not supported by the active translation model");return false;}memset(out,0,sizeof*out);int64_t t=osa_now_us();bool ok;if(osa_streq(s,d)){osa_strlcpy(out->text,text,sizeof out->text);osa_strlcpy(out->source_lang,s,8);out->confidence=1;ok=true;}else{
+static bool translate_core(osa_app*a,const char*text,const char*src,osa_app_translation*out,bool store,osa_error*err){if(!a||!text||!out){osa_err_set(err,"bad arguments");return false;}if(!osa_app_ready(a)){osa_err_set(err,"download and activate speech, translation and language models first");return false;}size_t len=strlen(text);if(!len||len>=TEXT_LIMIT||!osa_utf8_valid(text,len)){osa_err_set(err,"enter valid UTF-8 text under 64 KiB");return false;}locke(a);char s[8],d[8];osa_strlcpy(s,src&&*src?src:a->lang_src,8);osa_strlcpy(d,a->lang_dst,8);mt_style style=a->style;const char*alangs=a->mt_langs[0]?a->mt_langs:QWEN_LANGS;if(!has_token(alangs,d)||(!osa_streq(s,"auto")&&!has_token(alangs,s))){unlocke(a);osa_err_set(err,"language pair is not supported by the active translation model");return false;}memset(out,0,sizeof*out);int64_t t=osa_now_us();bool ok;if(osa_streq(s,d)){osa_strlcpy(out->text,text,sizeof out->text);osa_strlcpy(out->source_lang,s,8);out->same_language=true;out->confidence=1;ok=true;}else{
         if(osa_streq(s,"auto")){
             char detected[8]={0};float c=0;
             if(!detect(a,text,detected,&c,err)){unlocke(a);return false;}

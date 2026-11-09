@@ -2,7 +2,7 @@
 
 **Offline multilingual speech recognition and translation for Windows — no bundled models.**
 
-version 1.6.0 · Windows 10 1903+ / 11 x64 · GPL-3.0-or-later
+version 1.6.1 · Windows 10 1903+ / 11 x64 · GPL-3.0-or-later
 
 خلاصهٔ فارسی: برنامه هیچ مدل ازپیش‌نصب‌شده‌ای همراه ندارد. در بخش «مدل‌ها» یک مدل
 گفتار Whisper، یک مدل ترجمه Qwen GGUF و یک مدل تشخیص زبان (fastText یا GlotLID) را از منابع
@@ -15,13 +15,21 @@ version 1.6.0 · Windows 10 1903+ / 11 x64 · GPL-3.0-or-later
 ```
 dist/bin/OpenSpeechAI.exe          GUI executable, x86-64, static, worker embedded
 dist/bin/OpenSpeechWorker.exe      isolated neural inference worker
-dist/OpenSpeechAI-1.6.0-win64.zip  exe + worker + fonts/catalog/docs (no weights)
-dist/checksums-1.6.0.txt           SHA-256 of exe, worker and zip
+dist/OpenSpeechAI-1.6.1-win64.zip  exe + worker + fonts/catalog/docs (no weights)
+dist/checksums-1.6.1.txt           SHA-256 of exe, worker and zip
 ```
 
 ![Fresh-install Models screen](dist/screenshots/screen-04-models.png)
 
 ---
+
+## What changed in 1.6.1
+
+| Area | Behaviour |
+|---|---|
+| **The GPU switch told the truth, and now it can be trusted** | Reported with a screenshot: «پردازش روی گرافیک تنظیم شده اما در هنگام ترجمه سی‌پی‌یو کامل درگیره» — GPU selected, CPU pinned at 100%, no explanation. The shipped package is built with `-DGGML_USE_CPU` and contains no CUDA/Vulkan sources, so it registers exactly one device: the CPU. A new `OpenSpeechWorker --probe` asks llama.cpp's registry which devices exist and answers in milliseconds **without loading a model**; the app calls it once at startup. On a CPU-only package the GPU segment is now drawn inactive and cannot be selected, and the row says why in Persian rather than leaving the user to guess. A translation can never be reported as "on the GPU" when it is not. |
+| **The device choice actually reaches the engine** | Even on a build that *can* offload, changing the setting did nothing: `ensure_worker()` reused the process that had been started with `--device cpu` until it exited. Changing the device (or the thread budget) now restarts the translation worker, so the next request really runs where the setting says. |
+| **A slower-but-polite CPU** | Three sources of a permanently pinned processor, all fixed. The default thread budget only left a core free on machines with more than two cores, so a 2-core/4-thread i3-4160 used **every** core; it now always keeps one for the window, the OS and audio. The budget reached the recogniser but never the translator, so lowering it in Settings changed nothing during a translation. And llama.cpp's threadpool ships with `poll=50`, which spins ~6.5 M pause instructions per wait before sleeping — the worker now attaches a sleeping pool (`poll=0`) and threads cost microseconds of wake-up per token instead of burning a core between tokens. |
 
 ## What changed in 1.6.0
 

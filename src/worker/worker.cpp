@@ -4,6 +4,8 @@
  * stdin/stdout carry UTF-8 JSON; diagnostics go to stderr, never the protocol. */
 #include <nlohmann/json.hpp>
 #include <llama.h>
+#include <ggml-backend.h>
+#include <ggml-cpu.h>
 #include <fasttext.h>
 #include <algorithm>
 #include <cstring>
@@ -28,6 +30,33 @@ using json = nlohmann::json;
 
 static void send(const json &j) { std::cout << j.dump(-1, ' ', false, json::error_handler_t::replace) << '\n' << std::flush; }
 static void fail(const std::string &s) { send({{"ok",false},{"error",s}}); }
+
+/* What this build can actually compute on, asked of llama.cpp itself instead of
+ * assumed. The shipped package is built with -DGGML_USE_CPU and no CUDA/Vulkan
+ * sources, so ggml registers exactly one device: the CPU. Until now the app only
+ * learned that *after* a model had loaded, which meant Settings could offer a
+ * "GPU" segment, store it, and leave the user with a 100% CPU during every
+ * translation and no explanation. `probe` answers the question before any model
+ * is touched, so the UI can grey the option out and say why. */
+static json backend_report() {
+    json devs = json::array();
+    int gpu = 0;
+    for (size_t i = 0; i < ggml_backend_dev_count(); i++) {
+        ggml_backend_dev_t d = ggml_backend_dev_get(i);
+        if (!d) continue;
+        ggml_backend_dev_props props{};
+        ggml_backend_dev_get_props(d, &props);
+        const char *name = props.name ? props.name : ggml_backend_dev_name(d);
+        const char *type = props.type == GGML_BACKEND_DEVICE_TYPE_GPU ? "gpu"
+                         : props.type == GGML_BACKEND_DEVICE_TYPE_ACCEL ? "accel" : "cpu";
+        if (props.type == GGML_BACKEND_DEVICE_TYPE_GPU) gpu++;
+        devs.push_back({{"name", name ? name : "?"}, {"type", type},
+                        {"memory_total", (double)props.memory_total}});
+    }
+    json r = {{"ok", true}, {"event", "probe"}, {"devices", devs},
+              {"gpu_count", gpu}, {"gpu_available", gpu > 0 && llama_supports_gpu_offload()}};
+    return r;
+}
 
 /* llama.cpp reports the reason a GGUF was refused through its log callback,
  * not through a return value: llama_model_load_from_file only hands back NULL.
@@ -525,7 +554,13 @@ struct TranslationModel {
     const llama_vocab *vocab=nullptr;
     uint32_t context=4096;
     int threads=4;
-    ~TranslationModel() { if(ctx) llama_free(ctx); if(model) llama_model_free(model); llama_backend_free(); }
+    ~TranslationModel() {
+        if(ctx) llama_free(ctx);
+        if(pool_batch) ggml_threadpool_free(pool_batch);
+        if(pool) ggml_threadpool_free(pool);
+        if(model) llama_model_free(model);
+        llama_backend_free();
+    }
     void load(const std::string &path,int nthreads,bool want_gpu=false) {
         threads=std::clamp(nthreads,1,16);
         /* Keep llama.cpp's diagnostics: they are the only thing that says why a
@@ -568,10 +603,27 @@ struct TranslationModel {
         cp.offload_kqv=false; cp.no_perf=true; cp.embeddings=false;
         ctx=llama_init_from_model(model,cp);
         if(!ctx) throw std::runtime_error("not enough free memory for the translation context");
-        std::fprintf(stderr,"llama.cpp: ready, ctx=%u\n",context);
+        /* ggml's default threadpool spins between graphs: poll=50 means ~6.5 M
+         * pause instructions per wait before a thread finally sleeps. On a word
+         * count of 4 cores that looks like the CPU being "fully busy" even while
+         * the decoder is between tokens — the user's Task Manager showed 100% for
+         * the whole translation. A sleeping pool costs microseconds of wake-up
+         * latency per token and gives the window and the audio thread their core
+         * back. Threads are still pinned to the context so llama.cpp does not
+         * build a disposable spinning pool of its own. */
+        {
+            struct ggml_threadpool_params ttp=ggml_threadpool_params_default(cp.n_threads);
+            ttp.poll=0;                      /* 0 = no polling, sleep instead */
+            pool=ggml_threadpool_new(&ttp);
+            pool_batch=ggml_threadpool_new(&ttp);
+            if(pool&&pool_batch) llama_attach_threadpool(ctx,pool,pool_batch);
+            else std::fprintf(stderr,"llama.cpp: threadpool unavailable, using the default pool\n");
+        }
+        std::fprintf(stderr,"llama.cpp: ready, ctx=%u (threads sleep when idle)\n",context);
     }
 public:
     bool gpu_enabled=false;
+    ggml_threadpool *pool=nullptr,*pool_batch=nullptr;
     std::vector<llama_token> tokens(const std::string &s,bool add_special,bool parse_special) const {
         std::vector<llama_token> t(s.size()+64);
         int n=llama_tokenize(vocab,s.c_str(),(int32_t)s.size(),t.data(),(int32_t)t.size(),add_special,parse_special);
@@ -721,6 +773,12 @@ int main(int argc,char **argv) {
                 else if(a=="--threads") threads=atoi(args[++i].c_str());
                 else if(a=="--device") device=args[++i];
             }
+        }
+        /* `worker --probe` answers "can this build use a GPU?" and exits. It must
+         * come before the model path check: the whole point is to answer without
+         * a model, so Settings can be honest on a fresh install. */
+        for(size_t i=1;i<args.size();++i) {
+            if(args[i]=="--probe") { llama_backend_init(); send(backend_report()); return 0; }
         }
         if(path.empty()) throw std::runtime_error("missing model path");
         std::unique_ptr<LanguageModel> lid;

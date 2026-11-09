@@ -1066,7 +1066,15 @@ void shell_job_tick(shell_state*s){
         case SHELL_JOB_RESTORE:osa_app_get_languages(s->app,s->lang_src,sizeof s->lang_src,s->lang_dst,sizeof s->lang_dst);s->style=osa_app_style(s->app);if(!s->models_ready)s->screen=SCREEN_MODELS;break;
         case SHELL_JOB_LOAD_AUDIO:free(s->peaks);s->peaks=j->peaks;j->peaks=NULL;s->n_peaks=j->n_peaks;shell_set_message(s,false,"%s",tt(s->lang,"msg.fileselected"));break;
         case SHELL_JOB_TRANSCRIBE:osa_strlcpy(s->transcript,j->tr.text,sizeof s->transcript);osa_strlcpy(s->correction,j->tr.text,sizeof s->correction);osa_strlcpy(s->translation,j->mt.text,sizeof s->translation);osa_strlcpy(s->detected_lang,j->tr.language,sizeof s->detected_lang);osa_strlcpy(s->transcript_id,j->tr.id,sizeof s->transcript_id);s->transcript_conf=(float)j->tr.confidence;s->transcript_rtf=j->tr.rtf;s->transcript_dur=j->tr.duration_s;s->transcript_ms=j->tr.proc_ms;s->transcript_words=j->tr.n_words;shell_refresh_phonetic(s);free(s->history_json);s->history_json=osa_app_history_json(s->app,100,NULL);shell_set_message(s,false,"%s",tt(s->lang,"msg.ok"));break;
-        case SHELL_JOB_TRANSLATE:osa_strlcpy(s->tr_out,j->mt.text,sizeof s->tr_out);osa_strlcpy(s->tr_out_lang,j->mt.target_lang,sizeof s->tr_out_lang);s->tr_score=j->mt.confidence;s->tr_phonetic[0]=0;if(s->show_phonetic)osa_app_pronounce(j->mt.text,j->mt.target_lang,s->tr_phonetic,sizeof s->tr_phonetic);shell_set_message(s,false,"%s (%s → %s)",tt(s->lang,"translate.done"),shell_lang_name(s,j->mt.source_lang),shell_lang_name(s,j->mt.target_lang));break;
+        case SHELL_JOB_TRANSLATE:osa_strlcpy(s->tr_out,j->mt.text,sizeof s->tr_out);osa_strlcpy(s->tr_out_lang,j->mt.target_lang,sizeof s->tr_out_lang);s->tr_score=j->mt.confidence;s->tr_same_lang=j->mt.same_language;s->tr_phonetic[0]=0;
+            /* A pronunciation line is only meaningful for a translation. When the
+             * two languages are the same the text is unchanged, so writing it out
+             * again ("Excited to meet you too" -> «اکسکید تُ میت یو تو») is not a
+             * transliteration, it is noise. */
+            if(s->show_phonetic&&!j->mt.same_language)osa_app_pronounce(j->mt.text,j->mt.target_lang,s->tr_phonetic,sizeof s->tr_phonetic);
+            if(j->mt.same_language)shell_set_message(s,true,"%s",tt(s->lang,"translate.samelang"));
+            else shell_set_message(s,false,"%s (%s → %s)",tt(s->lang,"translate.done"),shell_lang_name(s,j->mt.source_lang),shell_lang_name(s,j->mt.target_lang));
+            break;
         case SHELL_JOB_DOWNLOAD:free(s->models_json);s->models_json=NULL;s->models_tab=0;shell_set_message(s,false,"%s",tt(s->lang,"models.installed_inactive"));break;
         case SHELL_JOB_ACTIVATE:{
             free(s->models_json);s->models_json=NULL;

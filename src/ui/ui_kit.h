@@ -224,6 +224,10 @@ bool  ui_row(ui_context *u, int id, osa_rect r, bool selected);
 
 /* Segmented control over N labels separated by '|' ("فارسی|English"). */
 bool  ui_segmented(ui_context *u, int id, osa_rect r, const char *labels, int *value, int n);
+/* Same, but the segment at `disabled_slot` (0-based, -1 for none) is drawn
+ * inactive and cannot be selected: for a choice this build cannot honour. */
+bool  ui_segmented_disabled(ui_context *u, int id, osa_rect r, const char *labels,
+                            int *value, int n, int disabled_slot);
 
 /* Numeric stepper with -/+ buttons. Returns true when the value changed. */
 bool  ui_stepper(ui_context *u, int id, osa_rect r, int *value, int vmin, int vmax);

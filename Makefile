@@ -212,16 +212,16 @@ WORKER_WIN_OBJ := $(patsubst %.c,$(BUILD)/worker-win/%.c.o,$(LLAMA_C)) \
                   $(BUILD)/worker-win/$(WORKER_SRC).o
 $(BUILD)/worker-win/%.c.o: %.c
 	@mkdir -p $(dir $@)
-	$(WIN_CC) -std=c11 $(LLAMA_DEF) $(LLAMA_INC) -c $< -o $@
+	$(WIN_CC) -std=c11 -MMD -MP $(LLAMA_DEF) $(LLAMA_INC) -c $< -o $@
 $(BUILD)/worker-win/%.cpp.o: %.cpp
 	@mkdir -p $(dir $@)
-	$(WIN_CXX) -std=c++17 $(LLAMA_DEF) $(LLAMA_INC) -c $< -o $@
+	$(WIN_CXX) -std=c++17 -MMD -MP $(LLAMA_DEF) $(LLAMA_INC) -c $< -o $@
 $(BUILD)/worker-win/%.cc.o: %.cc
 	@mkdir -p $(dir $@)
-	$(WIN_CXX) -std=c++17 $(LLAMA_INC) -c $< -o $@
+	$(WIN_CXX) -std=c++17 -MMD -MP $(LLAMA_INC) -c $< -o $@
 $(BUILD)/worker-win/src/engines/lang_script.o: $(LANGSCRIPT_SRC) $(SRC)/engines/lang_script.h
 	@mkdir -p $(dir $@)
-	$(WIN_CC) -std=c11 -I$(SRC)/core -I$(SRC)/engines -c $< -o $@
+	$(WIN_CC) -std=c11 -MMD -MP -I$(SRC)/core -I$(SRC)/engines -c $< -o $@
 $(BUILD)/worker-win/res.o: $(SRC)/platform/win32/worker.rc $(SRC)/platform/win32/worker.manifest
 	@mkdir -p $(dir $@)
 	$(ZIG) rc /fo $@ /I $(SRC)/platform/win32 $(SRC)/platform/win32/worker.rc
@@ -233,7 +233,7 @@ win: $(WIN_BIN) $(WORKER_WIN)
 
 $(BUILD)/win/%.o: %.c
 	@mkdir -p $(dir $@)
-	$(WIN_CC) -std=c11 $(INCLUDES) -DOSAI_WIN_MEDIA_FOUNDATION -DOSAI_WIN_SAPI -c $< -o $@
+	$(WIN_CC) -std=c11 -MMD -MP $(INCLUDES) -DOSAI_WIN_MEDIA_FOUNDATION -DOSAI_WIN_SAPI -c $< -o $@
 
 $(BUILD)/win/sqlite3.o: $(SRC)/third_party/sqlite/sqlite3.c
 	@mkdir -p $(dir $@)
