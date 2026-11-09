@@ -15,6 +15,8 @@
 #include <vector>
 #include <thread>
 #include <mutex>
+#include <fstream>
+#include <streambuf>
 #ifdef _WIN32
 #include <io.h>
 #include <fcntl.h>
@@ -178,57 +180,288 @@ static std::wstring utf8_wide(const std::string &s) {
 }
 #endif
 
-/* fastText models start with a little-endian magic (793712893) and a format
- * version. Checking it here means a whisper ggml .bin, a .gguf or a truncated
- * download gets a sentence that names the actual problem instead of fastText's
- * bare "has wrong file format!" — or, worse, a stream exception with no text. */
-static bool fasttext_magic_ok(const std::string &path, std::string &problem) {
-    FILE *f = std::fopen(path.c_str(), "rb");
-    if (!f) return true;                    /* let fastText report the open error */
-    int32_t magic = 0, version = 0;
-    size_t n1 = std::fread(&magic, 1, sizeof magic, f);
-    size_t n2 = std::fread(&version, 1, sizeof version, f);
-    std::fclose(f);
-    if (n1 < sizeof magic) { problem = "the file is empty or truncated"; return false; }
-    if (magic != 793712314) {   /* FASTTEXT_FILEFORMAT_MAGIC_INT32 */
-        if (n1 >= 4 && std::memcmp(&magic, "ggml", 4) == 0)
-            problem = "this is a whisper (.bin) model, not a fastText language model";
-        else if (n1 >= 4 && std::memcmp(&magic, "GGUF", 4) == 0)
-            problem = "this is a GGUF translation model, not a fastText language model";
-        else
-            problem = "the file is not a fastText model (wrong header)";
-        return false;
-    }
-    if (n2 < sizeof version) { problem = "the file is truncated"; return false; }
-    if (version > 12) { /* upstream FASTTEXT_VERSION */ problem = "the fastText format is newer than this build supports"; return false; }
+/* ---- fastText model pre-flight -------------------------------------
+ *
+ * Why this exists (two user-visible bugs, one root cause):
+ *
+ * fastText has two ways in. loadModel(const std::string&) validates the file
+ * with checkModel() first; loadModel(std::istream&) — the one used here, because
+ * it lets us hand fastText a stream opened with the wide Win32 API so that a
+ * Persian folder name works — does NOT. The stream version starts reading at
+ * offset 0 instead of offset 8, so Args::load() consumed the magic as "dim" and
+ * then every field was skewed by four bytes. The dictionary header (size,
+ * nwords, nlabels, ntokens, pruneidx_size) came out as garbage; in practice
+ * size_ = 0 while nwords_/nlabels_ kept whatever the skew produced, and
+ * Dictionary::find() then indexed an empty word2int_ and threw
+ * std::out_of_range — whose message under the app's C++ runtime is just
+ * "vector". That is the whole of "worker: load failed: vector".
+ *
+ * A model that survived the skew (here: glotlid-small) loaded "successfully"
+ * with zero words and zero labels, so activation appeared to do nothing at all.
+ *
+ * So: validate the whole container before handing it over, and skip exactly the
+ * 8-byte header the stream reader expects to skip. Everything below is streamed
+ * — the dictionary is traversed, never buffered — because a full 176-language
+ * model is 131 MB and glotlid's is 783 MB.
+ *
+ * The layout is the one saveModel()/loadModel() write and read:
+ *   magic:int32 version:int32
+ *   Args:   12x int32 + double                       (56 bytes)
+ *   Dict:   3x int32 + 2x int64, then per entry: word\0 int64 count int32 type,
+ *           then pruneidx_size x (int32, int32)
+ *   bool quant, Matrix input (dense or quantized), bool qout, Matrix output
+ */
+namespace ft {
+
+static const int32_t kMagic   = 793712314;   /* FASTTEXT_FILEFORMAT_MAGIC_INT32  */
+static const int32_t kVersion = 12;          /* FASTTEXT_VERSION                 */
+static const int32_t kHeader  = 8;           /* magic + version                  */
+static const int32_t kKsub    = 256;         /* ProductQuantizer::ksub_  (1<<8)  */
+static const int32_t kDsub    = 2;           /* ProductQuantizer::dsub_          */
+
+/* Reads exactly n bytes; false on any short read (i.e. a truncated file). */
+static bool rd(FILE *f, void *p, size_t n, int64_t *left) {
+    if (n == 0) return true;
+    if (n > (size_t)(*left < 0 ? 0 : *left)) return false;
+    if (std::fread(p, 1, n, f) != n) return false;
+    *left -= (int64_t)n;
     return true;
 }
+static bool skip(FILE *f, int64_t n, int64_t *left) {
+    if (n <= 0) return true;
+    if (n > *left) return false;
+    if (std::fseek(f, (long)n, SEEK_CUR) != 0) return false;
+    *left -= n;
+    return true;
+}
+
+/* Mirrors Matrix::load without allocating anything. */
+static bool skip_matrix(FILE *f, bool quantized, int64_t *left, std::string &why) {
+    if (!quantized) {
+        int64_t m = 0, n = 0;
+        if (!rd(f, &m, sizeof m, left) || !rd(f, &n, sizeof n, left)) { why = "the file ends inside the weight matrix header"; return false; }
+        if (m < 0 || n < 0 || m > (int64_t)1 << 40 || n > (int64_t)1 << 40) { why = "the weight matrix header is not plausible"; return false; }
+        if (!skip(f, m * n * (int64_t)sizeof(float), left)) { why = "the file ends inside the weight matrix"; return false; }
+        return true;
+    }
+    bool qnorm = false; int32_t m = 0, n = 0, codesize = 0;
+    if (!rd(f, &qnorm, sizeof qnorm, left)) { why = "the file ends inside the quantized matrix header"; return false; }
+    if (!rd(f, &m, sizeof m, left) || !rd(f, &n, sizeof n, left) || !rd(f, &codesize, sizeof codesize, left)) {
+        why = "the file ends inside the quantized matrix header"; return false;
+    }
+    if (m < 0 || n < 0 || codesize < 0) { why = "the quantized matrix header is not plausible"; return false; }
+    if (!skip(f, codesize, left)) { why = "the file ends inside the matrix codes"; return false; }
+    /* ProductQuantizer: dim, nsubq, dsub, lastdsub + ksub*ceil(dim/dsub) floats */
+    int32_t dim = 0, nsubq = 0, dsub = 0, lastdsub = 0;
+    if (!rd(f, &dim, sizeof dim, left) || !rd(f, &nsubq, sizeof nsubq, left) ||
+        !rd(f, &dsub, sizeof dsub, left) || !rd(f, &lastdsub, sizeof lastdsub, left)) {
+        why = "the file ends inside the product quantizer"; return false;
+    }
+    if (dim <= 0 || dim > 100000 || dsub <= 0 || nsubq <= 0) { why = "the product quantizer header is not plausible"; return false; }
+    /* ProductQuantizer stores exactly dim*ksub centroids — not
+     * ceil(dim/dsub)*ksub — because every sub-vector is dsub wide except the
+     * last, which is lastdsub. Using the cluster count here walked the file
+     * pointer past the end of a valid model. */
+    if (!skip(f, (int64_t)dim * kKsub * (int64_t)sizeof(float), left)) {
+        why = "the file ends inside the quantizer centroids"; return false;
+    }
+    if (qnorm) {
+        /* The separate norm quantizer is rare (fastText quantizes norms only
+         * with -qnorm true) and its tail layout is the one part of this format
+         * we cannot confirm against a real file here. So this block is checked
+         * only as far as it is certain: if it does not add up we stop believing
+         * our own arithmetic and let fastText attempt the load, rather than
+         * reject a model that may be perfectly good. */
+        if (*left <= 0 || !skip(f, m, left)) return true;
+        int32_t d2 = 0, n2 = 0, ds2 = 0, ls2 = 0;
+        if (!rd(f, &d2, sizeof d2, left) || !rd(f, &n2, sizeof n2, left) ||
+            !rd(f, &ds2, sizeof ds2, left) || !rd(f, &ls2, sizeof ls2, left)) return true;
+        if (d2 <= 0 || ds2 <= 0) return true;
+        (void)skip(f, (int64_t)d2 * kKsub * (int64_t)sizeof(float), left);
+        (void)why;
+    }
+    return true;
+}
+
+/* Returns "" when the file is a language-identification model that the stream
+ * reader can consume, otherwise the sentence to show the user. */
+static std::string validate(const std::string &path) {
+    FILE *f = std::fopen(path.c_str(), "rb");
+    if (!f) return "";                 /* let fastText report the open failure */
+    int64_t left = -1;
+    if (std::fseek(f, 0, SEEK_END) == 0) { long e = std::ftell(f); if (e > 0) left = e; }
+    if (left < 0 || std::fseek(f, 0, SEEK_SET) != 0) { std::fclose(f); return ""; }
+
+    std::string why;
+    int32_t magic = 0, version = 0;
+    if (!rd(f, &magic, sizeof magic, &left)) { std::fclose(f); return "the file is empty or truncated"; }
+    if (magic != kMagic) {
+        std::fclose(f);
+        if (std::memcmp(&magic, "ggml", 4) == 0)
+            return "this is a whisper (.bin) model, not a fastText language model";
+        if (std::memcmp(&magic, "GGUF", 4) == 0)
+            return "this is a GGUF translation model, not a fastText language model";
+        return "the file is not a fastText model (wrong header)";
+    }
+    if (!rd(f, &version, sizeof version, &left)) { std::fclose(f); return "the file is truncated"; }
+    if (version > kVersion) { std::fclose(f); return "the fastText format is newer than this build supports"; }
+    if (version <= 0) { std::fclose(f); return "the fastText header is corrupt (bad version)"; }
+
+    /* Args: 12 int32 then a double. */
+    {
+        int32_t a[12];
+        double t = 0;
+        if (!rd(f, a, sizeof a, &left) || !rd(f, &t, sizeof t, &left)) { std::fclose(f); return "the file ends inside the model parameters"; }
+        /* dim/ws/epoch/minCount/neg/wordNgrams/loss/model/bucket/minn/maxn/lrUpdateRate.
+         * Anything absurd here means the header is not really an Args block. */
+        if (a[0] <= 0 || a[0] > 100000 || a[4] < 0 || a[5] < 0 || a[8] < 0 || a[9] < 0 || a[10] < 0)
+            { std::fclose(f); return "the model parameters are corrupt"; }
+    }
+
+    /* Dictionary header. */
+    int32_t size = 0, nwords = 0, nlabels = 0;
+    int64_t ntokens = 0, pruneidx_size = 0;
+    if (!rd(f, &size, sizeof size, &left) || !rd(f, &nwords, sizeof nwords, &left) ||
+        !rd(f, &nlabels, sizeof nlabels, &left) || !rd(f, &ntokens, sizeof ntokens, &left) ||
+        !rd(f, &pruneidx_size, sizeof pruneidx_size, &left)) {
+        std::fclose(f); return "the file ends inside the dictionary header";
+    }
+    /* -1 means "this dictionary was never pruned" (Dictionary::isPruned() is
+     * `pruneidx_size_ >= 0`), so it is a normal value, not corruption. */
+    if (size <= 0 || nwords < 0 || nlabels < 0 || size > (int32_t)50000000 ||
+        nwords > size || nlabels > size || pruneidx_size < -1 || pruneidx_size > (int64_t)1 << 31) {
+        std::fclose(f);
+        return "the dictionary header is corrupt — the file is not a valid fastText model";
+    }
+    if (nlabels < 2) {
+        std::fclose(f);
+        return "this fastText model has fewer than two labels, so it is not a "
+               "language-identification model (it looks like a word-vector model)";
+    }
+
+    /* Walk the entries. This is the only slow part, and it is a straight read. */
+    for (int32_t i = 0; i < size; i++) {
+        for (;;) {
+            if (left <= 0) { std::fclose(f); return "the file ends inside the vocabulary"; }
+            int c = std::fgetc(f);
+            if (c == EOF) { std::fclose(f); return "the file ends inside the vocabulary"; }
+            left--;
+            if (c == 0) break;
+        }
+        int64_t count = 0;
+        /* entry_type is `enum class entry_type : int8_t` — one byte, not four. */
+        int8_t type = 0;
+        if (!rd(f, &count, sizeof count, &left) || !rd(f, &type, sizeof type, &left)) {
+            std::fclose(f); return "the file ends inside the vocabulary";
+        }
+        if (type != 0 && type != 1) { std::fclose(f); return "the vocabulary holds an unknown entry type"; }  /* word / label */
+    }
+    if (pruneidx_size > 0 && !skip(f, pruneidx_size * 8, &left)) { std::fclose(f); return "the file ends inside the pruned vocabulary index"; }
+
+    bool quant = false;
+    if (!rd(f, &quant, sizeof quant, &left)) { std::fclose(f); return "the file ends after the dictionary"; }
+    if (!skip_matrix(f, quant, &left, why)) { std::fclose(f); return why; }
+    bool qout = false;
+    if (!rd(f, &qout, sizeof qout, &left)) { std::fclose(f); return "the file ends after the input matrix"; }
+    if (!skip_matrix(f, qout, &left, why)) { std::fclose(f); return why; }
+
+    std::fclose(f);
+    return "";
+}
+
+}  /* namespace ft */
+
+
+/* Hands fastText the model with the 8-byte header already consumed.
+ *
+ * loadModel(std::istream&) expects to start after the magic and version — that
+ * is exactly what loadModel(const std::string&) does for you after checkModel()
+ * has read them. Calling the stream overload on a fresh stream therefore shifted
+ * every field by four bytes (see the comment above). Skipping the header here
+ * fixes the misparse at its cause, so even a model this build does not
+ * pre-validate loads correctly. */
+class header_skipped_buf : public std::streambuf {
+    std::streambuf *src_;
+    int64_t skip_;
+    char head_[1024];
+public:
+    header_skipped_buf(std::streambuf *src, int64_t skip) : src_(src), skip_(skip) {
+        setg(head_, head_, head_);
+    }
+protected:
+    int_type underflow() override {
+        if (gptr() < egptr()) return traits_type::to_int_type(*gptr());
+        while (skip_ > 0) {
+            std::streamsize want = (std::streamsize)std::min<int64_t>(skip_, (int64_t)sizeof head_);
+            std::streamsize got = src_->sgetn(head_, want);
+            if (got <= 0) return traits_type::eof();
+            skip_ -= got;
+        }
+        std::streamsize got = src_->sgetn(head_, (std::streamsize)sizeof head_);
+        if (got <= 0) return traits_type::eof();
+        setg(head_, head_, head_ + got);
+        return traits_type::to_int_type(*gptr());
+    }
+    std::streamsize xsgetn(char *dst, std::streamsize count) override {
+        std::streamsize done = 0;
+        while (done < count) {
+            if (gptr() == egptr() && underflow() == traits_type::eof()) break;
+            std::streamsize take = std::min(count - done, (std::streamsize)(egptr() - gptr()));
+            std::memcpy(dst + done, gptr(), (size_t)take);
+            gbump((int)take);
+            done += take;
+        }
+        return done;
+    }
+};
 
 struct LanguageModel {
     fasttext::FastText ft;
     std::vector<std::string> labels;
     void load(const std::string &path) {
         std::fprintf(stderr, "fastText: loading %s\n", path.c_str());
-        std::string problem;
-        if (!fasttext_magic_ok(path, problem))
+        /* Validate the whole container first and report what is wrong with it,
+         * instead of letting the reader trip over a misaligned stream and throw
+         * an exception whose text is a single word ("vector"). */
+        std::string problem = ft::validate(path);
+        if (!problem.empty())
             throw std::runtime_error("cannot load the language model (" + path + "): " + problem);
+        try {
 #ifdef _WIN32
-        FILE *fp=_wfopen(utf8_wide(path).c_str(),L"rb");
-        if(!fp) throw std::runtime_error("cannot open the language model file: "+path);
-        {
-            wide_filebuf buf(fp);          /* owns fp, closes it on scope exit */
-            std::istream in(&buf);
-            in.exceptions(std::ios::badbit);
-            ft.loadModel(in);
-        }
+            FILE *fp=_wfopen(utf8_wide(path).c_str(),L"rb");
+            if(!fp) throw std::runtime_error("cannot open the language model file: "+path);
+            {
+                wide_filebuf raw(fp);      /* owns fp, closes it on scope exit */
+                header_skipped_buf buf(&raw, ft::kHeader);
+                std::istream in(&buf);
+                in.exceptions(std::ios::badbit | std::ios::failbit);
+                ft.loadModel(in);
+            }
 #else
-        ft.loadModel(path);
+            /* Same wrapper on every target: fastText's stream overload expects
+             * the header to have been consumed already. */
+            std::ifstream file(path, std::ifstream::binary);
+            if (!file.is_open()) throw std::runtime_error("cannot open the language model file: " + path);
+            header_skipped_buf buf(file.rdbuf(), ft::kHeader);
+            std::istream in(&buf);
+            in.exceptions(std::ios::badbit | std::ios::failbit);
+            ft.loadModel(in);
 #endif
+        } catch (const std::exception &e) {
+            /* Anything the reader still dislikes is a format problem, and its
+             * own text (often just "vector") is not worth showing on its own. */
+            std::string what = e.what() ? e.what() : "";
+            if (what.size() < 8 || what.find(' ') == std::string::npos)
+                what = "the model data could not be read (it is damaged or truncated)";
+            throw std::runtime_error("cannot load the language model (" + path + "): " + what);
+        }
         std::fprintf(stderr, "fastText: loaded, %d labels\n", (int)ft.getDictionary()->nlabels());
         auto dict=ft.getDictionary();
         if (dict->nlabels() < 2) throw std::runtime_error(
             "the file is a fastText model but not a language-identification one "
             "(it has fewer than two labels)");
+        if (dict->nwords() <= 0) throw std::runtime_error(
+            "the language model has an empty dictionary; the file is damaged");
         // nwords() + nlabels() covers the whole dictionary; iterating only
         // nwords() stopped before the labels and produced an empty list.
         const int32_t total=dict->nwords()+dict->nlabels();
@@ -241,6 +474,11 @@ struct LanguageModel {
             }
         }
         std::sort(labels.begin(),labels.end());
+        /* A model that parses but yields no usable labels would "activate"
+         * successfully and then fail on the first detect. Refuse it here so the
+         * user is told now, not later. */
+        if (labels.empty()) throw std::runtime_error(
+            "the language model lists no usable language labels; the file is damaged");
     }
     void request(const json &j) {
         std::string text=j.at("text").get<std::string>();

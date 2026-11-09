@@ -552,6 +552,110 @@ static void test_hash_cancel(void){
     remove(path);
 }
 
+/* A genuine fastText container, byte for byte. These are the files that used to
+ * fail with "worker: load failed: vector": the worker handed fastText a stream
+ * starting at offset 0, so the magic was read as the first parameter and every
+ * field after it was skewed. Writing the container ourselves keeps the test
+ * independent of whether any model can be downloaded.
+ *
+ * Layout (fastText saveModel/loadModel):
+ *   magic:int32 version:int32
+ *   Args: 12x int32 + double
+ *   Dict: size,nwords,nlabels:int32  ntokens,pruneidx_size:int64
+ *         per entry: word\0 | count:int64 | type:int8      (type is ONE byte)
+ *   pruneidx pairs (int32,int32) when pruneidx_size>0   (-1 = never pruned)
+ *   quant:bool | Matrix input | qout:bool | Matrix output
+ *   Matrix: dense  -> m:int64 n:int64 floats[m*n]
+ *           quant  -> qnorm:bool m:int32 n:int32 codesize:int32 codes
+ *                     ProductQuantizer: dim,nsubq,dsub,lastdsub:int32 floats[dim*256]
+ */
+static void test_fasttext_language_model(void){
+    suite("fastText language model container");
+    const char *exe="build/OpenSpeechWorker";
+    if(!osa_file_exists(exe)){printf("  SKIP worker binary not built (%s)\n",exe);return;}
+
+    /* ---- writer ---------------------------------------------------- */
+    char dir[256];snprintf(dir,sizeof dir,"/tmp/osai-ft-XXXXXX");
+    if(!mkdtemp(dir)){CHECK_MSG(false,"mkdtemp");return;}
+
+    struct { const char *name; int quant; int nlabels; int truncate_at; const char *expect; } cases[]={
+        {"dense.bin",   0, 4, 0, NULL},                    /* must load        */
+        {"quant.bin",   1, 4, 0, NULL},                    /* must load        */
+        {"short.bin",   0, 4, 40, "ends inside"},          /* truncated dict   */
+        {"onelabel.bin",0, 1, 0, "fewer than two labels"}, /* not a LID model  */
+    };
+    const char *words[]={"salam","hello","hallo","marhaba","kotob","book","buch","kitab"};
+    const char *labels[]={"__label__fa","__label__en","__label__de","__label__ar"};
+
+    for(size_t k=0;k<sizeof cases/sizeof cases[0];k++){
+        unsigned char buf[65536];size_t n=0;
+        int dim=16;
+        /* header */
+        #define PUTI32(v) do{int32_t _v=(int32_t)(v);memcpy(buf+n,&_v,4);n+=4;}while(0)
+        #define PUTI64(v) do{int64_t _v=(int64_t)(v);memcpy(buf+n,&_v,8);n+=8;}while(0)
+        PUTI32(793712314);PUTI32(12);
+        int32_t args[12]={dim,5,5,1,5,1,2,3,0,0,0,100};
+        for(int i=0;i<12;i++)PUTI32(args[i]);
+        {double t=0.0001;memcpy(buf+n,&t,8);n+=8;}
+        int nwords=8,nlabels=cases[k].nlabels,total=nwords+nlabels;
+        PUTI32(total);PUTI32(nwords);PUTI32(nlabels);PUTI64(1000);PUTI64(-1);
+        for(int i=0;i<nwords;i++){
+            size_t l=strlen(words[i]);memcpy(buf+n,words[i],l);n+=l;buf[n++]=0;
+            PUTI64(i+1);buf[n++]=0;                        /* entry_type::word */
+        }
+        for(int i=0;i<nlabels;i++){
+            size_t l=strlen(labels[i]);memcpy(buf+n,labels[i],l);n+=l;buf[n++]=0;
+            PUTI64(50);buf[n++]=1;                         /* entry_type::label */
+        }
+        buf[n++]=cases[k].quant?1:0;
+        if(cases[k].quant){
+            int codesize=total*((dim+1)/2);
+            buf[n++]=0;                                    /* qnorm = false: one BYTE */
+            PUTI32(total);PUTI32(dim);PUTI32(codesize);
+            memset(buf+n,0,(size_t)codesize);n+=(size_t)codesize;
+            PUTI32(dim);PUTI32(dim/2);PUTI32(2);PUTI32(dim%2?dim%2:2);
+            memset(buf+n,0,(size_t)dim*256*4);n+=(size_t)dim*256*4;
+        }else{
+            PUTI64(total);PUTI64(dim);
+            memset(buf+n,0,(size_t)total*dim*4);n+=(size_t)total*dim*4;
+        }
+        buf[n++]=0;                                        /* qout = false */
+        PUTI64(nlabels);PUTI64(dim);
+        memset(buf+n,0,(size_t)nlabels*dim*4);n+=(size_t)nlabels*dim*4;
+        #undef PUTI32
+        #undef PUTI64
+        if(cases[k].truncate_at) n=(size_t)cases[k].truncate_at;
+        char path[400];snprintf(path,sizeof path,"%s/%s",dir,cases[k].name);
+        CHECK_MSG(osa_file_write(path,buf,n),"fixture written: %s",cases[k].name);
+
+        const char *argv[]={exe,"--kind","lang","--model",path,NULL};
+        osa_error err;osa_err_ok(&err);
+        osa_process *p=osa_process_start(argv,&err);
+        CHECK_MSG(p!=NULL,"worker starts on %s: %s",cases[k].name,p?"ok":err.msg);
+        if(!p)continue;
+        char *line=NULL;
+        bool got=osa_process_line(p,60000,NULL,&line,&err);
+        CHECK_MSG(got,"the worker replies for %s",cases[k].name);
+        if(got&&line){
+            if(!cases[k].expect){
+                CHECK_MSG(strstr(line,"\"ok\":true")!=NULL&&strstr(line,"ready")!=NULL,
+                          "%s loads and reports ready: %s",cases[k].name,line);
+                CHECK_MSG(strstr(line,"fa")!=NULL,"%s exposes its language labels: %s",cases[k].name,line);
+            }else{
+                CHECK_MSG(strstr(line,"\"ok\":false")!=NULL,"%s is refused: %s",cases[k].name,line);
+                CHECK_MSG(strstr(line,cases[k].expect)!=NULL,
+                          "%s explains itself (wanted \"%s\"): %s",cases[k].name,cases[k].expect,line);
+                CHECK_MSG(strcmp(line,"vector")!=0&&strstr(line,"\"error\":\"vector\"")==NULL,
+                          "%s never reports a bare C++ exception name",cases[k].name);
+            }
+            free(line);
+        }
+        osa_process_stop(p);
+        remove(path);
+    }
+    char cmd[512];snprintf(cmd,sizeof cmd,"rmdir %s 2>/dev/null",dir);system(cmd);
+}
+
 static void test_portable_data_dir(void){
     suite("portable data folder + profile migration");
     const char *host="build/openspeech";
@@ -643,6 +747,7 @@ int main(void){
     test_activation_diagnostics();
     test_model_load_diagnostics();
     test_hash_cancel();
+    test_fasttext_language_model();
     test_portable_data_dir();
     test_optional_real_models();
     printf("\n%d passed, %d failed\n",g_pass,g_fail);

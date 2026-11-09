@@ -1082,8 +1082,14 @@ void shell_job_tick(shell_state*s){
         const char*raw=j->err.msg[0]?j->err.msg:tt(s->lang,"msg.cancelled");
         const char*hint=NULL;
         if(strstr(raw,"memory")||strstr(raw,"bad_alloc")||strstr(raw,"free RAM"))hint=tt(s->lang,"err.memory");
-        else if(strstr(raw,"cannot be opened")||strstr(raw,"cannot open")||strstr(raw,"missing"))hint=tt(s->lang,"err.modelfile");
-        else if(strstr(raw,"integrity")||strstr(raw,"wrong file format"))hint=tt(s->lang,"err.integrity");
+        else if(strstr(raw,"cannot be opened")||strstr(raw,"cannot open")||strstr(raw,"cannot read")||strstr(raw,"missing"))hint=tt(s->lang,"err.modelfile");
+        else if(strstr(raw,"integrity"))hint=tt(s->lang,"err.integrity");
+        /* The engine now names the real cause; give each kind the one action
+         * the user can take, in their own language. */
+        else if(strstr(raw,"not a GGUF")||strstr(raw,"not a fastText")||strstr(raw,"whisper (.bin)")||
+                strstr(raw,"not in a format")||strstr(raw,"wrong header"))hint=tt(s->lang,"err.format");
+        else if(strstr(raw,"truncated")||strstr(raw,"damaged")||strstr(raw,"corrupt")||strstr(raw,"ends inside"))hint=tt(s->lang,"err.damaged");
+        else if(strstr(raw,"fewer than two labels"))hint=tt(s->lang,"err.nolabels");
         const char *where=j->kind==SHELL_JOB_ACTIVATE?tt(s->lang,"models.loghint"):"";
         /* Put the engine's sentence and the log pointer on their own lines.
          * A single mixed RTL/LTR line could still be clipped by the toast's
