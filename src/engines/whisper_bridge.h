@@ -35,6 +35,26 @@ bool wsp_is_model_file(const char *path);
 bool wsp_transcribe(wsp_ctx *c, const float *pcm, int64_t n, const char *lang,
                     wsp_result *out, char *err, size_t cap);
 
+/* Language identification only: computes the mel spectrogram, asks whisper for
+ * the language, and returns without decoding any text. `wsp_transcribe` with a
+ * NULL language calls this itself, because whisper_full() stops after detection
+ * when detect_language is set and would return no words at all. */
+bool wsp_detect_language(wsp_ctx *c, const float *pcm, int64_t n, char *lang, size_t cap,
+                         float *prob);
+
+/* Load with an explicit thread count. File transcription wants a few threads
+ * (the UI still has to paint); live transcription uses what the machine has,
+ * because its latency is the delay the speaker hears. */
+wsp_ctx *wsp_load_ex(const char *path, int n_threads, char *err, size_t cap);
+void     wsp_set_threads(wsp_ctx *c, int n);
+int      wsp_threads(const wsp_ctx *c);
+
+/* Transcribe with a cap on the decoder's text context. 0 keeps whisper's 16k
+ * default, which is right for a whole file; a live partial pass wants a few
+ * hundred, because it decodes the same audio over and over. */
+bool wsp_transcribe_ex(wsp_ctx *c, const float *pcm, int64_t n, const char *lang,
+                       int max_tokens, wsp_result *out, char *err, size_t cap);
+
 /* Short name of the loaded model (its file name without extension). */
 const char *wsp_model_name(const wsp_ctx *c);
 

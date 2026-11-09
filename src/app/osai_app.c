@@ -128,6 +128,7 @@ struct osa_app {
     bool mt_loaded, lid_loaded;
     char models_dir[OSAI_MAX_PATH], audio_dir[OSAI_MAX_PATH];
     char last_language[8], lang_src[8], lang_dst[8];
+    int  worker_threads;
     mt_style style; volatile int cancel;
 };
 
@@ -166,7 +167,7 @@ static int free_ram_mb(void){
  * worker's own sentence: "model did not become ready" told the user nothing,
  * while the worker always reports why (bad file, unsupported GGUF, bad_alloc).
  * The attempt and the outcome are also appended to <data>/Logs/worker.log. */
-static osa_process *start_worker(const char*kind,const char*path,volatile int*cancel,osa_error*err){
+static osa_process *start_worker(osa_app*a,const char*kind,const char*path,volatile int*cancel,osa_error*err){
     char exe[OSAI_MAX_PATH];
     /* Say which precondition failed before a process is spawned. A worker that
      * cannot open its model exits with a generic sentence, and "the file is
@@ -179,7 +180,7 @@ static osa_process *start_worker(const char*kind,const char*path,volatile int*ca
         return NULL;
     }
     if(!osa_worker_path(exe,sizeof exe,err))return NULL;
-    char threads[8];snprintf(threads,sizeof threads,"%d",osa_clampi(osa_cpu_count()/2,1,8));
+    char threads[8];snprintf(threads,sizeof threads,"%d",osa_app_threads(a));
     const char*argv[]={exe,"--kind",kind,"--model",path,"--threads",threads,NULL};
     osa_worker_log_note("activate kind=%s threads=%s model=%s",kind,threads,path);
     osa_process*p=osa_process_start(argv,err);
@@ -213,7 +214,7 @@ static osa_process *start_worker(const char*kind,const char*path,volatile int*ca
     osa_worker_log_note("ready kind=%s",kind);
     return p;
 }
-static bool ensure_worker(osa_app*a,const char*kind,osa_error*err){osa_process**slot=osa_streq(kind,"mt")?&a->mt:&a->lid;const char*path=osa_streq(kind,"mt")?a->mt_path:a->lid_path;if(*slot)return true;if(!path[0]){osa_err_set(err,"activate the required %s model first",kind);return false;}*slot=start_worker(kind,path,&a->cancel,err);return *slot!=NULL;}
+static bool ensure_worker(osa_app*a,const char*kind,osa_error*err){osa_process**slot=osa_streq(kind,"mt")?&a->mt:&a->lid;const char*path=osa_streq(kind,"mt")?a->mt_path:a->lid_path;if(*slot)return true;if(!path[0]){osa_err_set(err,"activate the required %s model first",kind);return false;}*slot=start_worker(a,kind,path,&a->cancel,err);return *slot!=NULL;}
 
 /* Remove only legacy demo artifacts. User-downloaded GGUF/Whisper files and
  * history are never deleted by this migration. */
@@ -234,9 +235,14 @@ osa_app *osa_app_create(osa_error*err){
      if(md&&*md&&osa_dir_exists(md)){osa_strlcpy(a->models_dir,md,sizeof a->models_dir);
          size_t n=strlen(a->models_dir);if(n&&a->models_dir[n-1]!=OSAI_PATH_SEP[0]&&n+1<sizeof a->models_dir){a->models_dir[n]=OSAI_PATH_SEP[0];a->models_dir[n+1]=0;}}
      osa_arena_free(&ar2);}
-    lockd(a);osa_arena ar;osa_arena_init(&ar);char*s=osa_db_get_setting(a->db,"lang_src",&ar,"auto");char*d=osa_db_get_setting(a->db,"lang_dst",&ar,"fa");char*st=osa_db_get_setting(a->db,"mt_style",&ar,"0");osa_strlcpy(a->lang_src,s,sizeof a->lang_src);osa_strlcpy(a->lang_dst,d,sizeof a->lang_dst);a->style=(mt_style)osa_clampi(atoi(st),0,2);osa_arena_free(&ar);unlockd(a);return a;
+    lockd(a);osa_arena ar;osa_arena_init(&ar);char*s=osa_db_get_setting(a->db,"lang_src",&ar,"auto");char*d=osa_db_get_setting(a->db,"lang_dst",&ar,"fa");char*st=osa_db_get_setting(a->db,"mt_style",&ar,"0");osa_strlcpy(a->lang_src,s,sizeof a->lang_src);osa_strlcpy(a->lang_dst,d,sizeof a->lang_dst);a->style=(mt_style)osa_clampi(atoi(st),0,2);
+    /* Leave a core or two for the window, the OS and audio: using every core is
+     * what made the machine sit at 100% while translating. */
+    {int cores=osa_cpu_count();a->worker_threads=osa_clampi(cores>2?cores-1:cores,1,8);}osa_arena_free(&ar);unlockd(a);return a;
 }
 void osa_app_destroy(osa_app*a){if(!a)return;osa_atomic_inc(&a->cancel);osa_mutex_lock(&a->life_mu);locke(a);if(a->asr){wsp_free(a->asr);a->asr=NULL;}osa_process*mt=a->mt,*lid=a->lid;a->mt=a->lid=NULL;unlocke(a);osa_process_stop(mt);osa_process_stop(lid);lockd(a);osa_db_close(a->db);a->db=NULL;unlockd(a);osa_mutex_unlock(&a->life_mu);osa_mutex_destroy(&a->life_mu);osa_mutex_destroy(&a->engine_mu);osa_mutex_destroy(&a->db_mu);free(a);}
+void osa_app_set_threads(osa_app*a,int n){if(!a)return;locke(a);a->worker_threads=osa_clampi(n,1,16);if(a->asr)wsp_set_threads(a->asr,a->worker_threads);unlocke(a);}
+int  osa_app_threads(osa_app*a){if(!a)return 1;locke(a);int n=a->worker_threads;unlocke(a);return n>0?n:1;}
 void osa_app_cancel(osa_app*a){if(a)osa_atomic_inc(&a->cancel);} void osa_app_reset_cancel(osa_app*a){if(a)__sync_lock_test_and_set(&a->cancel,0);}
 bool osa_app_ready(osa_app*a){if(!a)return false;locke(a);bool ok=a->asr&&a->mt_loaded&&a->lid_loaded;unlocke(a);return ok;}
 bool osa_app_refresh(osa_app*a,osa_error*err){(void)a;osa_err_ok(err);return true;}
@@ -299,7 +305,7 @@ static bool activate(osa_app*a,const char*id,osa_error*err){
     osa_process_stop(old);
     int need=estimate_ram_mb(p),have=free_ram_mb();
     if(have>=0&&have<need/2)osa_worker_log_note("warning: ~%d MB free, this model needs ~%d MB",have,need);
-    osa_process*n=start_worker(m.kind,m.path,&a->cancel,err);
+    osa_process*n=start_worker(a,m.kind,m.path,&a->cancel,err);
     if(!n){
         if(have>=0&&have<need){
             char base[600];osa_strlcpy(base,err&&err->msg[0]?err->msg:"load failed",sizeof base);
@@ -486,7 +492,22 @@ void osa_app_set_style(osa_app*a,mt_style st){if(!a)return;st=(mt_style)osa_clam
 
 /* ---- real ASR ---- */
 const char*osa_app_last_language(const osa_app*a){return a?a->last_language:"";}
-static bool recognize(osa_app*a,const float*pcm,int64_t n,wsp_result*r,osa_error*err){if(!pcm||n<1600){osa_err_set(err,"not enough audio (at least 0.1 s)");return false;}locke(a);if(!a->asr){unlocke(a);osa_err_set(err,"download and activate a speech model first");return false;}char hint[8]={0};if(!osa_streq(a->lang_src,"auto"))osa_strlcpy(hint,a->lang_src,8);char e[512]={0};bool ok=wsp_transcribe(a->asr,pcm,n,hint,r,e,sizeof e);if(ok)osa_strlcpy(a->last_language,r->language,sizeof a->last_language);unlocke(a);if(!ok)osa_err_set(err,"%s",e);return ok;}
+static bool recognize_opt(osa_app*a,const float*pcm,int64_t n,bool live,osa_error*err,wsp_result*r){if(!pcm||n<1600){osa_err_set(err,"not enough audio (at least 0.1 s)");return false;}locke(a);if(!a->asr){unlocke(a);osa_err_set(err,"download and activate a speech model first");return false;}char hint[8]={0};if(!osa_streq(a->lang_src,"auto"))osa_strlcpy(hint,a->lang_src,8);char e[512]={0};
+    /* A live partial decodes the same sentence over and over, so it gets the
+     * whole machine and a small decoder context; a file pass keeps a core free
+     * for the window and whisper's own context size. */
+    int threads=wsp_threads(a->asr);
+    /* One recogniser is shared by file and live passes, so the thread count is
+     * set once, from the same budget. Live passes take the whole budget (their
+     * latency is what the speaker hears); a file pass leaves one core free so
+     * the window still paints. */
+    int budget=osa_app_threads(a);
+    wsp_set_threads(a->asr,live?budget:(budget>1?budget-1:1));
+    bool ok=wsp_transcribe_ex(a->asr,pcm,n,hint,live?256:0,r,e,sizeof e);
+    if(live)wsp_set_threads(a->asr,threads);
+    if(ok)osa_strlcpy(a->last_language,r->language,sizeof a->last_language);unlocke(a);if(!ok)osa_err_set(err,"%s",e);return ok;}
+static bool recognize(osa_app*a,const float*pcm,int64_t n,wsp_result*r,osa_error*err){return recognize_opt(a,pcm,n,false,err,r);}
+bool osa_app_recognize_live(osa_app*a,const float*s,int64_t n,bool partial,char*text,size_t tc,char*lang,size_t lc,float*conf,osa_error*err){if(!a)return false;wsp_result r;memset(&r,0,sizeof r);if(!recognize_opt(a,s,n,true,err,&r))return false;if(text&&tc){if(strlen(r.text)>=tc){osa_err_set(err,"recognition output buffer too small");return false;}osa_strlcpy(text,r.text,tc);}if(lang&&lc)osa_strlcpy(lang,r.language,lc);if(conf)*conf=r.confidence;(void)partial;return true;}
 static bool persist_transcript(osa_app*a,const wsp_result*r,double dur,double ms,const char*audio,osa_app_transcript*out,osa_error*err){memset(out,0,sizeof*out);osa_uuid(out->id);osa_strlcpy(out->text,r->text,sizeof out->text);osa_strlcpy(out->language,r->language,sizeof out->language);osa_strlcpy(out->model_id,a->asr_id,sizeof out->model_id);out->confidence=r->confidence;out->duration_s=dur;out->proc_ms=ms;out->rtf=dur>0?ms/(dur*1000):0;for(char*p=out->text;*p;){while(*p==' '||*p=='\n'||*p=='\t')p++;if(!*p)break;out->n_words++;while(*p&&*p!=' '&&*p!='\n'&&*p!='\t')p++;}osa_transcription t;memset(&t,0,sizeof t);osa_strlcpy(t.id,out->id,sizeof t.id);osa_strlcpy(t.audio_path,audio?audio:"",sizeof t.audio_path);osa_strlcpy(t.model_id,out->model_id,sizeof t.model_id);osa_strlcpy(t.language,out->language,sizeof t.language);osa_strlcpy(t.source,audio&&*audio?"file":"microphone",sizeof t.source);osa_strlcpy(t.text,out->text,sizeof t.text);osa_strlcpy(t.status,"done",sizeof t.status);t.confidence=r->confidence;t.duration_ms=(int64_t)(dur*1000);t.proc_ms=(int64_t)ms;osa_iso_time(osa_now_ms(),t.created_at);lockd(a);bool ok=osa_store_transcription_add(a->db,&t,err);unlockd(a);return ok;}
 bool osa_app_recognize(osa_app*a,const float*s,int64_t n,char*text,size_t tc,char*lang,size_t lc,float*conf,osa_error*err){if(!a)return false;wsp_result r;memset(&r,0,sizeof r);if(!recognize(a,s,n,&r,err))return false;if(text&&tc){if(strlen(r.text)>=tc){osa_err_set(err,"recognition output buffer too small");return false;}osa_strlcpy(text,r.text,tc);}if(lang&&lc)osa_strlcpy(lang,r.language,lc);if(conf)*conf=r.confidence;return true;}
 bool osa_app_transcribe_samples(osa_app*a,const float*s,int64_t n,osa_app_transcript*out,osa_error*err){if(!a||!out)return false;int64_t t=osa_now_us();wsp_result r;memset(&r,0,sizeof r);if(!recognize(a,s,n,&r,err))return false;return persist_transcript(a,&r,(double)n/OSAI_SR,(double)(osa_now_us()-t)/1000,"",out,err);}

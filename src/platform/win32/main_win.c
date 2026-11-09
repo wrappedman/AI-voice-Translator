@@ -35,6 +35,7 @@
 #include "../../app/osai_app.h"
 #include "../../core/osai_platform.h"
 #include "../../core/audio.h"
+#include "../../ui/ui_kit.h"
 #include "../../ui/canvas.h"
 #include "../../ui/shell.h"
 #include "../mic.h"
@@ -426,6 +427,21 @@ static LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             if (wp == VK_TAB) {
                 if (h->n_typed < (int)(sizeof h->typed / sizeof h->typed[0]))
                     h->typed[h->n_typed++] = 9;
+            }
+            /* Clipboard shortcuts. Only the window can read the system clipboard,
+             * so Ctrl+V is resolved here and handed to the focused text widget as
+             * a private-use scalar; Ctrl+C/X/A become requests the screen
+             * satisfies from the field it owns. */
+            if (GetKeyState(VK_CONTROL) & 0x8000) {
+                uint32_t marker = 0;
+                if (wp == 'V') marker = UI_KEY_PASTE;
+                else if (wp == 'C') marker = UI_KEY_COPY;
+                else if (wp == 'X') marker = UI_KEY_CUT;
+                else if (wp == 'A') marker = UI_KEY_SELECT_ALL;
+                if (marker && h->n_typed < (int)(sizeof h->typed / sizeof h->typed[0])) {
+                    h->typed[h->n_typed++] = marker;
+                    return 0;          /* never also reach WM_CHAR as text */
+                }
             }
             h->in.key = (int)wp;
             if (GetKeyState(VK_SHIFT) & 0x8000) h->in.shift = true;

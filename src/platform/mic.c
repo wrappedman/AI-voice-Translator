@@ -190,19 +190,106 @@ void osa_mic_close(osa_mic *m) {
 
 bool osa_mic_available(void) { return true; }
 
-#else /* ------------------------- headless stub ---------------------- */
+#else /* --------------------- file-backed playback ----------------------
+ *
+ * The headless build has no capture device, so it plays a stream from a file
+ * instead — and that is not a toy: it is how the live pipeline can be exercised
+ * on CI without a microphone. OSAI_MIC_FILE names a WAV; its samples are handed
+ * out in real time (as if a microphone were recording), then the stream ends.
+ * With OSAI_MIC_FILE unset capture is unavailable, exactly as before.
+ *
+ * This is what makes "does live endpointing work" testable end to end: the same
+ * code path the microphone drives can be driven by a known recording. */
+#include "../core/audio.h"
 
-struct osa_mic { int sr; int64_t total; float level; };
+struct osa_mic {
+    int      sr;
+    int64_t  total;
+    float    level;
+    float   *pcm;
+    int64_t  n, at;
+    int64_t  next_frame_ms;
+    int      clock_ms;
+};
+
+static osa_mic *mic_from_file(int sample_rate, osa_error *err) {
+    const char *path = getenv("OSAI_MIC_FILE");
+    if (!path || !*path) return NULL;
+    osa_audio au;
+    if (!osa_audio_load(path, &au, err)) return NULL;
+    osa_mic *m = (osa_mic *)calloc(1, sizeof *m);
+    if (!m) { osa_audio_free(&au); osa_err_set(err, "out of memory"); return NULL; }
+    m->sr = sample_rate > 0 ? sample_rate : OSAI_SR;
+    m->pcm = au.samples;
+    m->n = au.n;
+    au.samples = NULL;                       /* the mic owns it now */
+    osa_audio_free(&au);
+    m->next_frame_ms = 0;
+    osa_err_ok(err);
+    return m;
+}
 
 osa_mic *osa_mic_open(int sample_rate, osa_error *err) {
-    (void)sample_rate;
-    osa_err_set(err, "microphone capture is not available on this platform");
+    osa_mic *m = mic_from_file(sample_rate, err);
+    if (m) return m;
+    osa_err_set(err, "microphone capture is not available on this platform "
+                     "(set OSAI_MIC_FILE to a WAV to drive live capture from a file)");
     return NULL;
 }
-int   osa_mic_read(osa_mic *m, float *out, int max) { (void)m; (void)out; (void)max; return 0; }
-float osa_mic_level(osa_mic *m) { return m ? m->level : 0.0f; }
+
+int osa_mic_read(osa_mic *m, float *out, int max) {
+    if (!m || !out || max <= 0 || !m->pcm) return 0;
+    /* OSAI_MIC_FAST hands the audio out as fast as it is asked for. Real-time
+     * pacing is what a microphone does and what the live screen expects, but a
+     * test that checks endpointing should not have to sleep through the clip. */
+    if (getenv("OSAI_MIC_FAST") && *getenv("OSAI_MIC_FAST")) {
+        int want = max;
+        int64_t left = m->n - m->at;
+        if (left <= 0) return 0;
+        if (want > left) want = (int)left;
+        memcpy(out, m->pcm + m->at, (size_t)want * sizeof(float));
+        m->at += want;
+        m->total += want;
+        return want;
+    }
+    /* Release samples on a wall clock, so the consumer sees the same pacing a
+     * real device would produce. The clock starts at the first read. */
+    int64_t now = osa_now_ms();
+    if (m->clock_ms == 0) { m->clock_ms = 1; m->next_frame_ms = now; m->total = 0; }
+    if (now < m->next_frame_ms) {
+        int wait = (int)(m->next_frame_ms - now);
+        osa_sleep_ms(wait > 20 ? 20 : wait);
+        now = osa_now_ms();
+        if (now < m->next_frame_ms) return 0;
+    }
+    int want = max;
+    int64_t left = m->n - m->at;
+    if (left <= 0) return 0;
+    if (want > left) want = (int)left;
+    for (int i = 0; i < want; i++) {
+        float v = m->pcm[m->at + i];
+        out[i] = v;
+        float a = v < 0 ? -v : v;
+        if (a > m->level) m->level = a;
+    }
+    m->at += want;
+    m->total += want;
+    /* advance the clock by the audio handed out, in 20 ms slices */
+    m->next_frame_ms += (int64_t)((double)want * 1000.0 / m->sr);
+    return want;
+}
+
+float osa_mic_level(osa_mic *m) {
+    if (!m) return 0.0f;
+    float lv = m->level;
+    m->level *= 0.85f;
+    return lv;
+}
 int64_t osa_mic_total(const osa_mic *m) { return m ? m->total : 0; }
-void  osa_mic_close(osa_mic *m) { free(m); }
-bool  osa_mic_available(void) { return false; }
+void osa_mic_close(osa_mic *m) { if (!m) return; free(m->pcm); free(m); }
+bool osa_mic_available(void) {
+    const char *p = getenv("OSAI_MIC_FILE");
+    return p && *p;
+}
 
 #endif

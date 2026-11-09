@@ -221,7 +221,7 @@ win: $(WIN_BIN) $(WORKER_WIN)
 
 $(BUILD)/win/%.o: %.c
 	@mkdir -p $(dir $@)
-	$(WIN_CC) -std=c11 $(INCLUDES) -DOSAI_WIN_MEDIA_FOUNDATION -c $< -o $@
+	$(WIN_CC) -std=c11 $(INCLUDES) -DOSAI_WIN_MEDIA_FOUNDATION -DOSAI_WIN_SAPI -c $< -o $@
 
 $(BUILD)/win/sqlite3.o: $(SRC)/third_party/sqlite/sqlite3.c
 	@mkdir -p $(dir $@)

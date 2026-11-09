@@ -8,6 +8,7 @@
  *  triggered the action of the panel behind it.
  * ===================================================================== */
 #include "ui_kit.h"
+#include "../core/osai_platform.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -168,6 +169,7 @@ bool ui_init(ui_context *u, osa_canvas *c) {
     u->L.win_h = c->h;
     u->next_id = 1;
     u->focus_id = 0;
+    u->copy_request = 0;
     u->popup_id = 0;
     return true;
 }
@@ -842,6 +844,34 @@ static bool text_input_apply(ui_context *u, char *buf, size_t cap, bool multilin
                 continue;
             }
         } else if (cp == 9 || cp == 27 || cp < 32) {
+            continue;
+        } else if (cp >= 0xE000 && cp <= 0xF8FF) {
+            /* Private-use markers the platform layer raises for the clipboard
+             * shortcuts (see ui_kit.h): they never become text themselves. */
+            if (cp == UI_KEY_PASTE) {
+                osa_arena ar;
+                osa_arena_init(&ar);
+                const char *clip = osa_clipboard_get(&ar);
+                if (clip && *clip) {
+                    size_t cl = strlen(clip);
+                    if (n + cl + 1 < cap) {
+                        memcpy(buf + n, clip, cl);
+                        n += cl;
+                        buf[n] = 0;
+                        changed = true;
+                    }
+                }
+                osa_arena_free(&ar);
+            } else if (cp == UI_KEY_COPY) {
+                u->copy_request = 1;
+            } else if (cp == UI_KEY_CUT) {
+                u->copy_request = 1;
+                buf[0] = 0;
+                n = 0;
+                changed = true;
+            } else if (cp == UI_KEY_SELECT_ALL) {
+                u->copy_request = 1;      /* the caller copies the whole field */
+            }
             continue;
         } else {
             char tmp[4];

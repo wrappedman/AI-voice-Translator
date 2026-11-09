@@ -110,6 +110,10 @@ static float noise_sample(uint32_t *st) {
     return (float)((int32_t)x) / 2147483648.0f;
 }
 
+/* Per-phoneme level equalisation (see synth_phoneme). Off for the
+ * lexicon-driven pronunciation, which already has natural balance. */
+static bool synth_equalise = false;
+
 typedef struct synth {
     int     sr;
     float  *out;
@@ -150,6 +154,7 @@ static void synth_push(synth *s, float v) {
 static void synth_phoneme(synth *s, const phoneme *ph, float stretch) {
     int nsamp = (int)(ph->dur_ms * stretch * (float)s->sr / 1000.0f);
     if (nsamp < 8) nsamp = 8;
+    const int64_t seg_start = s->n;
     /* glide formants from the previous target */
     float f1 = s->prev_f1, f2 = s->prev_f2, f3 = s->prev_f3;
     for (int i = 0; i < nsamp; i++) {
@@ -188,6 +193,30 @@ static void synth_phoneme(synth *s, const phoneme *ph, float stretch) {
         synth_push(s, y * env * 0.9f);
     }
     s->prev_f1 = ph->f1; s->prev_f2 = ph->f2; s->prev_f3 = ph->f3;
+
+    /* Equalise this phoneme against its neighbours.
+     *
+     * A two-pole cascade is extremely uneven in level: a vowel whose first
+     * formant is low resonates far more than a high one, so a spelled word came
+     * out with two loud letters and three inaudible ones. Normalising the clip
+     * as a whole then made the quiet letters disappear. Correcting each phoneme
+     * towards the same RMS, with the correction bounded to ±14 dB, keeps the
+     * natural relative loudness of vowels and consonants while making every
+     * letter audible. */
+    if (synth_equalise) {
+        double acc = 0.0;
+        int64_t n = s->n - seg_start;
+        if (n > 0) {
+            for (int64_t i = seg_start; i < s->n; i++) acc += (double)s->out[i] * (double)s->out[i];
+            float rms = (float)sqrt(acc / (double)n);
+            if (rms > 1e-6f) {
+                float g = 0.05f / rms;
+                if (g < 0.20f) g = 0.20f;
+                if (g > 5.0f) g = 5.0f;
+                for (int64_t i = seg_start; i < s->n; i++) s->out[i] *= g;
+            }
+        }
+    }
 }
 
 static void synth_silence(synth *s, int ms) {
@@ -274,6 +303,82 @@ static const char *tts_next_word(const char **cursor) {
     return start;
 }
 
+/* A word the builtin lexicon does not know.
+ *
+ * The old fallback pronounced the first four *characters* and stopped, which is
+ * what made the "listen" button sound like growling: "hello" became "h-e-l-l"
+ * and every Persian word became a run of bare consonants, because Persian is
+ * written without short vowels. Spelling letter-by-letter can never be pleasant,
+ * but it can at least be recognisable, so:
+ *
+ *   - Latin words are spelled with the English letter *names* ("h" = "aitch",
+ *     "w" = "double-u"), which is how the letters are actually said;
+ *   - every consonant gets a short support vowel, so two letters never collide
+ *     into one buzz;
+ *   - a word over four letters is spelled in groups ("hel-lo"), with a falling
+ *     pitch, instead of being cut off after four letters;
+ *   - punctuation inserts a pause instead of being skipped silently.
+ *
+ * When Windows voices are present this path is never reached at all: it is the
+ * fallback for a machine that has none. */
+typedef struct letter_name { const char *sym, *spoken; } letter_name;
+static const letter_name LETTERS[] = {
+    {"a", "ay"},   {"b", "bee"},  {"c", "see"},  {"d", "dee"}, {"e", "ee"},
+    {"f", "ef"},   {"g", "jee"},  {"h", "aitch"},{"i", "ay"},  {"j", "jay"},
+    {"k", "kay"},  {"l", "el"},   {"m", "em"},   {"n", "en"},  {"o", "oh"},
+    {"p", "pee"},  {"q", "kyu"},  {"r", "ar"},   {"s", "es"},  {"t", "tee"},
+    {"u", "yu"},   {"v", "vee"},  {"w", "dabl-yu"}, {"x", "eks"}, {"y", "wy"},
+    {"z", "zee"},
+};
+
+static const char *letter_name_for(char c) {
+    if (c >= 'A' && c <= 'Z') c = (char)(c - 'A' + 'a');
+    for (int i = 0; i < (int)(sizeof LETTERS / sizeof LETTERS[0]); i++)
+        if (LETTERS[i].sym[0] == c && LETTERS[i].sym[1] == 0) return LETTERS[i].spoken;
+    return NULL;
+}
+
+/* Says one romanised syllable: known digraphs first, then single phonemes. */
+static void say_code(synth *s, const char *code, float stretch) {
+    if (!code) return;
+    const char *p = code;
+    while (*p) {
+        const phoneme *ph = parse_next(&p);
+        if (ph) synth_phoneme(s, ph, stretch);
+    }
+}
+
+static void spell_word(synth *s, const char *word) {
+    /* ASCII letters only: the letter names are English. */
+    char cleaned[64];
+    int n = 0;
+    for (const char *c = word; *c && n < (int)sizeof cleaned - 1; c++) {
+        if ((*c >= 'a' && *c <= 'z') || (*c >= 'A' && *c <= 'Z')) cleaned[n++] = *c;
+    }
+    cleaned[n] = 0;
+    if (n == 0) {
+        /* Persian (or any non-Latin) word with no lexicon entry. Saying nothing
+         * is worse than saying a neutral placeholder, and inventing phonemes
+         * from raw UTF-8 bytes is worse than both: those bytes include 0xD8 and
+         * friends, which parse_next() would turn into noise. */
+        synth_silence(s, 90);
+        return;
+    }
+    synth_equalise = true;
+    /* Spell in groups of four letters: a whole long word spelled out is
+     * unlistenable, and groups give the ear a place to breathe. */
+    for (int i = 0; i < n; i += 4) {
+        int end = i + 4 < n ? i + 4 : n;
+        for (int j = i; j < end; j++) {
+            const char *name = letter_name_for(cleaned[j]);
+            if (name) say_code(s, name, 0.85f);
+            else { char ch[2] = { cleaned[j], 0 }; say_code(s, ch, 0.8f); }
+            synth_silence(s, 18);
+        }
+        synth_silence(s, i + 4 < n ? 45 : 30);
+    }
+}
+
 float *tts_speak(const char *text, const char *lang, int64_t *n_out) {
     if (n_out) *n_out = 0;
     if (!text) return NULL;
@@ -298,14 +403,7 @@ float *tts_speak(const char *text, const char *lang, int64_t *n_out) {
             }
             synth_silence(s, 70);
         } else {
-            /* unknown word: spell it out from its romanized letters */
-            int wrote = 0;
-            for (const char *c = code ? code : word; *c && wrote < 4; c++) {
-                char ch[2] = { *c, 0 };
-                const phoneme *ph = find_ph(ch, 1);
-                if (ph) { synth_phoneme(s, ph, 0.8f); wrote++; synth_silence(s, 25); }
-            }
-            synth_silence(s, 50);
+            spell_word(s, word);
         }
     }
     /* Nothing was spoken: return no audio at all rather than a pad of silence,
@@ -315,10 +413,22 @@ float *tts_speak(const char *text, const char *lang, int64_t *n_out) {
         return NULL;
     }
     synth_silence(s, 80);
+    /* Level. Normalising on the peak alone made every clip almost inaudible:
+     * the formant cascade is quiet by nature, so the single loudest click set
+     * the gain and the rest of the sentence sat at a few percent — which is what
+     * "only a faint growl" sounds like. Scale to a target RMS (speech is
+     * around -20 dBFS RMS) and then only clamp if the peak would clip. */
+    double acc = 0.0;
     float peak = 0;
-    for (int64_t i = 0; i < s->n; i++) if (fabsf(s->out[i]) > peak) peak = fabsf(s->out[i]);
-    if (peak > 1e-6f) {
-        float g = 0.20f / peak;
+    for (int64_t i = 0; i < s->n; i++) {
+        float a = fabsf(s->out[i]);
+        acc += (double)s->out[i] * (double)s->out[i];
+        if (a > peak) peak = a;
+    }
+    float rms = s->n ? (float)sqrt(acc / (double)s->n) : 0.0f;
+    if (rms > 1e-6f) {
+        float g = 0.10f / rms;                   /* ~-20 dBFS */
+        if (peak * g > 0.95f) g = 0.95f / peak;  /* never clip */
         for (int64_t i = 0; i < s->n; i++) s->out[i] *= g;
     }
     float *out = s->out;

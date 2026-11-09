@@ -1194,7 +1194,31 @@ void osa_audio_stop(void) {
     g_playing = false;
 }
 
+/* The headless build has no window system of its own, but it can still talk to
+ * the X11 or Wayland clipboard through the standard command-line tools. That is
+ * what lets the copy/paste behaviour be tested on this machine instead of only on
+ * a Windows desktop, and it makes the Linux build behave like the Windows one
+ * instead of silently dropping the text. */
+/* On X11 the clipboard is owned by a live window, so a helper program has to stay
+ * running to serve it. `xclip -selection clipboard` does exactly that; without any
+ * helper installed, the clipboard is genuinely unavailable on this machine and we
+ * say so rather than reporting a copy that did not happen. */
+static bool clipboard_have(const char *tool) {
+    char cmd[128];
+    snprintf(cmd, sizeof cmd, "command -v %s >/dev/null 2>&1", tool);
+    return system(cmd) == 0;
+}
+
+static bool clipboard_set_pipe(const char *cmd, const char *utf8) {
+    FILE *p = popen(cmd, "w");
+    if (!p) return false;
+    size_t n = strlen(utf8);
+    bool ok = n == 0 || fwrite(utf8, 1, n, p) == n;
+    return pclose(p) == 0 && ok;
+}
+
 bool osa_clipboard_set(const char *utf8) {
+    if (!utf8) utf8 = "";
 #ifdef _WIN32
     if (!OpenClipboard(NULL)) return false;
     EmptyClipboard();
@@ -1211,7 +1235,15 @@ bool osa_clipboard_set(const char *utf8) {
     CloseClipboard();
     return ok;
 #else
-    (void)utf8;
+    /* Prefer whichever of these the desktop actually has; the first success
+     * wins. Without any of them the clipboard is simply unavailable, which the
+     * caller reports rather than pretending the copy worked. */
+    if (getenv("WAYLAND_DISPLAY") && clipboard_have("wl-copy") &&
+        clipboard_set_pipe("wl-copy 2>/dev/null", utf8)) return true;
+    if (clipboard_have("xclip") &&
+        clipboard_set_pipe("xclip -selection clipboard 2>/dev/null", utf8)) return true;
+    if (clipboard_have("xsel") &&
+        clipboard_set_pipe("xsel --clipboard --input 2>/dev/null", utf8)) return true;
     return false;
 #endif
 }
@@ -1237,7 +1269,23 @@ char *osa_clipboard_get(osa_arena *a) {
     CloseClipboard();
     return out;
 #else
-    (void)a;
+    static const struct { const char *tool, *cmd; } readers[] = {
+        {"wl-paste", "wl-paste --no-newline 2>/dev/null"},
+        {"xclip",    "xclip -selection clipboard -o 2>/dev/null"},
+        {"xsel",     "xsel --clipboard --output 2>/dev/null"},
+    };
+    for (int i = 0; i < 3; i++) {
+        if (!clipboard_have(readers[i].tool)) continue;
+        FILE *p = popen(readers[i].cmd, "r");
+        if (!p) continue;
+        char buf[8192];
+        size_t got = fread(buf, 1, sizeof buf - 1, p);
+        int rc = pclose(p);
+        if (rc == 0 && got > 0) {
+            buf[got] = 0;
+            return osa_arena_strdup(a, buf);
+        }
+    }
     return NULL;
 #endif
 }

@@ -17,6 +17,10 @@
 #include "osai_common.h"
 #include "osai_platform.h"
 #include "osai_process.h"
+#include "live_endpoint.h"
+#include "tts.h"
+#include "tts_sapi.h"
+#include "mic.h"
 #include "osai_store.h"
 #include "osai_app.h"
 #include "audio.h"
@@ -656,6 +660,297 @@ static void test_fasttext_language_model(void){
     char cmd[512];snprintf(cmd,sizeof cmd,"rmdir %s 2>/dev/null",dir);system(cmd);
 }
 
+/* The live screen's endpoint: speech start, hangover, noise-floor tracking and
+ * the forced cut. Driven by dBFS frames, so these run in microseconds and cover
+ * the parts that used to make live capture feel broken: a segment that never
+ * closed while the speaker paused, and one that grew without bound. */
+static void test_live_endpoint(void){
+    suite("live endpointing (speech boundaries)");
+    live_ep_params p;
+    live_ep_defaults(&p);
+    CHECK(p.frame_s>0.0f && p.hangover_s>0.2f && p.max_segment_s>1.0f);
+
+    /* A quiet room is silence: nothing starts, however many frames pass. */
+    live_ep e;
+    live_ep_init(&e,&p);
+    bool quiet_still=true;
+    for(int i=0;i<300;i++) if(live_ep_frame(&e,-62.0f)!=LIVE_EP_NONE) quiet_still=false;
+    CHECK_MSG(quiet_still,"300 frames of a quiet room produce no event");
+    CHECK(!e.in_segment);
+    CHECK_MSG(live_ep_floor_db(&e)>-75.0f,"the noise floor is learned, not -inf: %.1f",live_ep_floor_db(&e));
+
+    /* Speech starts a segment after min_speech_s, and reports it. */
+    int events=0;
+    for(int i=0;i<40 && !events;i++) events|=live_ep_frame(&e,-30.0f);
+    CHECK_MSG(events==LIVE_EP_SPEECH_START,"speech reports a start: %d",events);
+    CHECK(e.in_segment);
+
+    /* While the speaker keeps talking, the segment stays open. */
+    bool no_flapping=true;
+    for(int i=0;i<100;i++) if(live_ep_frame(&e,-30.0f)!=LIVE_EP_NONE) no_flapping=false;
+    CHECK_MSG(no_flapping,"sustained speech does not re-trigger the start event");
+    CHECK(e.in_segment);
+
+    /* A pause shorter than the hangover does not end the sentence. */
+    int n=p.hangover_s/p.frame_s/2;
+    for(int i=0;i<n;i++) live_ep_frame(&e,-64.0f);
+    CHECK_MSG(e.in_segment,"a brief pause keeps the segment open (%d frames)",n);
+
+    /* A pause longer than the hangover closes it exactly once. */
+    events=0;int frames=0;
+    while(frames<(int)(p.hangover_s/p.frame_s)+6){
+        int ev=live_ep_frame(&e,-64.0f);
+        if(ev==LIVE_EP_SEGMENT_READY){events++;break;}
+        frames++;
+    }
+    CHECK_MSG(events==1,"the hangover closes the segment: events=%d frames=%d",events,frames);
+    CHECK(!e.in_segment);
+    /* and the next sentence starts a new segment after real speech again */
+    events=0;
+    for(int i=0;i<40 && !events;i++) events|=live_ep_frame(&e,-30.0f);
+    CHECK_MSG(events==LIVE_EP_SPEECH_START,"a second sentence starts a new segment: %d",events);
+
+    /* A click (too short to be speech) never opens a segment. */
+    live_ep_init(&e,&p);
+    for(int i=0;i<200;i++) live_ep_frame(&e,-64.0f);
+    for(int i=0;i<2;i++) live_ep_frame(&e,-10.0f);
+    for(int i=0;i<100;i++) live_ep_frame(&e,-64.0f);
+    CHECK_MSG(!e.in_segment,"a two-frame click does not start a segment");
+    CHECK(e.events==0);
+
+    /* A segment that never pauses is cut at max_segment_s instead of growing. */
+    live_ep_init(&e,&p);
+    for(int i=0;i<100;i++) live_ep_frame(&e,-64.0f);      /* learn the room first */
+    events=0;
+    for(int i=0;i<(int)((p.max_segment_s+1.0f)/p.frame_s);i++){
+        int ev=live_ep_frame(&e,-30.0f);
+        if(ev==LIVE_EP_SEGMENT_READY){events++;break;}
+    }
+    CHECK_MSG(events==1,"an endless sentence is cut, not grown forever: %d",events);
+
+    /* The floor must not climb into speech: a floor that followed the voice
+     * would go deaf after a few seconds and never close a segment. This is the
+     * failure that made live capture "stop after the first sentence". */
+    live_ep_init(&e,&p);
+    for(int i=0;i<200;i++) live_ep_frame(&e,-64.0f);   /* learn a quiet room */
+    float floor_quiet=live_ep_floor_db(&e);
+    for(int i=0;i<400;i++) live_ep_frame(&e,-28.0f);   /* 8 s of speech      */
+    float floor_speech=live_ep_floor_db(&e);
+    CHECK_MSG(floor_speech<floor_quiet+6.0f,
+              "8 s of speech does not drag the floor into the voice (%.1f -> %.1f)",
+              floor_quiet,floor_speech);
+    events=0;
+    for(int i=0;i<(int)(p.hangover_s/p.frame_s)+8;i++){
+        int ev=live_ep_frame(&e,-64.0f);
+        if(ev==LIVE_EP_SEGMENT_READY){events++;break;}
+    }
+    CHECK_MSG(events==1,"after a long stretch of speech the pause still closes it: %d",events);
+
+    /* Cold start: the user is already talking when capture begins. That opening
+     * word must be heard — the first frame is not the room. */
+    live_ep_init(&e,&p);
+    events=0;
+    for(int i=0;i<40 && !events;i++) events|=live_ep_frame(&e,-22.0f);
+    CHECK_MSG(events==LIVE_EP_SPEECH_START,"speech on the very first frame is heard: %d",events);
+
+    /* The floor does follow a quieter room, so a hiss that stops does not leave
+     * the threshold stuck above the speech that follows. */
+    live_ep_init(&e,&p);
+    for(int i=0;i<200;i++) live_ep_frame(&e,-30.0f);   /* a noisy room       */
+    float floor_noisy=live_ep_floor_db(&e);
+    for(int i=0;i<200;i++) live_ep_frame(&e,-60.0f);   /* the noise stops    */
+    float floor_after=live_ep_floor_db(&e);
+    CHECK_MSG(floor_after<floor_noisy-3.0f,
+              "the floor follows a room that gets quieter (%.1f -> %.1f)",floor_noisy,floor_after);
+
+    /* The forced cut lands on the quietest recent frame, not in the middle. */
+    float db[100];
+    for(int i=0;i<100;i++) db[i]=-30.0f;
+    db[88]=-61.0f;                                        /* a pause at 1.76 s */
+    float cut=live_ep_cut_point(db,100,0,&p);
+    CHECK_MSG(cut>1.74f&&cut<1.80f,"the cut goes to the pause at 1.76 s: %.2f",cut);
+}
+
+/* The CPU budget. A translation used to start its worker with "cores/2" and the
+ * recogniser with every core, which is why the machine sat at 100% while
+ * translating. There is now one number, it is never the whole machine by
+ * default, and Settings can change it. */
+static void test_thread_budget(void){
+    suite("CPU budget (threads)");
+    use_temp_root("threads");
+    osa_error err; osa_app *app=osa_app_create(&err);
+    CHECK_MSG(app!=NULL,"app create: %s",app?err.msg:"ok");
+    if(!app){clean_root();return;}
+    int cores=osa_cpu_count();
+    int def=osa_app_threads(app);
+    CHECK_MSG(def>=1,"the default budget is at least one thread (got %d)",def);
+    CHECK_MSG(def<=8,"the default budget never takes a small PC's everything (got %d of %d cores)",def,cores);
+    if(cores>2) CHECK_MSG(def<=cores-1,"one core is always left for the window (%d of %d)",def,cores);
+    osa_app_set_threads(app,3);
+    CHECK_MSG(osa_app_threads(app)==3,"the budget can be lowered (got %d)",osa_app_threads(app));
+    osa_app_set_threads(app,0);
+    CHECK_MSG(osa_app_threads(app)==1,"zero threads is clamped to one, never to zero");
+    osa_app_set_threads(app,999);
+    CHECK_MSG(osa_app_threads(app)==16,"the budget is capped at 16 (got %d)",osa_app_threads(app));
+    osa_app_destroy(app); clean_root();
+}
+
+/* The builtin synthesiser is the fallback for a machine with no system voices.
+ * It cannot pronounce an unknown word, but it must not answer with a growl or
+ * with near-silence: every letter has to be audible, nothing may be clipped, and
+ * the word has to be spelled out in full rather than cut off after four letters.
+ * (On Windows the installed system voices speak the sentence instead.) */
+static void test_speech_fallback(void){
+    suite("speech synthesis fallback");
+    const char *words[]={"hello","world","book","translation","xyz"};
+    for(int k=0;k<5;k++){
+        int64_t n=0;
+        float *pcm=tts_speak(words[k],"en",&n);
+        CHECK_MSG(pcm&&n>0,"\"%s\" produces audio: %d samples",words[k],(int)n);
+        if(!pcm)continue;
+        /* Per 30 ms window: how much of the word is actually audible, and is any
+         * of it clipping? A growl is a constant buzz; near-silence is the old
+         * peak-normalisation bug. */
+        int win=OSAI_SR/33, total=0, audible=0;
+        float peak=0;
+        for(int64_t i=0;i+win<=n;i+=win){
+            double a=0;
+            for(int j=0;j<win;j++){a+=(double)pcm[i+j]*pcm[i+j]; if(fabsf(pcm[i+j])>peak)peak=fabsf(pcm[i+j]);}
+            total++;
+            if(sqrt(a/win)>0.005)audible++;    /* ~-46 dBFS: above any hiss */
+        }
+        CHECK_MSG(total>0&&audible*10>=total*4,
+                  "\"%s\" is audible for most of its length: %d of %d windows above -46 dBFS",
+                  words[k],audible,total);
+        CHECK_MSG(peak<=0.99f,"\"%s\" never clips: peak=%.2f",words[k],peak);
+        /* Longer words are spelled in full: the clip grows with the word. */
+        if(osa_streq(words[k],"translation"))
+            CHECK_MSG((double)n/OSAI_SR>0.6,"a long word is spelled out, not cut short: %.2f s",(double)n/OSAI_SR);
+        free(pcm);
+    }
+    int64_t n=0;
+    float *pcm=tts_speak("سلام دنیا","fa",&n);
+    CHECK_MSG(pcm&&n>0,"Persian text with no lexicon entry still produces audio: %d samples",(int)n);
+    free(pcm);
+    n=0; pcm=tts_speak("","en",&n);
+    CHECK_MSG(pcm==NULL&&n==0,"empty text produces no clip at all");
+    free(pcm);
+}
+
+/* "Listen to the translation" had a path that produced a growl and another that
+ * produced near-silence. On a machine with system voices the sentence goes to
+ * them; without, the builtin synthesiser must still produce an audible, plausible
+ * clip. Which of the two happened is reported, not assumed. */
+static void test_speak_path(void){
+    suite("speak the translation (listen button)");
+    bool platform = osa_tts_platform_available();
+    printf("  note the platform speaks with: %s\n",
+           platform ? osa_tts_platform_name() : "the builtin synthesiser (no system voices)");
+    /* Whatever the backend, the user must never get silence without a message:
+     * either the backend accepts the sentence, or the fallback clip exists. */
+    /* .wav on the end: osa_audio_load picks the decoder from the extension. */
+    char wav[300];
+    snprintf(wav,sizeof wav,"/tmp/osai-speak-%d.wav",(int)getpid());
+    bool clipped = tts_speak_to_wav("از آشنایی با شما خوشحالم","fa",wav);
+    CHECK_MSG(clipped,"the fallback writes a WAV even for Persian text");
+    osa_audio au;
+    if(osa_audio_load(wav,&au,NULL)){
+        double secs=osa_audio_duration_s(&au);
+        CHECK_MSG(secs>0.2&&secs<30.0,"the spoken clip has a plausible length: %.2f s",secs);
+        double acc=0;
+        for(int64_t i=0;i<au.n;i++) acc+=(double)au.samples[i]*au.samples[i];
+        double rms=au.n?sqrt(acc/(double)au.n):0;
+        CHECK_MSG(rms>0.003,"the spoken clip is audible, not a hiss: rms=%.4f",rms);
+        osa_audio_free(&au);
+    } else CHECK_MSG(false,"the spoken clip is a readable WAV");
+    remove(wav);
+    if(platform){
+        CHECK_MSG(osa_tts_platform_speak("Hello","en"),"the platform voice accepts a sentence");
+    } else {
+        printf("  note platform voices absent here: the fallback clip above is what a user would hear\n");
+    }
+}
+
+/* Capture -> endpoint, end to end, with a real WAV and the real microphone API.
+ * The headless build plays a file instead of a device (OSAI_MIC_FILE), which is
+ * how this path can be tested without a microphone: three spoken bursts
+ * separated by pauses must be reported as three sentences, not one. */
+static bool make_burst_wav(const char *path, double *burst_starts, int *n_bursts){
+    const double bursts[] = {1.5, 1.2, 0.9};
+    const double pause = 1.2;
+    int64_t total = 0;
+    for (int i = 0; i < 3; i++) total += (int64_t)((bursts[i] + pause) * OSAI_SR);
+    float *pcm = (float *)calloc((size_t)total, sizeof(float));
+    if (!pcm) return false;
+    int64_t at = 0;
+    for (int i = 0; i < 3; i++) {
+        burst_starts[i] = (double)at / OSAI_SR;
+        int64_t n = (int64_t)(bursts[i] * OSAI_SR);
+        for (int64_t k = 0; k < n; k++) {
+            double t = (double)k / OSAI_SR;
+            double env = 1.0;
+            if (t < 0.02) env = t / 0.02;
+            if (t > bursts[i] - 0.02) env = (bursts[i] - t) / 0.02;
+            pcm[at + k] = (float)(0.25 * env * sin(2.0 * 3.14159265358979 * 220.0 * t));
+        }
+        at += n + (int64_t)(pause * OSAI_SR);
+    }
+    bool ok = osa_audio_save_wav(path, pcm, total, OSAI_SR);
+    free(pcm);
+    *n_bursts = 3;
+    return ok;
+}
+
+static void test_live_capture_pipeline(void){
+    suite("live capture -> endpoint (real microphone API, file-backed)");
+    char wav[300];
+    snprintf(wav, sizeof wav, "/tmp/osai-mic-%d.wav", (int)getpid());
+    double starts[3];
+    int nb = 0;
+    if (!make_burst_wav(wav, starts, &nb)) { CHECK_MSG(false, "could not write the test WAV"); return; }
+
+    setenv("OSAI_MIC_FILE", wav, 1);
+    setenv("OSAI_MIC_FAST", "1", 1);
+    CHECK_MSG(osa_mic_available(), "capture reports available when a file is configured");
+
+    osa_error err;
+    osa_err_ok(&err);
+    osa_mic *mic = osa_mic_open(OSAI_SR, &err);
+    CHECK_MSG(mic != NULL, "the capture device opens: %s", mic ? "ok" : err.msg);
+    if (!mic) { remove(wav); return; }
+
+    live_ep ep;
+    live_ep_init(&ep, NULL);
+    int starts_seen = 0, segments = 0;
+    float buf[1600];
+    int reads = 0;
+    int n;
+    /* Feed the endpoint exactly the way shell_live_tick does: 20 ms frames
+     * carved out of whatever the device hands us. */
+    static float acc[64 * 1024];
+    int n_acc = 0;
+    while ((n = osa_mic_read(mic, buf, 1600)) > 0 && reads < 20000) {
+        reads++;
+        for (int i = 0; i < n; i++) {
+            if (n_acc < (int)(sizeof acc / sizeof acc[0])) acc[n_acc++] = buf[i];
+            if (n_acc >= OSAI_SR / 50) {
+                int ev = live_ep_frame(&ep, live_ep_db(acc, OSAI_SR / 50));
+                if (ev == LIVE_EP_SPEECH_START) starts_seen++;
+                else if (ev == LIVE_EP_SEGMENT_READY) segments++;
+                n_acc = 0;
+            }
+        }
+    }
+    osa_mic_close(mic);
+    printf("  note %d reads, %d sentences started, %d closed\n", reads, starts_seen, segments);
+    CHECK_MSG(starts_seen >= 3, "every spoken burst is detected as speech (%d)", starts_seen);
+    CHECK_MSG(segments >= 3, "every pause closes a sentence (%d)", segments);
+
+    unsetenv("OSAI_MIC_FILE");
+    unsetenv("OSAI_MIC_FAST");
+    remove(wav);
+}
+
 static void test_portable_data_dir(void){
     suite("portable data folder + profile migration");
     const char *host="build/openspeech";
@@ -747,6 +1042,11 @@ int main(void){
     test_activation_diagnostics();
     test_model_load_diagnostics();
     test_hash_cancel();
+    test_live_endpoint();
+    test_thread_budget();
+    test_speech_fallback();
+    test_speak_path();
+    test_live_capture_pipeline();
     test_fasttext_language_model();
     test_portable_data_dir();
     test_optional_real_models();

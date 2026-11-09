@@ -301,6 +301,24 @@ int main(int argc, char **argv) {
     bool train = false;
 
     if (argc <= 1) { usage(); return 0; }
+
+    /* Clipboard plumbing, headless: the tests and the file-driven live session
+     * below need a real clipboard and a real text-input path, and both are
+     * reachable from the command line without a window. */
+    for (int i = 1; i < argc; i++) {
+        if (osa_streq(argv[i], "--clip-set") && i + 1 < argc) {
+            printf("%s\n", osa_clipboard_set(argv[i + 1]) ? "ok" : "unavailable");
+            return 0;
+        }
+        if (osa_streq(argv[i], "--clip-get")) {
+            osa_arena ar;
+            osa_arena_init(&ar);
+            const char *clip = osa_clipboard_get(&ar);
+            printf("%s\n", clip ? clip : "");
+            osa_arena_free(&ar);
+            return 0;
+        }
+    }
     for (int i = 1; i < argc; i++) {
         const char *a = argv[i];
         if (osa_streq(a, "--version")) { printf("OpenSpeech AI %s\n", OSAI_VERSION); return 0; }

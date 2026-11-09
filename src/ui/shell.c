@@ -16,6 +16,7 @@
  *  owns the state and the platform owns the window.
  * ===================================================================== */
 #include "shell_internal.h"
+#include "../core/tts_sapi.h"
 #include "../core/osai_platform.h"
 #include "../core/tts.h"
 #include <stdio.h>
@@ -82,9 +83,13 @@ void shell_load_prefs(shell_state *s) {
      * number, so using the host's core count would make the rendered snapshot
      * depend on the machine (2 cores here, 4 in CI, 16 on a workstation) and the
      * visual-regression job would fail on a difference that is not one. */
-    s->asr_threads = 4;
-    if (s->asr_threads < 1) s->asr_threads = 1;
-    if (s->asr_threads > 16) s->asr_threads = 16;
+    /* Default: leave one core for the window and the operating system. The old
+     * default of 4 was also not applied anywhere, so the workers sized
+     * themselves from the core count and a translation pinned every core. */
+    {
+        int cores = osa_cpu_count();
+        s->asr_threads = osa_clampi(cores > 2 ? cores - 1 : cores, 1, 8);
+    }
     osa_strlcpy(s->lang_src, "auto", sizeof s->lang_src);
     osa_strlcpy(s->lang_dst, "fa", sizeof s->lang_dst);
     s->style = MT_STYLE_NEUTRAL;
@@ -109,6 +114,7 @@ void shell_load_prefs(shell_state *s) {
             else if (osa_streq(key, "privacylogs")) s->privacy_logs = osa_starts(val, "1");
             else if (osa_streq(key, "phonetic")) s->show_phonetic = osa_starts(val, "1");
             else if (osa_streq(key, "threads")) s->asr_threads = atoi(val);
+            else if (osa_streq(key, "budget")) s->asr_threads = atoi(val);
             else if (osa_streq(key, "langsrc")) osa_strlcpy(s->lang_src, val, sizeof s->lang_src);
             else if (osa_streq(key, "langdst")) osa_strlcpy(s->lang_dst, val, sizeof s->lang_dst);
             else if (osa_streq(key, "style")) {
@@ -153,6 +159,9 @@ bool shell_init(shell_state *s, osa_app *app) {
     if (!s) return false;
     memset(s, 0, sizeof *s); s->app = app; s->screen = SCREEN_TRANSCRIBE; s->ds_sel = -1;
     shell_load_prefs(s);
+    /* The saved thread budget goes to the app before any worker starts: one
+     * place decides how many cores inference may use. */
+    osa_app_set_threads(s->app, s->asr_threads);
     shell_refresh_models_dir(s);
     osa_strlcpy(s->tr_in, "از آشنایی با شما خوشحالم", sizeof s->tr_in);
     s->restoring = true; s->working = true;
@@ -171,6 +180,15 @@ void shell_shutdown(shell_state *s) {
  * replaced: the UI never accumulates audio files without the user asking. */
 void shell_speak(shell_state *s, const char *text, const char *lang) {
     if (!s || !text || !*text) return;
+    /* Prefer the voices the operating system already has (Windows SAPI): they
+     * are offline and they speak the sentence in its own script. The builtin
+     * synthesiser is the fallback for a machine with no voices installed, and it
+     * cannot say anything outside its small lexicon — which is what the "only
+     * growling" report was. */
+    if (osa_tts_platform_speak(text, lang && *lang ? lang : "en")) {
+        shell_set_message(s, false, "%s", tt(s->lang, "msg.playing"));
+        return;
+    }
     int64_t n = 0;
     float *pcm = tts_speak(text, lang && *lang ? lang : "en", &n);
     if (!pcm || n <= 0) {
@@ -269,7 +287,13 @@ void shell_refresh_phonetic(shell_state *s) {
 bool shell_run_transcribe(shell_state *s) {
     if (!s || !s->audio_path[0]) { shell_set_message(s,true,"%s",tt(s->lang,"msg.nofile")); return false; }
     if (!s->models_ready) { shell_set_message(s,true,"%s",tt(s->lang,"models.required")); return false; }
-    return shell_start_job(s,SHELL_JOB_TRANSCRIBE,s->audio_path);
+    /* Say what is happening, and how long a whole-file pass normally takes:
+     * whisper decodes the file in one go, and a 3 GB model on a laptop can
+     * spend a minute on a short clip. Silence during that minute is what "it
+     * takes a long time and does nothing" feels like. */
+    if(!shell_start_job(s,SHELL_JOB_TRANSCRIBE,s->audio_path))return false;
+    shell_set_message(s,false,"%s",tt(s->lang,"transcribe.working"));
+    return true;
 }
 bool shell_select_audio(shell_state *s,const char *path){
     if(!s||!path||!*path)return false;
@@ -741,8 +765,8 @@ static void draw_result_pane(shell_state *s, ui_context *u, osa_rect r,
         osa_rect copy_r = rectf(u->L.rtl ? r.x + pad : r.x + r.w - pad - 54 * u->L.scale,
                                 r.y + 9 * u->L.scale, 54 * u->L.scale, 26 * u->L.scale);
         if (ui_button_ghost(u, id, copy_r, tt(s->lang, "btn.copy"))) {
-            osa_clipboard_set(text);
-            shell_set_message(s, false, "%s", tt(s->lang, "msg.copied"));
+            if (osa_clipboard_set(text)) shell_set_message(s, false, "%s", tt(s->lang, "msg.copied"));
+            else shell_set_message(s, true, "%s", tt(s->lang, "msg.clipfail"));
         }
     }
     c_hline(u->c, r.x + pad, r.x + r.w - pad, r.y + 44 * u->L.scale, 1, u->t.border_soft);
@@ -1090,6 +1114,7 @@ void shell_job_tick(shell_state*s){
                 strstr(raw,"not in a format")||strstr(raw,"wrong header"))hint=tt(s->lang,"err.format");
         else if(strstr(raw,"truncated")||strstr(raw,"damaged")||strstr(raw,"corrupt")||strstr(raw,"ends inside"))hint=tt(s->lang,"err.damaged");
         else if(strstr(raw,"fewer than two labels"))hint=tt(s->lang,"err.nolabels");
+        else if(strstr(raw,"no speech recognised"))hint=tt(s->lang,"err.nospeech");
         const char *where=j->kind==SHELL_JOB_ACTIVATE?tt(s->lang,"models.loghint"):"";
         /* Put the engine's sentence and the log pointer on their own lines.
          * A single mixed RTL/LTR line could still be clipped by the toast's

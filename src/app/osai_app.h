@@ -107,6 +107,21 @@ bool osa_app_recognize(osa_app *app, const float *samples, int64_t n,
                        char *text, size_t text_cap, char *lang, size_t lang_cap,
                        float *confidence, osa_error *err);
 
+/* Threads each worker may use: half of this machine's cores, capped at 8 by
+ * default and never zero. The remainder is headroom for the UI, the operating
+ * system and audio capture, which is what stops a translation from pinning
+ * every core at 100% and making the whole PC unresponsive. Set from Settings. */
+void osa_app_set_threads(osa_app *app, int threads);
+int  osa_app_threads(osa_app *app);
+
+/* The same, for the live screen: `partial` marks a pass over a sentence the
+ * speaker has not finished, so the decoder's text context is capped (a partial
+ * is re-decoded every second and must cost little) and the engine may use more
+ * threads than a file pass. Results are identical in shape. */
+bool osa_app_recognize_live(osa_app *app, const float *samples, int64_t n, bool partial,
+                            char *text, size_t text_cap, char *lang, size_t lang_cap,
+                            float *confidence, osa_error *err);
+
 bool osa_app_transcribe_samples(osa_app *app, const float *samples, int64_t n,
                                 osa_app_transcript *out, osa_error *err);
 
