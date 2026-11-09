@@ -150,6 +150,84 @@ static void test_audio_wav(void){
     osa_audio_free(&a); clean_root();
 }
 
+/* The exact regression from the field: the app logged a correct Windows path,
+ * but the child received C:UsersAdministratorDesktopNew folderdataModels...
+ * because the command-line builder counted backslashes before ordinary letters
+ * and then dropped them. Quote construction is portable so this test runs on
+ * Linux too; a reference MSVCRT parser checks the round trip. */
+static int msvcrt_parse(const char *s, char out[][1024], int max){
+    int argc=0; const char *p=s;
+    while(*p && argc<max){
+        while(*p==' '||*p=='\t')p++;
+        if(!*p)break;
+        char *dst=out[argc]; size_t n=0; bool inq=false;
+        while(*p){
+            if(*p=='\\'){
+                size_t bs=0; while(*p=='\\'){bs++;p++;}
+                if(*p=='"'){
+                    for(size_t i=0;i<bs/2;i++)dst[n++]='\\';
+                    if(bs%2)dst[n++]='"'; else inq=!inq;
+                    p++;
+                }else{
+                    for(size_t i=0;i<bs;i++)dst[n++]='\\';
+                }
+            }else if(*p=='"'){inq=!inq;p++;}
+            else if(!inq && (*p==' '||*p=='\t'))break;
+            else dst[n++]=*p++;
+            if(n>=1023)break;
+        }
+        dst[n]=0; argc++;
+    }
+    return argc;
+}
+static void test_process_quoting(void){
+    suite("Windows argv quoting (backslashes / spaces / Persian)");
+    const char *user_argv[]={
+        "C:\\Users\\Administrator\\Desktop\\New folder\\data\\Cache\\OpenSpeechWorker.exe",
+        "--kind","lang","--model",
+        "C:\\Users\\Administrator\\Desktop\\New folder\\data\\Models\\glotlid-small.bin",
+        "--threads","2",NULL};
+    osa_error err; osa_err_ok(&err);
+    char *cmd=osa_process_quote_argv(user_argv,&err);
+    CHECK_MSG(cmd!=NULL,"quote builder succeeds: %s",cmd?"ok":err.msg);
+    if(cmd){
+        const char *want=
+            "\"C:\\Users\\Administrator\\Desktop\\New folder\\data\\Cache\\OpenSpeechWorker.exe\""
+            " \"--kind\" \"lang\" \"--model\""
+            " \"C:\\Users\\Administrator\\Desktop\\New folder\\data\\Models\\glotlid-small.bin\""
+            " \"--threads\" \"2\"";
+        CHECK_STR(cmd,want);
+        char got[16][1024]; int n=msvcrt_parse(cmd,got,16);
+        CHECK_MSG(n==7,"the quoted line parses back to 7 arguments (got %d)",n);
+        bool same=n==7;
+        for(int i=0;same&&user_argv[i];i++)same=osa_streq(got[i],user_argv[i]);
+        CHECK_MSG(same,"every argument survives quoting, especially the model path");
+        free(cmd);
+    }
+    const char *cases[][4]={
+        {"exe","C:\\Users\\بهنام\\Desktop\\پوشه جدید\\data\\Models\\glotlid-small.bin",NULL},
+        {"exe","C:\\folder with space\\trailing\\",NULL},
+        {"exe","a\"b\\c","a\\\"b",NULL},
+        {"exe","a\\","a\\\\",NULL},
+        {"exe",""," space ",NULL},
+        {"C:\\Program Files\\OpenSpeech AI\\OpenSpeechWorker.exe","--model","C:\\مدل ها\\z.bin",NULL},
+    };
+    for(size_t k=0;k<sizeof cases/sizeof cases[0];k++){
+        char *q=osa_process_quote_argv(cases[k],&err);
+        CHECK_MSG(q!=NULL,"case %zu quotes",(size_t)k);
+        if(!q)continue;
+        char got[4][1024]; int n=msvcrt_parse(q,got,4);
+        int want=0; while(cases[k][want])want++;
+        bool same=n==want;
+        for(int i=0;same&&i<want;i++)same=osa_streq(got[i],cases[k][i]);
+        CHECK_MSG(same,"case %zu round-trips through MSVCRT rules",(size_t)k);
+        free(q);
+    }
+    CHECK(osa_process_quote_argv(NULL,&err)==NULL);
+    const char *empty[]={NULL};
+    CHECK(osa_process_quote_argv(empty,&err)==NULL);
+}
+
 static void test_worker_isolation(void){
     suite("worker isolation / invalid model");
     char exe[512]; snprintf(exe,sizeof exe,"build/OpenSpeechWorker");
@@ -238,6 +316,38 @@ static void test_worker_protocol(void){
             }else CHECK_MSG(false,"FLORES detect answered");
             osa_process_stop(f);
         }
+    }
+
+    /* The worker must receive the path verbatim. On POSIX a backslash is an
+     * ordinary filename character, so this file exercises spaces, Persian and
+     * literal backslashes in one real load + detect round trip. */
+    {
+        const char *dir="build/worker path test";
+        const char *name="C:\\Users\\Administrator\\Desktop\\New folder\\data\\Models\\glotlid-small.bin";
+        char path[700]; snprintf(path,sizeof path,"%s/%s",dir,name);
+        osa_mkdirs(dir);
+        osa_buf fixture; osa_buf_init(&fixture);
+        if(osa_file_read(model,&fixture)){
+            CHECK(osa_file_write(path,fixture.data,fixture.len));
+            const char *ha[]={exe,"--kind","lang","--model",path,"--threads","1",NULL};
+            osa_process *h=osa_process_start(ha,&err);
+            CHECK_MSG(h!=NULL,"worker starts with a spaces/Persian/backslash path: %s",h?"ok":err.msg);
+            if(h){
+                line=NULL;
+                bool r=osa_process_line(h,20000,NULL,&line,&err);
+                CHECK_MSG(r,"hostile-path ready line arrives: %s",r?"ok":err.msg);
+                if(r){free(line);line=NULL;}
+                osa_process_write(h,"{\"op\":\"detect\",\"text\":\"سلام دنیا\"}",&err);
+                r=osa_process_line(h,20000,NULL,&line,&err);
+                if(r){char code[16]={0};osa_json_get_string(line,"language",code,sizeof code);
+                    CHECK_STR(code,"fa");free(line);line=NULL;}
+                else CHECK_MSG(false,"hostile-path detect answered");
+                osa_process_stop(h);
+            }
+            osa_file_remove(path);
+        }else CHECK_MSG(false,"read LID fixture for hostile-path test");
+        osa_buf_free(&fixture);
+        osa_dir_remove_recursive(dir);
     }
 
     /* A bad file must report the loader's own sentence, not a generic one. */
@@ -433,6 +543,7 @@ int main(void){
     test_store_active();
     test_long_history();
     test_audio_wav();
+    test_process_quoting();
     test_worker_isolation();
     test_shell_gate();
     test_worker_path();

@@ -598,14 +598,14 @@ void shell_draw_toast(shell_state *s, ui_context *u, osa_rect area) {
     float size = UI_FS_SMALL * u->L.scale;
     /* An error carries the engine's own sentence and the file path: clipping it
      * to one line hid the only part that explains what went wrong. Measure the
-     * wrapped text and give the band up to four lines. */
+     * wrapped text and give the band up to five lines. */
     int lines = 1;
     if (s->message_is_error && u->reg) {
         char buf[2048];
         lines = text_wrap_lines(u->reg, size, s->message, w - 60 * u->L.scale,
-                                buf, sizeof buf, 4);
+                                buf, sizeof buf, 5);
         if (lines < 1) lines = 1;
-        if (lines > 4) lines = 4;
+        if (lines > 5) lines = 5;
     }
     float lh = size * 1.7f;
     float h = 26 * u->L.scale + (lines - 1) * lh + 16 * u->L.scale;
@@ -1066,11 +1066,16 @@ void shell_job_tick(shell_state*s){
         const char*raw=j->err.msg[0]?j->err.msg:tt(s->lang,"msg.cancelled");
         const char*hint=NULL;
         if(strstr(raw,"memory")||strstr(raw,"bad_alloc")||strstr(raw,"free RAM"))hint=tt(s->lang,"err.memory");
-        else if(strstr(raw,"cannot be opened")||strstr(raw,"missing"))hint=tt(s->lang,"err.modelfile");
+        else if(strstr(raw,"cannot be opened")||strstr(raw,"cannot open")||strstr(raw,"missing"))hint=tt(s->lang,"err.modelfile");
         else if(strstr(raw,"integrity")||strstr(raw,"wrong file format"))hint=tt(s->lang,"err.integrity");
         const char *where=j->kind==SHELL_JOB_ACTIVATE?tt(s->lang,"models.loghint"):"";
-        if(hint)shell_set_message(s,true,"%s: %s (%s)%s%s",tt(s->lang,"msg.failed"),hint,raw,where?" — ":"",where);
-        else shell_set_message(s,true,"%s: %s%s%s",tt(s->lang,"msg.failed"),raw,where?" — ":"",where);
+        /* Put the engine's sentence and the log pointer on their own lines.
+         * A single mixed RTL/LTR line could still be clipped by the toast's
+         * one-line fallback; explicit newlines guarantee the path is visible. */
+        if(hint&&where[0])shell_set_message(s,true,"%s: %s\n%s\n%s",tt(s->lang,"msg.failed"),hint,raw,where);
+        else if(hint)shell_set_message(s,true,"%s: %s\n%s",tt(s->lang,"msg.failed"),hint,raw);
+        else if(where[0])shell_set_message(s,true,"%s: %s\n%s",tt(s->lang,"msg.failed"),raw,where);
+        else shell_set_message(s,true,"%s: %s",tt(s->lang,"msg.failed"),raw);
     }
     s->dl_pack[0]=0;s->dl_progress=0;s->dl_got=s->dl_total=0;free(j->input);free(j->peaks);free(j->eval_json);free(j);
 }

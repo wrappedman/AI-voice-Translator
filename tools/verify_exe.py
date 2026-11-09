@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 """Sanity-check a built Windows executable.
 
-CI cannot run a Windows binary here, so this verifies the PE header and a few
-load-bearing strings/resources without executing it:
+This verifies the PE header and a few load-bearing strings/resources without
+executing the binary. A separate native Windows CI job (tools/win_smoke.py)
+runs the shipped worker against a synthetic model in a Persian/spaces folder:
   * OpenSpeechAI.exe      x86-64 PE32+, GUI subsystem, version + DPI manifest
   * OpenSpeechWorker.exe  x86-64 PE32+, console subsystem, UTF-8 manifest
 
@@ -38,6 +39,11 @@ APP_REQUIRED = [
     ("پوشه مدل‌ها", "the models-folder setting"),
     ("حذف شود؟", "the two-step delete confirmation"),
     ("درباره سازنده", "the developer section"),
+    ("the worker command line is too long", "the MSVCRT argv quoting guard"),
+]
+WORKER_REQUIRED = [
+    ("cannot parse the worker command line", "wide Windows argv parsing"),
+    ("cannot open the language model file", "the wide-path fastText loader"),
 ]
 FORBIDDEN = [
     "no AAC decoder on this platform",
@@ -61,10 +67,10 @@ def check(path: str, console: bool) -> int:
     with open(path, "rb") as f:
         data = f.read()
     fails = []
-    if not console:
-        for needle, why in APP_REQUIRED:
-            if not _contains(data, needle):
-                fails.append("missing %r: %s" % (needle, why))
+    required = WORKER_REQUIRED if console else APP_REQUIRED
+    for needle, why in required:
+        if not _contains(data, needle):
+            fails.append("missing %r: %s" % (needle, why))
     for needle in FORBIDDEN:
         if _contains(data, needle):
             fails.append("contains forbidden fallback %r" % needle)
@@ -98,7 +104,7 @@ def check(path: str, console: bool) -> int:
                              (b"permonitorv2", "DPI manifest")):
             if needle not in data:
                 fails.append("missing %s resource" % what)
-        stale = [v for v in ("1.0.0.0", "0.9.0.0", "1.1.0.0", "1.2.0.0", "1.3.0.0")
+        stale = [v for v in ("1.0.0.0", "0.9.0.0", "1.1.0.0", "1.2.0.0", "1.3.0.0", "1.3.1.0", "1.4.0.0")
                  if v != ver and v.encode("utf-16-le") in data]
         for v in stale:
             fails.append("file properties still report version %s" % v)

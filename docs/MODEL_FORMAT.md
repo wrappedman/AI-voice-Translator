@@ -1,4 +1,4 @@
-# Model formats and verification (1.4.0)
+# Model formats and verification (1.4.1)
 
 OpenSpeech AI no longer ships or accepts the old exemplar `.osam` / phrasebook
 `.osmt` containers as active models. The supported artifacts are standard
@@ -76,9 +76,11 @@ per `kind`. Failure leaves the previous active model intact.
   (`fa`, `en`, …) in both `detect` results and the `ready.languages` list, and
   keeps the original label when no honest ISO-1 mapping exists. If the detected
   language is outside the MT set, translation fails with a readable message
-  instead of silently producing garbage. On Windows the model file is opened
-  with `_wfopen` and streamed to fastText, so non-ASCII (e.g. Persian) folder
-  names work regardless of the ANSI code page.
+  instead of silently producing garbage. On Windows the model path is quoted
+  with the MSVCRT rules, parsed by the worker with `CommandLineToArgvW`, and the
+  file is opened with `_wfopen` and streamed to fastText, so spaces,
+  backslashes and non-ASCII (e.g. Persian) folder names work regardless of the
+  ANSI code page.
 
 ## Text limits and failure behaviour
 

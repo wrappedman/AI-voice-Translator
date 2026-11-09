@@ -215,7 +215,7 @@ $(BUILD)/worker-win/res.o: $(SRC)/platform/win32/worker.rc $(SRC)/platform/win32
 	$(ZIG) rc /fo $@ /I $(SRC)/platform/win32 $(SRC)/platform/win32/worker.rc
 $(WORKER_WIN): $(WORKER_WIN_OBJ) $(BUILD)/worker-win/res.o
 	@mkdir -p $(dir $@)
-	$(WIN_CXX) -static -o $@ $^ -lm -lpthread
+	$(WIN_CXX) -static -o $@ $^ -lm -lpthread -lshell32
 .PHONY: win
 win: $(WIN_BIN) $(WORKER_WIN)
 

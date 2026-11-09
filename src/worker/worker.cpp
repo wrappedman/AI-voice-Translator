@@ -18,6 +18,7 @@
 #include <io.h>
 #include <fcntl.h>
 #include <windows.h>
+#include <shellapi.h>
 #endif
 using json = nlohmann::json;
 
@@ -264,10 +265,31 @@ int main(int argc,char **argv) {
 #endif
     std::ios::sync_with_stdio(false);
     try {
+        /* Parse the wide command line ourselves on Windows. The parent quotes
+         * argv with the MSVCRT rules; CommandLineToArgvW is the matching parser.
+         * Converting each argument straight to UTF-8 avoids any dependence on
+         * the CRT's narrow argv conversion or the process ANSI code page. */
+        std::vector<std::string> args;
+#ifdef _WIN32
+        (void)argc; (void)argv;
+        int wargc=0;
+        LPWSTR *wargv=CommandLineToArgvW(GetCommandLineW(),&wargc);
+        if(!wargv) throw std::runtime_error("cannot parse the worker command line");
+        for(int i=0;i<wargc;++i) {
+            int n=WideCharToMultiByte(CP_UTF8,0,wargv[i],-1,nullptr,0,nullptr,nullptr);
+            if(n<=0) { LocalFree(wargv); throw std::runtime_error("worker argument is not valid Unicode"); }
+            std::string s((size_t)(n>0?n-1:0),'\0');
+            if(n>1) WideCharToMultiByte(CP_UTF8,0,wargv[i],-1,&s[0],n,nullptr,nullptr);
+            args.push_back(std::move(s));
+        }
+        LocalFree(wargv);
+#else
+        for(int i=0;i<argc;++i) args.emplace_back(argv[i]);
+#endif
         std::string kind,path; int threads=4;
-        for(int i=1;i<argc;++i) {
-            std::string a=argv[i];
-            if(i+1<argc) { if(a=="--kind") kind=argv[++i]; else if(a=="--model") path=argv[++i]; else if(a=="--threads") threads=atoi(argv[++i]); }
+        for(size_t i=1;i<args.size();++i) {
+            const std::string &a=args[i];
+            if(i+1<args.size()) { if(a=="--kind") kind=args[++i]; else if(a=="--model") path=args[++i]; else if(a=="--threads") threads=atoi(args[++i].c_str()); }
         }
         if(path.empty()) throw std::runtime_error("missing model path");
         std::unique_ptr<LanguageModel> lid;

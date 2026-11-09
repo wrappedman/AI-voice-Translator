@@ -2,7 +2,7 @@
 
 **Offline multilingual speech recognition and translation for Windows — no bundled models.**
 
-version 1.4.0 · Windows 10 1903+ / 11 x64 · GPL-3.0-or-later
+version 1.4.1 · Windows 10 1903+ / 11 x64 · GPL-3.0-or-later
 
 خلاصهٔ فارسی: برنامه هیچ مدل ازپیش‌نصب‌شده‌ای همراه ندارد. در بخش «مدل‌ها» یک مدل
 گفتار Whisper، یک مدل ترجمه Qwen GGUF و یک مدل تشخیص زبان (fastText یا GlotLID) را از منابع
@@ -15,13 +15,21 @@ version 1.4.0 · Windows 10 1903+ / 11 x64 · GPL-3.0-or-later
 ```
 dist/bin/OpenSpeechAI.exe          GUI executable, x86-64, static, worker embedded
 dist/bin/OpenSpeechWorker.exe      isolated neural inference worker
-dist/OpenSpeechAI-1.4.0-win64.zip  exe + worker + fonts/catalog/docs (no weights)
-dist/checksums-1.4.0.txt           SHA-256 of exe, worker and zip
+dist/OpenSpeechAI-1.4.1-win64.zip  exe + worker + fonts/catalog/docs (no weights)
+dist/checksums-1.4.1.txt           SHA-256 of exe, worker and zip
 ```
 
 ![Fresh-install Models screen](dist/screenshots/screen-04-models.png)
 
 ---
+
+## What changed in 1.4.1
+
+| Area | Behaviour |
+|---|---|
+| **Windows model path actually reaches the worker** | The field log showed the app verifying `C:\Users\Administrator\Desktop\New folder\data\Models\glotlid-small.bin`, while fastText received `C:UsersAdministratorDesktopNew folderdataModelsglotlid-small.bin`. The command-line builder counted backslashes before ordinary letters and then reset the counter **without writing them**. Quoting now follows the MSVCRT / `CommandLineToArgvW` rules exactly: literal backslashes are emitted, runs before a quote are doubled, and embedded quotes are escaped. The worker parses the wide command line itself and converts each argument to UTF-8, so spaces, Persian letters and backslashes survive the whole trip. |
+| **Regression tests for the exact failure** | A portable quoting helper is tested against the reported Windows path, trailing backslashes, embedded quotes, empty arguments and Persian folders, with a reference MSVCRT parser checking the round trip. The real worker also loads a synthetic LID model from a path containing spaces, Persian and literal backslashes and answers a Persian `detect` request. A native Windows CI smoke job runs the shipped worker from a Persian/spaces folder. |
+| **Readable activation failures** | The failure toast puts the explanation, the engine's own sentence and the log pointer on separate lines, so a long mixed Persian/English path is no longer hidden by the single-line fallback. |
 
 ## What changed in 1.4.0
 
@@ -64,21 +72,31 @@ dist/checksums-1.4.0.txt           SHA-256 of exe, worker and zip
 
 ## Downloadable models
 
-| Category | Model | Size | Licence |
-|---|---|---:|---|
-| Speech | Whisper Medium Q5_0 | 514 MiB | MIT |
-| Speech | Whisper Large v3 Turbo Q5_0 | 547 MiB | MIT |
-| Speech | Whisper Medium Q8_0 | 785 MiB | MIT |
-| Speech | Whisper Large v3 Turbo Q8_0 | 834 MiB | MIT |
-| Speech | Whisper Large v3 Q5_0 | 1.01 GiB | MIT |
-| Translation | Qwen2.5 1.5B Instruct Q4_K_M | 1.04 GiB | Apache-2.0 |
-| Translation | Qwen2.5 3B Instruct Q4_K_M | 1.96 GiB | Apache-2.0 |
-| Translation | Qwen2.5 3B Instruct Q6_K | 2.60 GiB | Apache-2.0 |
-| Translation | Qwen2.5 3B Instruct Q8_0 | 3.37 GiB | Apache-2.0 |
-| Translation | Qwen2.5 7B Instruct Q3_K_M | 3.55 GiB | Apache-2.0 |
-| Language ID | fastText LID 176 full (`.bin`) | 125 MiB | CC-BY-SA-3.0 |
-| Language ID | fastText LID 176 compact (`.ftz`) | 0.89 MiB | CC-BY-SA-3.0 |
+| Category | Model | Download | RAM needed | Licence |
+|---|---|---:|---:|---|
+| Speech | Whisper Tiny Q5_1 | 30.7 MiB | 500 MiB | MIT |
+| Speech | Whisper Base Q5_1 | 56.9 MiB | 600 MiB | MIT |
+| Speech | Whisper Small Q5_1 | 181.3 MiB | 1.0 GiB | MIT |
+| Speech | Whisper Medium Q5_0 | 514.2 MiB | 1.5 GiB | MIT |
+| Speech | Whisper Large v3 Turbo Q5_0 | 547.4 MiB | 1.6 GiB | MIT |
+| Speech | Whisper Medium Q8_0 | 785.2 MiB | 2.0 GiB | MIT |
+| Speech | Whisper Large v3 Turbo Q8_0 | 833.7 MiB | 2.1 GiB | MIT |
+| Speech | Whisper Large v3 Q5_0 | 1.01 GiB | 2.9 GiB | MIT |
+| Translation | Qwen2.5 0.5B Instruct Q4_K_M | 468.6 MiB | 1.0 GiB | Apache-2.0 |
+| Translation | Qwen2.5 0.5B Instruct Q8_0 | 644.4 MiB | 1.2 GiB | Apache-2.0 |
+| Translation | Qwen2.5 1.5B Instruct Q4_K_M | 1.04 GiB | 1.8 GiB | Apache-2.0 |
+| Translation | Qwen2.5 3B Instruct Q4_K_M | 1.96 GiB | 2.7 GiB | Apache-2.0 |
+| Translation | Qwen2.5 3B Instruct Q6_K | 2.60 GiB | 3.4 GiB | Apache-2.0 |
+| Translation | Qwen2.5 3B Instruct Q8_0 | 3.37 GiB | 4.2 GiB | Apache-2.0 |
+| Translation | Qwen2.5 7B Instruct Q3_K_M | 3.55 GiB | 4.7 GiB | Apache-2.0 |
+| Language ID | fastText LID 176 (compressed) | 0.9 MiB | 300 MiB | CC-BY-SA-3.0 |
+| Language ID | fastText LID 176 (full) | 125.2 MiB | 1.4 GiB | CC-BY-SA-3.0 |
+| Language ID | GlotLID v4 small (compressed) | 33.7 MiB | 400 MiB | Apache-2.0+notices |
+| Language ID | GlotLID v4 small (full) | 124.9 MiB | 900 MiB | Apache-2.0+notices |
+| Language ID | GlotLID v4 (compressed) | 96.5 MiB | 700 MiB | Apache-2.0+notices |
+| Language ID | GlotLID v4 (full) | 746.5 MiB | 2.9 GiB | Apache-2.0+notices |
 
+RAM figures are approximate resident-memory estimates for choosing a model; the UI shows the same number and marks light models with «سبک».
 Exact pinned URLs/hashes live in `src/app/osai_app.c` and `tools/catalog/catalog.json`.
 Nothing is downloaded automatically. Inference is offline after installation.
 Pick the smaller quants on a 8 GB machine; the 7B row needs ~6 GB of free RAM.
@@ -159,14 +177,17 @@ tests only; the shipped app always uses `<exe folder>\data`.
 
 ## Validation status
 
-- Linux: `make tests` (104 checks, including a real worker handshake and two
-  `detect` round trips against a synthetic fastText fixture) and `make snapshots` pass in this environment.
+- Linux: `make tests` (145 checks, including the exact Windows argv quoting
+  regression, a real worker handshake, `detect` round trips against a synthetic
+  fastText fixture, and a load from a spaces/Persian/backslash path) and
+  `make snapshots` pass in this environment.
 - Windows: cross-build succeeds; `tools/verify_exe.py` checks PE subsystem,
   manifests, the embedded worker payload and load-bearing strings.
 - **Not performed here:** native Windows microphone/Media Foundation runtime and
-  real-weight download/inference end-to-end. The worker-extraction and process
-  fixes are compiled and statically checked, but confirming the activation path
-  on a real Windows machine still needs the downloaded models.
+  real-weight download/inference end-to-end. The Windows build is compiled and
+  statically checked here; a native Windows CI smoke job exercises the shipped
+  worker from a Persian/spaces folder. Confirming activation with the downloaded
+  GlotLID weights on the user's machine still needs that machine.
 
 ## Architecture
 

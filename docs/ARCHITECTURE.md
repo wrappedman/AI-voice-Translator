@@ -1,10 +1,11 @@
-# OpenSpeech AI — Architecture (1.4.0)
+# OpenSpeech AI — Architecture (1.4.1)
 
-<!-- 1.4.0: the language worker opens fastText models through _wfopen +
-stdio_filebuf on Windows (non-ASCII paths), normalises ISO-639-3+script labels
-(GlotLID/FLORES) to ISO-1, and activation self-heals stale model paths after
-verifying size+SHA-256. PACKS carries min_ram_mb per model, surfaced in the UI
-and used by the activation memory check. -->
+<!-- 1.4.1: Windows argv is quoted with the exact MSVCRT rules by the portable
+osa_process_quote_argv helper; the worker parses CommandLineToArgvW and converts
+each argument to UTF-8. This fixes the field failure where backslashes before
+ordinary letters were dropped between CreateProcessW and the child. 1.4.0 added
+the _wfopen fastText loader, GlotLID label normalisation, stale-path self-heal
+and per-model min_ram_mb. -->
 
 ## Product contract
 
@@ -74,7 +75,12 @@ Getting this wrong (clearing inheritance on "the read end" of both pipes) gave t
 worker an invalid stdin: it printed `ready`, then `std::getline` failed and the
 process exited, so activation looked fine and every request afterwards failed.
 `tests/test_main.c` now starts the real worker with a synthetic fastText file and
-performs two `detect` round trips over the same pipe.
+performs two `detect` round trips over the same pipe. It also checks
+`osa_process_quote_argv` against the exact reported Windows path and a reference
+MSVCRT parser, and loads the fixture from a path containing spaces, Persian and
+literal backslashes. On Windows the worker ignores the CRT's narrow `argv` and
+parses `GetCommandLineW()` with `CommandLineToArgvW`, converting each argument to
+UTF-8; model files are then opened with `_wfopen`.
 
 Diagnostics: the app appends `activate kind=… model=…`, `ready`, `load failed: …`
 notes to `data/Logs/worker.log`, and the worker's stderr goes to the same file. A

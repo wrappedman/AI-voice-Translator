@@ -72,15 +72,16 @@ First run
     data\\Logs\\worker.log has the full trace.
     The application starts with NO installed models. Open Models, download
     one speech model (Whisper), one translation model (Qwen GGUF) and one
-    language-identification model (fastText LID 176), then activate each.
+    language-identification model (fastText LID 176 or GlotLID v4), then activate each.
     Transcription, translation and live features stay disabled until all
     three categories have an active model. The window header always names
     the active model in each category.
 
-    The catalogue offers 5 Whisper variants, 5 Qwen2.5 translation quants and
-    2 fastText language-identification models (including the 0.9 MB .ftz).
-    Downloads show their percentage, can be cancelled, and are verified
-    against pinned sizes and SHA-256 hashes before being installed inactive.
+    The catalogue offers 8 Whisper variants, 7 Qwen2.5 translation quants and
+    6 language-identification models (fastText LID 176 plus GlotLID v4, from
+    0.9 MB to 747 MB). Each row states the approximate RAM needed and marks
+    light models. Downloads show their percentage, can be cancelled, and are
+    verified against pinned sizes and SHA-256 hashes before being installed inactive.
     There is no local-file import: only the official catalogue installs.
 
 Everything the program writes lives next to the executable:
@@ -93,7 +94,7 @@ is moved into data\\ once on first start, and removed when it is empty.
 
 Requirements
     Windows 10 version 1903 or newer / Windows 11, 64-bit.
-    8 GB RAM minimum recommended for the Qwen2.5 3B translation model.
+    Light models run on 2-4 GB RAM; the Qwen2.5 3B translator recommends 8 GB.
     Several GB of free disk for the models you choose to download.
     Internet access only when you press Download; inference is offline.
 

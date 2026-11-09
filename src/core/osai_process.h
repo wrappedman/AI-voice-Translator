@@ -7,6 +7,11 @@ typedef struct osa_process osa_process;
 /* argv[0] is an executable path, not a shell command. NULL terminates argv.
  * The child inherits no listening socket; only anonymous stdio pipes. */
 osa_process *osa_process_start(const char *const *argv, osa_error *err);
+/* Windows command-line quoting (MSVCRT / CommandLineToArgvW rules), kept as a
+ * portable helper so the exact escaping can be regression-tested on Linux too.
+ * POSIX spawn passes argv directly and does not use this. Returns a malloc'd
+ * UTF-8 string the caller must free, or NULL with err set. */
+char *osa_process_quote_argv(const char *const *argv, osa_error *err);
 /* Reads one complete JSON line. timeout_ms<=0 means no deadline. Returns false
  * on cancellation, timeout, EOF or oversized output. Caller frees nothing. */
 bool osa_process_line(osa_process *p, int timeout_ms, volatile int *cancel,

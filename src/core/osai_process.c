@@ -33,6 +33,52 @@ static int reserve(osa_process *p,size_t n) {
     size_t c=p->cap? p->cap:4096; while(c<n)c*=2;
     char *s=realloc(p->line,c); if(!s)return 0; p->line=s;p->cap=c;return 1;
 }
+char *osa_process_quote_argv(const char *const *argv, osa_error *err) {
+    if (!argv || !argv[0] || !argv[0][0]) {
+        osa_err_set(err, "invalid worker argv");
+        return NULL;
+    }
+    osa_buf b; osa_buf_init(&b);
+    for (int i = 0; argv[i]; i++) {
+        if (i) osa_buf_putc(&b, ' ');
+        osa_buf_putc(&b, '"');
+        size_t bs = 0;
+        for (const unsigned char *p = (const unsigned char *)argv[i]; ; p++) {
+            unsigned char c = *p;
+            if (c == '\\') { bs++; continue; }
+            if (c == '"') {
+                /* 2n+1 backslashes before an embedded quote. */
+                for (size_t k = 0; k < bs * 2 + 1; k++) osa_buf_putc(&b, '\\');
+                osa_buf_putc(&b, '"');
+            } else if (c == 0) {
+                /* 2n backslashes before the closing quote. */
+                for (size_t k = 0; k < bs * 2; k++) osa_buf_putc(&b, '\\');
+                break;
+            } else {
+                /* Backslashes before an ordinary character are literal and
+                 * MUST be emitted. The old loop counted them and then reset
+                 * the counter without writing them, turning
+                 * C:\Users\... into C:Users... in the child. */
+                for (size_t k = 0; k < bs; k++) osa_buf_putc(&b, '\\');
+                osa_buf_putc(&b, (char)c);
+            }
+            bs = 0;
+        }
+        osa_buf_putc(&b, '"');
+        if (b.oom) {
+            osa_buf_free(&b);
+            osa_err_set(err, "out of memory building the worker command line");
+            return NULL;
+        }
+    }
+    if (b.oom) {
+        osa_buf_free(&b);
+        osa_err_set(err, "out of memory building the worker command line");
+        return NULL;
+    }
+    return osa_buf_detach(&b);
+}
+
 #ifdef _WIN32
 static DWORD WINAPI reader(LPVOID v) {
     osa_process *p=v; char b[4096]; DWORD n;
@@ -55,7 +101,14 @@ static DWORD WINAPI reader(LPVOID v) {
     }
     return 0;
 }
-static wchar_t *wide(const char *s){int n=MultiByteToWideChar(CP_UTF8,0,s,-1,NULL,0);wchar_t*w=calloc(n,sizeof(*w));if(w)MultiByteToWideChar(CP_UTF8,0,s,-1,w,n);return w;}
+static wchar_t *wide(const char *s){
+    if(!s)return NULL;
+    int n=MultiByteToWideChar(CP_UTF8,MB_ERR_INVALID_CHARS,s,-1,NULL,0);
+    if(n<=0)return NULL;
+    wchar_t*w=calloc((size_t)n,sizeof(*w));if(!w)return NULL;
+    if(!MultiByteToWideChar(CP_UTF8,MB_ERR_INVALID_CHARS,s,-1,w,n)){free(w);return NULL;}
+    return w;
+}
 /* Both ends start inheritable; the caller then marks exactly the two handles
  * the child owns (its stdin read end and its stdout write end) inheritable and
  * hides the parent's ends. Clearing inheritance on "the read end" for both
@@ -79,7 +132,12 @@ static HANDLE worker_stderr(void){
     return h;
 }
 osa_process *osa_process_start(const char *const *argv,osa_error *err){
-    osa_process*p=calloc(1,sizeof(*p));if(!p){osa_err_set(err,"out of memory");return NULL;}
+    if(!argv||!argv[0]||!argv[0][0]){osa_err_set(err,"invalid worker argv");return NULL;}
+    char *cmd8=osa_process_quote_argv(argv,err);if(!cmd8)return NULL;
+    wchar_t *cmd=wide(cmd8);free(cmd8);
+    if(!cmd){osa_err_set(err,"the worker command line is not valid UTF-8");return NULL;}
+    if(wcslen(cmd)>=32768){free(cmd);osa_err_set(err,"the worker command line is too long");return NULL;}
+    osa_process*p=calloc(1,sizeof(*p));if(!p){free(cmd);osa_err_set(err,"out of memory");return NULL;}
     InitializeCriticalSection(&p->lock);InitializeConditionVariable(&p->cv);p->rd=p->wr=NULL;
     SECURITY_ATTRIBUTES sa={sizeof(sa),NULL,TRUE};HANDLE cr=NULL,cw=NULL,sr=NULL,sw=NULL;
     pipes(&cr,&cw,&sa);
@@ -89,37 +147,37 @@ osa_process *osa_process_start(const char *const *argv,osa_error *err){
     if(sr)SetHandleInformation(sr,HANDLE_FLAG_INHERIT,FALSE);  /* parent only  */
     if(sw)SetHandleInformation(sw,HANDLE_FLAG_INHERIT,TRUE);   /* child stdout */
     HANDLE elog=worker_stderr();
-    wchar_t cmd[32768];cmd[0]=0;size_t used=0;
-    for(int i=0;argv[i];i++){wchar_t*w=wide(argv[i]);if(!w)goto fail;
-        size_t n=wcslen(w); if(used+n*2+4>=32760){free(w);goto fail;}
-        if(i)cmd[used++]=L' ';cmd[used++]=L'"';
-        unsigned bs=0;for(size_t j=0;j<n;j++){wchar_t ch=w[j];if(ch==L'\\')bs++;else{if(ch==L'"'){for(unsigned k=0;k<bs*2+1;k++)cmd[used++]=L'\\';bs=0;}else bs=0;cmd[used++]=ch;}}
-        for(unsigned k=0;k<bs*2;k++)cmd[used++]=L'\\';cmd[used++]=L'"';free(w);
-    }
-    cmd[used]=0;
     STARTUPINFOW si={0};si.cb=sizeof(si);si.dwFlags=STARTF_USESTDHANDLES;si.hStdInput=cr;si.hStdOutput=sw;si.hStdError=elog;
     /* An explicit application name removes any ambiguity in parsing the command
-     * line, and the working directory is the worker's own folder so a DLL search
-     * or a relative path can never depend on how the app was launched. */
+     * line. The command line itself is built by osa_process_quote_argv using
+     * the MSVCRT rules, so spaces, Persian letters and literal backslashes in
+     * the model path survive the trip to the child unchanged. */
     wchar_t *app=wide(argv[0]);wchar_t *dir=wide(osa_exe_dir());
     DWORD gle=0;
     PROCESS_INFORMATION pi={0};
-    BOOL ok=app?CreateProcessW(app,cmd,NULL,NULL,TRUE,CREATE_NO_WINDOW,NULL,dir,&si,&pi):FALSE;
+    BOOL ok=(app&&dir)?CreateProcessW(app,cmd,NULL,NULL,TRUE,CREATE_NO_WINDOW,NULL,dir,&si,&pi):FALSE;
     if(!ok)gle=GetLastError();
-    free(app);free(dir);
+    free(app);free(dir);free(cmd);cmd=NULL;
     if(elog){CloseHandle(elog);elog=NULL;}
     if(cr){CloseHandle(cr);cr=NULL;}if(sw){CloseHandle(sw);sw=NULL;}
-    if(!ok){if(cr)CloseHandle(cr);if(cw)CloseHandle(cw);if(sr)CloseHandle(sr);if(sw)CloseHandle(sw);
+    if(!ok){
+        if(cw)CloseHandle(cw);
+        if(sr)CloseHandle(sr);
         osa_process_stop(p);
         osa_err_set(err,"cannot start the model worker (%s, Windows error %lu)",argv[0],(unsigned long)gle);
         return NULL;}
-    CloseHandle(pi.hThread);p->child=pi.hProcess;p->rd=sr;p->wr=cw;p->thread=CreateThread(NULL,0,reader,p,0,NULL);
-    if(!p->thread)goto fail;if(cw==NULL&&cr)CloseHandle(cw);if(sr==NULL&&sw)CloseHandle(sr);return p;
+    CloseHandle(pi.hThread);p->child=pi.hProcess;p->rd=sr;p->wr=cw;
+    /* Ownership moved into p; the fail path must not close these twice. */
+    sr=cw=NULL;
+    p->thread=CreateThread(NULL,0,reader,p,0,NULL);
+    if(!p->thread)goto fail;
+    return p;
 fail:
     if(elog)CloseHandle(elog);
     if(cr)CloseHandle(cr);if(cw)CloseHandle(cw);if(sr)CloseHandle(sr);if(sw)CloseHandle(sw);
     osa_process_stop(p);osa_err_set(err,"cannot prepare the model worker pipes (%s)",argv[0]);return NULL;
 }
+
 bool osa_process_write(osa_process*p,const char*s,osa_error*err){size_t n=strlen(s),off=0;while(off<n){DWORD k=0;if(!WriteFile(p->wr,s+off,(DWORD)(n-off),&k,NULL)||!k){osa_err_set(err,"model worker pipe closed");return false;}off+=k;}DWORD k; if(!WriteFile(p->wr,"\n",1,&k,NULL)){osa_err_set(err,"model worker pipe closed");return false;}return true;}
 bool osa_process_line(osa_process*p,int timeout,volatile int*cancel,char**out,osa_error*err){
     *out=NULL;int waited=0;EnterCriticalSection(&p->lock);
@@ -142,21 +200,41 @@ bool osa_process_exited(osa_process*p,int*code){
 void osa_process_stop(osa_process*p){if(!p)return;if(p->child){TerminateProcess(p->child,1);WaitForSingleObject(p->child,5000);CloseHandle(p->child);}if(p->wr)CloseHandle(p->wr);if(p->rd)CloseHandle(p->rd);if(p->thread){WaitForSingleObject(p->thread,5000);CloseHandle(p->thread);}DeleteCriticalSection(&p->lock);free(p->line);free(p);}
 #else
 osa_process *osa_process_start(const char *const *argv,osa_error *err){
+    if(!argv||!argv[0]||!argv[0][0]){osa_err_set(err,"invalid worker argv");return NULL;}
     signal(SIGPIPE,SIG_IGN);
     int in[2]={-1,-1},out[2]={-1,-1};if(pipe(in)||pipe(out)){osa_err_set(err,"cannot create worker pipes");goto fail;}
     posix_spawn_file_actions_t a;posix_spawn_file_actions_init(&a);posix_spawn_file_actions_adddup2(&a,in[0],0);posix_spawn_file_actions_adddup2(&a,out[1],1);posix_spawn_file_actions_addclose(&a,in[1]);posix_spawn_file_actions_addclose(&a,out[0]);
-    osa_process*p=calloc(1,sizeof(*p));p->pid=-1;p->rd=p->wr=-1;
+    osa_process*p=calloc(1,sizeof(*p));
+    if(!p){posix_spawn_file_actions_destroy(&a);close(in[0]);close(out[1]);in[0]=out[1]=-1;osa_err_set(err,"out of memory");goto fail;}
+    p->pid=-1;p->rd=p->wr=-1;
     int rc=posix_spawnp(&p->pid,argv[0],&a,NULL,(char*const*)argv,environ);posix_spawn_file_actions_destroy(&a);
     close(in[0]);close(out[1]);in[0]=out[1]=-1;
-    if(rc){free(p);goto fail;}p->wr=in[1];p->rd=out[0];in[1]=out[0]=-1;fcntl(p->wr,F_SETFD,FD_CLOEXEC);fcntl(p->rd,F_SETFD,FD_CLOEXEC);return p;
-fail:for(int i=0;i<2;i++){if(in[i]>=0)close(in[i]);if(out[i]>=0)close(out[i]);}return NULL;
+    if(rc){
+        free(p);
+        osa_err_set(err,"cannot start the model worker (%s, error %d)",argv[0],rc);
+        goto fail;
+    }
+    p->wr=in[1];p->rd=out[0];in[1]=out[0]=-1;
+    fcntl(p->wr,F_SETFD,FD_CLOEXEC);fcntl(p->rd,F_SETFD,FD_CLOEXEC);return p;
+fail:
+    for(int i=0;i<2;i++){
+        if(in[i]>=0)close(in[i]);
+        if(out[i]>=0)close(out[i]);
+    }
+    return NULL;
 }
 bool osa_process_write(osa_process*p,const char*s,osa_error*err){size_t n=strlen(s),off=0;while(off<n){ssize_t k=write(p->wr,s+off,n-off);if(k<=0){osa_err_set(err,"model worker pipe closed");return false;}off+=k;}return write(p->wr,"\n",1)==1;}
 bool osa_process_line(osa_process*p,int timeout,volatile int*cancel,char**out,osa_error*err){
     *out=NULL;int waited=0;for(;;){char*nl=p->line?memchr(p->line,'\n',p->len):NULL;if(nl){size_t n=nl-p->line;char*s=malloc(n+1);if(!s)break;memcpy(s,p->line,n);s[n]=0;memmove(p->line,p->line+n+1,p->len-n-1);p->len-=n+1;p->line[p->len]=0;*out=s;return true;}
-        if(cancel&&osa_atomic_load(cancel))break;if(timeout>0&&waited>=timeout)break;
-        struct pollfd fd={p->rd,POLLIN,0};int rc=poll(&fd,1,50);waited+=50;if(rc<0)break;if(rc==0)continue;
-        char b[4096];ssize_t n=read(p->rd,b,sizeof(b));if(n<=0){p->done=1;break;}if(p->len+n>1048576||!reserve(p,p->len+n+1))break;memcpy(p->line+p->len,b,n);p->len+=n;p->line[p->len]=0;
+        if(cancel&&osa_atomic_load(cancel))break;
+        if(timeout>0&&waited>=timeout)break;
+        struct pollfd fd={p->rd,POLLIN,0};int rc=poll(&fd,1,50);waited+=50;
+        if(rc<0)break;
+        if(rc==0)continue;
+        char b[4096];ssize_t n=read(p->rd,b,sizeof(b));
+        if(n<=0){p->done=1;break;}
+        if(p->len+n>1048576||!reserve(p,p->len+n+1))break;
+        memcpy(p->line+p->len,b,n);p->len+=n;p->line[p->len]=0;
     }osa_err_set(err,"model worker stopped, timed out or returned invalid output");return false;
 }
 bool osa_process_exited(osa_process*p,int*code){
