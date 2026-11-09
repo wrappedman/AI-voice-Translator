@@ -122,6 +122,16 @@ static int run_snapshots(const char *dir, int w, int h, shell_lang lang, bool da
         "transcribe", "live", "translate", "history", "models",
         "training", "evaluation", "settings", "about"
     };
+    /* The Translate screen is shown with a finished translation and its
+     * آوانویسی line, or the line would never be in a still — and the way it draws
+     * is exactly what this release changed. The text is fixed, so the frame stays
+     * byte-identical between runs. */
+    osa_strlcpy(shell.tr_out, "Danke schön, bis bald!", sizeof shell.tr_out);
+    osa_strlcpy(shell.tr_out_lang, "de", sizeof shell.tr_out_lang);
+    shell.show_phonetic = true;
+    osa_app_pronounce(shell.tr_out, shell.tr_out_lang, shell.tr_phonetic,
+                      sizeof shell.tr_phonetic);
+
     int written = 0;
     for (int i = 0; i < SCREEN_COUNT; i++) {
         shell.screen = (shell_screen)i;

@@ -114,6 +114,18 @@ bool osa_app_recognize(osa_app *app, const float *samples, int64_t n,
 void osa_app_set_threads(osa_app *app, int threads);
 int  osa_app_threads(osa_app *app);
 
+/* Where inference runs: CPU (always available) or the GPU. The choice is passed
+ * to the worker as --device; the worker reports whether it could honour it, so
+ * the Settings screen can say "this build has no GPU backend" instead of quietly
+ * staying on the CPU after the user asked for the GPU. */
+void osa_app_set_device(osa_app *app, bool gpu);
+bool osa_app_gpu(osa_app *app);
+
+/* What this build can actually use for inference, and what the worker reported
+ * after the last translation model loaded. Both are honest strings for the UI:
+ * "CPU only" is an answer, an empty box is not. */
+const char *osa_app_device_status(osa_app *app);
+
 /* The same, for the live screen: `partial` marks a pass over a sentence the
  * speaker has not finished, so the decoder's text context is capped (a partial
  * is re-decoded every second and must cost little) and the engine may use more
@@ -175,6 +187,12 @@ const char *osa_app_translate_preview(osa_app *app, const char *text);
  * letters with diacritics; Persian input is returned unchanged because it is
  * already readable). Returns false when there is nothing to transliterate. */
 bool osa_app_pronounce(const char *text, const char *lang, char *out, size_t cap);
+
+/* True when the last osa_app_pronounce() saw a sentence written in a script this
+ * build cannot read letter by letter (Chinese, Japanese, Korean, Thai, the Indic
+ * scripts, Georgian, Armenian, Ethiopic, Khmer, Lao, Myanmar). The screen shows a
+ * one-line note then; an empty line with no explanation reads like a bug. */
+bool osa_app_pronounce_unsupported(void);
 
 /* One-shot: transcribe then translate, linking both rows. */
 bool osa_app_transcribe_and_translate(osa_app *app, const char *path,

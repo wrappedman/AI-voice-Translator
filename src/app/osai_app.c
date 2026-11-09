@@ -129,6 +129,9 @@ struct osa_app {
     char models_dir[OSAI_MAX_PATH], audio_dir[OSAI_MAX_PATH];
     char last_language[8], lang_src[8], lang_dst[8];
     int  worker_threads;
+    bool use_gpu;                 /* the user's choice; the worker says if it can */
+    bool gpu_compiled;            /* this build has a GPU backend at all */
+    char device_note[96];         /* what the last load reported */
     mt_style style; volatile int cancel;
 };
 
@@ -180,8 +183,9 @@ static osa_process *start_worker(osa_app*a,const char*kind,const char*path,volat
         return NULL;
     }
     if(!osa_worker_path(exe,sizeof exe,err))return NULL;
-    char threads[8];snprintf(threads,sizeof threads,"%d",osa_app_threads(a));
-    const char*argv[]={exe,"--kind",kind,"--model",path,"--threads",threads,NULL};
+    char threads[12];snprintf(threads,sizeof threads,"%d",osa_app_threads(a));
+    const char*dev=osa_app_gpu(a)?"gpu":"cpu";
+    const char*argv[]={exe,"--kind",kind,"--model",path,"--threads",threads,"--device",dev,NULL};
     osa_worker_log_note("activate kind=%s threads=%s model=%s",kind,threads,path);
     osa_process*p=osa_process_start(argv,err);
     if(!p){osa_worker_log_note("spawn failed: %s",err&&err->msg[0]?err->msg:"?");return NULL;}
@@ -200,6 +204,17 @@ static osa_process *start_worker(osa_app*a,const char*kind,const char*path,volat
     bool ok=false;char event[32]={0};char msg[OSAI_MAX_MSG]={0};
     osa_json_get_bool(line,"ok",&ok);osa_json_get_string(line,"event",event,sizeof event);
     osa_json_get_string(line,"error",msg,sizeof msg);
+    /* The worker says which device it actually used. Remember it, so Settings can
+     * report the truth rather than the request. */
+    if(osa_streq(kind,"mt")&&ok){
+        char dev[8]={0};bool avail=false;
+        osa_json_get_string(line,"device",dev,sizeof dev);
+        osa_json_get_bool(line,"gpu_available",&avail);
+        locke(a);
+        a->gpu_compiled=avail;
+        osa_strlcpy(a->device_note,osa_streq(dev,"gpu")?"gpu":"cpu",sizeof a->device_note);
+        unlocke(a);
+    }
     free(line);
     if(!ok||!osa_streq(event,"ready")){
         int code=-1;bool exited=osa_process_exited(p,&code);
@@ -238,9 +253,25 @@ osa_app *osa_app_create(osa_error*err){
     lockd(a);osa_arena ar;osa_arena_init(&ar);char*s=osa_db_get_setting(a->db,"lang_src",&ar,"auto");char*d=osa_db_get_setting(a->db,"lang_dst",&ar,"fa");char*st=osa_db_get_setting(a->db,"mt_style",&ar,"0");osa_strlcpy(a->lang_src,s,sizeof a->lang_src);osa_strlcpy(a->lang_dst,d,sizeof a->lang_dst);a->style=(mt_style)osa_clampi(atoi(st),0,2);
     /* Leave a core or two for the window, the OS and audio: using every core is
      * what made the machine sit at 100% while translating. */
-    {int cores=osa_cpu_count();a->worker_threads=osa_clampi(cores>2?cores-1:cores,1,8);}osa_arena_free(&ar);unlockd(a);return a;
+    {int cores=osa_cpu_count();a->worker_threads=osa_clampi(cores>2?cores-1:cores,1,8);}
+    {char*g=osa_db_get_setting(a->db,"device",&ar,"cpu");a->use_gpu=osa_streq(g,"gpu");}osa_arena_free(&ar);unlockd(a);return a;
 }
 void osa_app_destroy(osa_app*a){if(!a)return;osa_atomic_inc(&a->cancel);osa_mutex_lock(&a->life_mu);locke(a);if(a->asr){wsp_free(a->asr);a->asr=NULL;}osa_process*mt=a->mt,*lid=a->lid;a->mt=a->lid=NULL;unlocke(a);osa_process_stop(mt);osa_process_stop(lid);lockd(a);osa_db_close(a->db);a->db=NULL;unlockd(a);osa_mutex_unlock(&a->life_mu);osa_mutex_destroy(&a->life_mu);osa_mutex_destroy(&a->engine_mu);osa_mutex_destroy(&a->db_mu);free(a);}
+void osa_app_set_device(osa_app*a,bool gpu){if(!a)return;locke(a);a->use_gpu=gpu;unlocke(a);lockd(a);osa_db_set_setting(a->db,"device",gpu?"gpu":"cpu");unlockd(a);}
+bool osa_app_gpu(osa_app*a){if(!a)return false;locke(a);bool g=a->use_gpu;unlocke(a);return g;}
+/* A stable token, not a sentence: the UI localises it. Four honest answers —
+ * "gpu" (offloaded), "gpu-requested-cpu" (asked, not possible here),
+ * "cpu" (running on the CPU as configured), "cpu-only" (this build has no GPU
+ * backend at all, so the choice cannot be honoured). */
+const char*osa_app_device_status(osa_app*a){
+    if(!a)return "cpu";
+    locke(a);
+    const char *t;
+    if(a->gpu_compiled) t = osa_streq(a->device_note,"gpu") ? "gpu" : (a->use_gpu ? "gpu-requested-cpu" : "cpu");
+    else t = "cpu-only";
+    unlocke(a);
+    return t;
+}
 void osa_app_set_threads(osa_app*a,int n){if(!a)return;locke(a);a->worker_threads=osa_clampi(n,1,16);if(a->asr)wsp_set_threads(a->asr,a->worker_threads);unlocke(a);}
 int  osa_app_threads(osa_app*a){if(!a)return 1;locke(a);int n=a->worker_threads;unlocke(a);return n>0?n:1;}
 void osa_app_cancel(osa_app*a){if(a)osa_atomic_inc(&a->cancel);} void osa_app_reset_cancel(osa_app*a){if(a)__sync_lock_test_and_set(&a->cancel,0);}
@@ -366,7 +397,8 @@ bool osa_app_remove_model(osa_app*a,const char*id,osa_error*err){
 
 /* ---- models folder + synchronisation ------------------------------- */
 void osa_app_models_dir(osa_app*a,char*out,size_t cap){
-    if(!out||!cap)return;out[0]=0;
+    if(!out||!cap)return;
+    out[0]=0;
     if(!a){osa_strlcpy(out,osa_path(OSAI_DIR_MODELS),cap);return;}
     osa_strlcpy(out,a->models_dir,cap);
 }
@@ -505,7 +537,10 @@ static bool recognize_opt(osa_app*a,const float*pcm,int64_t n,bool live,osa_erro
     wsp_set_threads(a->asr,live?budget:(budget>1?budget-1:1));
     bool ok=wsp_transcribe_ex(a->asr,pcm,n,hint,live?256:0,r,e,sizeof e);
     if(live)wsp_set_threads(a->asr,threads);
-    if(ok)osa_strlcpy(a->last_language,r->language,sizeof a->last_language);unlocke(a);if(!ok)osa_err_set(err,"%s",e);return ok;}
+    if(ok)osa_strlcpy(a->last_language,r->language,sizeof a->last_language);
+    unlocke(a);
+    if(!ok)osa_err_set(err,"%s",e);
+    return ok;}
 static bool recognize(osa_app*a,const float*pcm,int64_t n,wsp_result*r,osa_error*err){return recognize_opt(a,pcm,n,false,err,r);}
 bool osa_app_recognize_live(osa_app*a,const float*s,int64_t n,bool partial,char*text,size_t tc,char*lang,size_t lc,float*conf,osa_error*err){if(!a)return false;wsp_result r;memset(&r,0,sizeof r);if(!recognize_opt(a,s,n,true,err,&r))return false;if(text&&tc){if(strlen(r.text)>=tc){osa_err_set(err,"recognition output buffer too small");return false;}osa_strlcpy(text,r.text,tc);}if(lang&&lc)osa_strlcpy(lang,r.language,lc);if(conf)*conf=r.confidence;(void)partial;return true;}
 static bool persist_transcript(osa_app*a,const wsp_result*r,double dur,double ms,const char*audio,osa_app_transcript*out,osa_error*err){memset(out,0,sizeof*out);osa_uuid(out->id);osa_strlcpy(out->text,r->text,sizeof out->text);osa_strlcpy(out->language,r->language,sizeof out->language);osa_strlcpy(out->model_id,a->asr_id,sizeof out->model_id);out->confidence=r->confidence;out->duration_s=dur;out->proc_ms=ms;out->rtf=dur>0?ms/(dur*1000):0;for(char*p=out->text;*p;){while(*p==' '||*p=='\n'||*p=='\t')p++;if(!*p)break;out->n_words++;while(*p&&*p!=' '&&*p!='\n'&&*p!='\t')p++;}osa_transcription t;memset(&t,0,sizeof t);osa_strlcpy(t.id,out->id,sizeof t.id);osa_strlcpy(t.audio_path,audio?audio:"",sizeof t.audio_path);osa_strlcpy(t.model_id,out->model_id,sizeof t.model_id);osa_strlcpy(t.language,out->language,sizeof t.language);osa_strlcpy(t.source,audio&&*audio?"file":"microphone",sizeof t.source);osa_strlcpy(t.text,out->text,sizeof t.text);osa_strlcpy(t.status,"done",sizeof t.status);t.confidence=r->confidence;t.duration_ms=(int64_t)(dur*1000);t.proc_ms=(int64_t)ms;osa_iso_time(osa_now_ms(),t.created_at);lockd(a);bool ok=osa_store_transcription_add(a->db,&t,err);unlockd(a);return ok;}
@@ -540,7 +575,16 @@ bool osa_app_translate(osa_app*a,const char*t,const char*s,osa_app_translation*o
 bool osa_app_translate_live(osa_app*a,const char*t,const char*s,osa_app_translation*o,osa_error*e){return translate_core(a,t,s,o,false,e);}
 bool osa_app_transcribe_and_translate(osa_app*a,const char*path,osa_app_transcript*tr,osa_app_translation*mt,osa_error*err){if(!osa_app_transcribe_file(a,path,tr,err))return false;if(!tr->text[0]){osa_err_set(err,"no speech recognised");return false;}if(!osa_app_translate(a,tr->text,tr->language,mt,err))return false;osa_arena ar;osa_arena_init(&ar);char*sql=osa_arena_printf(&ar,"UPDATE Translations SET transcription_id='%s' WHERE id='%s'",osa_sql_escape(&ar,tr->id),osa_sql_escape(&ar,mt->id));lockd(a);bool ok=osa_sql_exec(a->db,sql,err);unlockd(a);osa_arena_free(&ar);return ok;}
 const char*osa_app_translate_preview(osa_app*a,const char*t){(void)a;(void)t;return "";} /* history renders stored output, never inference while painting */
-bool osa_app_pronounce(const char*t,const char*l,char*out,size_t cap){if(!out||!cap)return false;out[0]=0;if(!t||!*t||!(osa_streq(l,"fa")||osa_streq(l,"en")))return false;return mt_pronounce(t,osa_streq(l,"fa")?MT_FA:MT_EN,out,cap);}
+/* Set by osa_app_pronounce: the visible sentence is in a script with no reader
+ * here, so the UI can say that instead of showing a silently empty line. */
+static bool a_pron_unsupported;
+/* آوانویسی for whatever language the translation is in. The reader is chosen by
+ * the language tag (script), not by a hard-coded pair, so German, Russian,
+ * Greek, Arabic and the rest get a line too. Returns false only when there is
+ * nothing useful to show: Persian output (already readable) or a script this
+ * build cannot read letter by letter. */
+bool osa_app_pronounce(const char*t,const char*l,char*out,size_t cap){if(!out||!cap)return false;out[0]=0;if(!t||!*t||!l||!*l)return false;bool unsupported=false;if(!mt_pronounce_ex(t,l,out,cap,&unsupported)){out[0]=0;return false;}a_pron_unsupported=unsupported;return true;}
+bool osa_app_pronounce_unsupported(void){return a_pron_unsupported;}
 
 /* ---- history/corrections ---- */
 char*osa_app_history_json(osa_app*a,int limit,osa_error*err){if(!a)return NULL;osa_rs rs;lockd(a);bool ok=osa_store_transcription_list(a->db,&rs,limit>0?limit:50,NULL,err);osa_buf b;osa_buf_init(&b);osa_buf_putc(&b,'[');if(ok)for(int i=0;i<rs.nrows;i++){if(i)osa_buf_putc(&b,',');osa_buf_puts(&b,"{\"id\":");json_str(&b,osa_rs_val(&rs,i,"id"));osa_buf_puts(&b,",\"text\":");json_str(&b,osa_rs_val(&rs,i,"text"));osa_buf_puts(&b,",\"language\":");json_str(&b,osa_rs_val(&rs,i,"language"));osa_buf_printf(&b,",\"confidence\":%.3f,\"duration_ms\":%lld,\"created_at\":",osa_rs_dbl(&rs,i,"confidence"),(long long)osa_rs_i64(&rs,i,"duration_ms"));json_str(&b,osa_rs_val(&rs,i,"created_at"));osa_buf_puts(&b,",\"audio\":");json_str(&b,osa_rs_val(&rs,i,"audio_path"));osa_arena ar;osa_arena_init(&ar);char*sql=osa_arena_printf(&ar,"SELECT text,target_lang FROM Translations WHERE transcription_id='%s' ORDER BY created_at DESC LIMIT 1",osa_sql_escape(&ar,osa_rs_val(&rs,i,"id")));osa_rs tr;if(osa_sql_query(a->db,sql,&tr,NULL)&&tr.nrows){osa_buf_puts(&b,",\"translation\":");json_str(&b,osa_rs_val(&tr,0,"text"));osa_buf_puts(&b,",\"target_lang\":");json_str(&b,osa_rs_val(&tr,0,"target_lang"));}osa_rs_free(&tr);osa_arena_free(&ar);osa_buf_putc(&b,'}');}osa_rs_free(&rs);unlockd(a);osa_buf_putc(&b,']');if(!ok){osa_buf_free(&b);return NULL;}return osa_buf_detach(&b);}

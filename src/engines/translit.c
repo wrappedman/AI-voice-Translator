@@ -508,6 +508,16 @@ static void render_rule_word(const char *word, char *out, size_t cap, size_t *o)
     }
 }
 
+/* A dictionary word, or NULL. Used by the reader in pronounce.c for English
+ * irregular spellings; keeping one dictionary in one place means the two readers
+ * cannot drift apart. */
+const char *mt_pronounce_known(const char *word) {
+    if (!word) return NULL;
+    for (int i = 0; i < PRON_N; i++)
+        if (osa_streq(PRON[i].en, word)) return PRON[i].fa;
+    return NULL;
+}
+
 /* ---------------------------------------------------------------------
  *  Public entry point
  * ------------------------------------------------------------------- */

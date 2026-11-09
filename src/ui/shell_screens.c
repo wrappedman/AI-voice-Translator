@@ -931,8 +931,12 @@ static void draw_translate(shell_state *s, ui_context *u, osa_rect body) {
     c_hline(u->c, out_r.x + p, out_r.x + out_r.w - p, out_r.y + 42 * u->L.scale, 1,
             u->t.border_soft);
 
-    bool ph = s->show_phonetic && s->tr_phonetic[0];
-    float ph_h = ph ? 52 * u->L.scale : 0;
+    /* The آوانویسی box appears whenever the switch is on: when a script cannot be
+     * read letter by letter it says so, because an empty line is indistinguishable
+     * from a broken feature. */
+    bool ph = s->show_phonetic && (s->tr_phonetic[0] || s->tr_out[0]);
+    bool ph_note = ph && !s->tr_phonetic[0];
+    float ph_h = ph ? (ph_note ? 58 : 52) * u->L.scale : 0;
     osa_rect tr = rectf(out_r.x + p, out_r.y + 52 * u->L.scale, out_r.w - p * 2,
                         out_r.h - 64 * u->L.scale - ph_h);
     if (tr.h < 24) tr.h = 24;
@@ -963,10 +967,17 @@ static void draw_translate(shell_state *s, ui_context *u, osa_rect body) {
         po.max_width = pr.w - 24 * u->L.scale;
         po.rtl = true;
         po.align = 2;
-        text_draw_box(u->c, u->reg, UI_FS_BODY * u->L.scale, u->t.text,
-                      rectf(pr.x + 12 * u->L.scale, pr.y + 18 * u->L.scale,
-                            pr.w - 24 * u->L.scale, 24 * u->L.scale),
-                      s->tr_phonetic, po);
+        if (ph_note) {
+            text_draw_box(u->c, u->reg, UI_FS_TINY * u->L.scale, u->t.text_faint,
+                          rectf(pr.x + 12 * u->L.scale, pr.y + 18 * u->L.scale,
+                                pr.w - 24 * u->L.scale, 32 * u->L.scale),
+                          kl(s, "phonetic.unsupported"), po);
+        } else {
+            text_draw_box(u->c, u->reg, UI_FS_BODY * u->L.scale, u->t.text,
+                          rectf(pr.x + 12 * u->L.scale, pr.y + 18 * u->L.scale,
+                                pr.w - 24 * u->L.scale, 24 * u->L.scale),
+                          s->tr_phonetic, po);
+        }
     }
 
 }
@@ -1556,6 +1567,35 @@ static void draw_settings(shell_state *s, ui_context *u, osa_rect body) {
                                    : a.x + a.w - p - 40 * u->L.scale,
                           y + 8 * u->L.scale, 40 * u->L.scale, 28 * u->L.scale),
                  pct, UI_FS_SMALL * u->L.scale, u->t.text_dim, u->L.rtl ? 0 : 2);
+    }
+    y += row_h;
+
+    /* Compute device: CPU or GPU. The hint is not decorative — it says what this
+     * build can do, because a package with the CPU backend cannot honour a GPU
+     * request and must say so instead of quietly ignoring it. */
+    {
+        /* The status is a token from the app, localised here: an English
+         * sentence in the middle of a Persian row reads like a bug. */
+        const char *tok = osa_app_device_status(s->app);
+        const char *hint = osa_streq(tok, "gpu") ? kl(s, "settings.dev.gpu")
+                         : osa_streq(tok, "gpu-requested-cpu") ? kl(s, "settings.dev.gpureq")
+                         : osa_streq(tok, "cpu-only") ? kl(s, "settings.dev.cpuonly")
+                         : kl(s, "settings.dev.cpu");
+        setting_row(u, rectf(a.x + p, y, a.w - p * 2, row_h), kl(s, "settings.device"), hint);
+    }
+    {
+        osa_rect sr = rectf(u->L.rtl ? a.x + p : a.x + a.w - p - ctrl_w,
+                            y + 6 * u->L.scale, ctrl_w, 32 * u->L.scale);
+        /* The labels are localised before the widget sees them: it takes a
+         * "left|right" string, not keys. */
+        char labels[96];
+        snprintf(labels, sizeof labels, "%s|%s", kl(s, "settings.devicecpu"),
+                 kl(s, "settings.devicegpu"));
+        int sel = osa_app_gpu(s->app) ? 1 : 0;
+        if (ui_segmented(u, 8005, sr, labels, &sel, 2)) {
+            osa_app_set_device(s->app, sel == 1);
+            shell_save_prefs(s);
+        }
     }
     y += row_h;
 

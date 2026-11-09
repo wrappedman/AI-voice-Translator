@@ -139,6 +139,29 @@ bool mt_translate_styled(const mt_model *m, const char *text, mt_lang src,
  */
 bool mt_pronounce(const char *text, mt_lang from, char *out, size_t cap);
 
+/* The same, for a language named by its tag ("de", "ru", "el-GR", "ar" ...).
+ * This is the entry point the Translate screen uses: it follows the language of
+ * the translation, not one hard-coded pair, so آوانویسی works for every
+ * language the app can translate.
+ *
+ * `unsupported` is set to true when the text is written in a script that cannot
+ * be read letter by letter without a dictionary (Chinese, Japanese, Korean,
+ * Thai, the Indic scripts, Georgian, Armenian, Ethiopic, Khmer, Lao, Myanmar).
+ * The output then keeps those sentences as they are, and the caller shows a
+ * short note instead of pretending to know how they sound. */
+bool mt_pronounce_ex(const char *text, const char *tag, char *out, size_t cap,
+                     bool *unsupported);
+
+/* Which reader handles `tag`: "latin", "cyrillic", "greek", "arabic",
+ * "persian", "hebrew", "unsupported", "unknown". For tests and for the note in
+ * the UI. */
+const char *mt_pronounce_script(const char *tag);
+
+/* The known-pronunciation dictionary: the Persian reading of an English word, or
+ * NULL when the word is not in it. Shared with the multi-script reader so both
+ * read "you" the same way. */
+const char *mt_pronounce_known(const char *word);
+
 /* Language of a text, by script detection. Never MT_AUTO. */
 mt_lang mt_detect_lang(const char *text);
 

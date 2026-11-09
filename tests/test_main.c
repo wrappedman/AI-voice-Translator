@@ -25,6 +25,8 @@
 #include "osai_app.h"
 #include "audio.h"
 #include "shell.h"
+#include "mt.h"
+#include "lang_script.h"
 
 static int g_pass, g_fail;
 static void suite(const char *name){ printf("\n%s\n",name); }
@@ -1027,6 +1029,117 @@ static void test_optional_real_models(void){
     osa_app_destroy(app); clean_root();
 }
 
+
+/* ---- آوانویسی: every supported language, correct diacritics ---------- */
+static void test_pronunciation_languages(void){
+    suite("pronunciation for every supported language");
+    char out[512];
+    bool uns=false;
+
+    /* The bug this covers: pronunciation used to be produced for English only. */
+    struct { const char *text, *tag; } OK[] = {
+        {"danke schön","de"},       {"bonjour","fr"},      {"gracias","es"},
+        {"grazie","it"},            {"спасибо","ru"},      {"καλημέρα","el"},
+        {"شكرا","ar"},              {"שלום","he"},         {"bedankt","nl"},
+        {"teşekkürler","tr"},       {"obrigado","pt"},     {"dziękuję","pl"},
+        {"köszönöm","hu"},          {"hyvää päivää","fi"}, {"xin chào","vi"},
+        {"terima kasih","id"},      {"asante","sw"},       {"hallo wereld","af"},
+    };
+    for (unsigned i=0;i<sizeof OK/sizeof*OK;i++){
+        out[0]=0;
+        bool ok=mt_pronounce_ex(OK[i].text,OK[i].tag,out,sizeof out,&uns);
+        CHECK_MSG(ok&&out[0]!=0,"pronunciation produced text for '%s' (%s)",OK[i].tag,OK[i].text);
+        CHECK_MSG(!uns,"'%s' is not reported as unsupported",OK[i].tag);
+    }
+
+    /* Persian output needs no transliteration: it is already readable. */
+    CHECK(!mt_pronounce_ex("سلام","fa",out,sizeof out,&uns));
+    /* Scripts that need a dictionary are refused, not turned into noise. */
+    CHECK(!mt_pronounce_ex("谢谢","zh",out,sizeof out,&uns));
+    CHECK(uns);
+    uns=false;
+    CHECK(!mt_pronounce_ex("こんにちは","ja",out,sizeof out,&uns));
+    CHECK(uns);
+
+    /* Diacritics: a short vowel is a mark on the consonant before it, never a mark
+     * on ا/ی/و, and never two marks on one letter. */
+    out[0]=0; mt_pronounce_ex("spasibo","en",out,sizeof out,&uns);
+    for (const char *p=out;*p;p++){
+        if ((unsigned char)p[0]==0xD9 && ((unsigned char)p[1]==0x8E||
+                                          (unsigned char)p[1]==0x90||
+                                          (unsigned char)p[1]==0x8F)){
+            /* the byte before a diacritic is the last byte of a letter */
+            const char *q=p-1; while (q>out && ((unsigned char)*q&0xC0)==0x80) q--;
+            unsigned char b0=(unsigned char)q[0], b1=(unsigned char)q[1];
+            uint32_t letter=(b0>=0xE0)?(((uint32_t)(b0&0x0F)<<12)|((uint32_t)(b1&0x3F)<<6)|((unsigned char)q[2]&0x3F))
+                                      :(((uint32_t)(b0&0x1F)<<6)|(b1&0x3F));
+            CHECK_MSG(letter!=0x0627&&letter!=0x06CC&&letter!=0x0648,
+                      "no diacritic sits on a long-vowel letter (%s)",out);
+            CHECK_MSG(!((unsigned char)p[2]==0xD9),"no doubled diacritics (%s)",out);
+        }
+    }
+
+    /* The same sentence in two languages must not come out the same: the language
+     * tag really selects a reader. */
+    char de[256],fr[256];
+    mt_pronounce_ex("danke","de",de,sizeof de,&uns);
+    mt_pronounce_ex("danke","fr",fr,sizeof fr,&uns);
+    CHECK_MSG(strcmp(de,fr)!=0,"language selects the reading rules (%s vs %s)",de,fr);
+    /* A German ü is یو, not a folded u: the language table is consulted before
+     * the accent is folded away. */
+    char ue[256], fr_ue[256];
+    mt_pronounce_ex("über","de",ue,sizeof ue,&uns);
+    mt_pronounce_ex("uber","de",fr_ue,sizeof fr_ue,&uns);
+    CHECK_MSG(strcmp(ue,fr_ue)!=0,"German ü keeps its own reading (%s)",ue);
+
+    /* Long text is truncated at a character boundary, never mid-sequence. */
+    char big[512];
+    for (int i=0;i<200;i++) big[i]=(char)('a'+(i%26));
+    big[200]=0;
+    out[0]=0;
+    CHECK(mt_pronounce_ex(big,"en",out,sizeof out,&uns));
+    CHECK_MSG(osa_utf8_valid(out,strlen(out)),"truncated pronunciation is still valid UTF-8");
+}
+
+
+/* ---- "did it translate?": the chatty-model regression ---------------- */
+static void test_translation_target_script(void){
+    suite("translation output must be in the target language's script");
+
+    /* The reported failure: English -> Persian, model answered the input. */
+    CHECK(!osa_translation_in_target_script("Hello! How can I assist you today?",
+                                            "fa", "hello", "en"));
+    CHECK(osa_translation_in_target_script("سلام! چطور می‌توانم کمک کنم؟",
+                                           "fa", "hello", "en"));
+    /* The other direction, and the other scripts. */
+    CHECK(!osa_translation_in_target_script("سلام، حال شما چطور است؟", "en", "hello", "fa"));
+    CHECK(osa_translation_in_target_script("Hello, how are you?", "en", "سلام", "fa"));
+    CHECK(osa_translation_in_target_script("Спасибо", "ru", "thanks", "en"));
+    CHECK(!osa_translation_in_target_script("Thank you", "ru", "thanks", "en"));
+    CHECK(osa_translation_in_target_script("ありがとう", "ja", "thanks", "en"));
+    CHECK(osa_translation_in_target_script("谢谢", "zh", "thanks", "en"));
+
+    /* Not translations: a number, a name, an email. A result without letters must
+     * not be refused, and a Persian name inside an English sentence stays Persian. */
+    CHECK(osa_translation_in_target_script("42", "fa", "42", "en"));
+    CHECK(osa_translation_in_target_script("OpenSpeech AI", "en", "OpenSpeech AI", "fa"));
+    CHECK(osa_translation_in_target_script("OpenSpeech AI", "fa", "OpenSpeech AI", "en"));
+    /* But a chatty answer that merely borrows the input's script is not a translation. */
+    CHECK(!osa_translation_in_target_script("Hello! How can I assist you today?", "fa", "hello", "en"));
+    CHECK(osa_translation_in_target_script("«تهران» is the capital", "en", "تهران", "fa"));
+
+    /* A target tag the app does not know must not cause a false refusal. */
+    CHECK(osa_translation_in_target_script("qualcosa", "xx", "something", "en"));
+
+    /* Language names for the prompt: a model reads "Persian", not "fa". */
+    CHECK(osa_streq(osa_language_name("fa"), "Persian"));
+    CHECK(osa_streq(osa_language_name("en-GB"), "English"));
+    CHECK(osa_streq(osa_language_name("de"), "German"));
+    CHECK(osa_script_for_tag("ru") == OSA_SCRIPT_CYRILLIC);
+    CHECK(osa_script_for_tag("fa") == OSA_SCRIPT_ARABIC);
+    CHECK(osa_script_for_tag("ja") == OSA_SCRIPT_KANA);
+}
+
 int main(void){
     test_json_unicode();
     test_catalog_and_gate();
@@ -1048,6 +1161,8 @@ int main(void){
     test_speak_path();
     test_live_capture_pipeline();
     test_fasttext_language_model();
+    test_pronunciation_languages();
+    test_translation_target_script();
     test_portable_data_dir();
     test_optional_real_models();
     printf("\n%d passed, %d failed\n",g_pass,g_fail);
