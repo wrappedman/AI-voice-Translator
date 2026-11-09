@@ -45,6 +45,10 @@ typedef struct osa_app_translation {
     char     engine[32];
     double   confidence;
     double   elapsed_ms;
+    /* True when the engine returned the source unchanged because the two
+     * languages are the same. The screen says "same language" then, instead of
+     * presenting an untranslated sentence as a translation. */
+    bool     same_language;
 } osa_app_translation;
 
 /* Snapshot of the machine + data directories, for the status bar. */
@@ -107,6 +111,40 @@ bool osa_app_recognize(osa_app *app, const float *samples, int64_t n,
                        char *text, size_t text_cap, char *lang, size_t lang_cap,
                        float *confidence, osa_error *err);
 
+/* Threads each worker may use: half of this machine's cores, capped at 8 by
+ * default and never zero. The remainder is headroom for the UI, the operating
+ * system and audio capture, which is what stops a translation from pinning
+ * every core at 100% and making the whole PC unresponsive. Set from Settings. */
+void osa_app_set_threads(osa_app *app, int threads);
+int  osa_app_threads(osa_app *app);
+
+/* Where inference runs: CPU (always available) or the GPU. The choice is passed
+ * to the worker as --device, and changing it restarts the translation worker so
+ * the next request really uses the new device: it used to be stored and then
+ * ignored, because ensure_worker() reuses the process it already has. */
+void osa_app_set_device(osa_app *app, bool gpu);
+bool osa_app_gpu(osa_app *app);
+
+/* Ask the worker which backends this build can compute on. Cached after the
+ * first call and refreshed only when `refresh` is true. A package built with
+ * -DGGML_USE_CPU registers the CPU and nothing else, so a GPU request can be
+ * refused *before* the user waits a minute for a translation and then watches
+ * task manager show 100% CPU with no explanation. Safe from any thread. */
+bool osa_app_gpu_available(osa_app *app, bool refresh);
+
+/* What this build can actually use for inference, and what the worker reported
+ * after the last translation model loaded. Both are honest strings for the UI:
+ * "CPU only" is an answer, an empty box is not. */
+const char *osa_app_device_status(osa_app *app);
+
+/* The same, for the live screen: `partial` marks a pass over a sentence the
+ * speaker has not finished, so the decoder's text context is capped (a partial
+ * is re-decoded every second and must cost little) and the engine may use more
+ * threads than a file pass. Results are identical in shape. */
+bool osa_app_recognize_live(osa_app *app, const float *samples, int64_t n, bool partial,
+                            char *text, size_t text_cap, char *lang, size_t lang_cap,
+                            float *confidence, osa_error *err);
+
 bool osa_app_transcribe_samples(osa_app *app, const float *samples, int64_t n,
                                 osa_app_transcript *out, osa_error *err);
 
@@ -160,6 +198,12 @@ const char *osa_app_translate_preview(osa_app *app, const char *text);
  * letters with diacritics; Persian input is returned unchanged because it is
  * already readable). Returns false when there is nothing to transliterate. */
 bool osa_app_pronounce(const char *text, const char *lang, char *out, size_t cap);
+
+/* True when the last osa_app_pronounce() saw a sentence written in a script this
+ * build cannot read letter by letter (Chinese, Japanese, Korean, Thai, the Indic
+ * scripts, Georgian, Armenian, Ethiopic, Khmer, Lao, Myanmar). The screen shows a
+ * one-line note then; an empty line with no explanation reads like a bug. */
+bool osa_app_pronounce_unsupported(void);
 
 /* One-shot: transcribe then translate, linking both rows. */
 bool osa_app_transcribe_and_translate(osa_app *app, const char *path,
@@ -248,6 +292,10 @@ typedef struct osa_sync_result {
     int existing;                /* already registered, nothing to do      */
     int unknown;                 /* not in the verified catalogue          */
     char unknown_names[400];     /* a few names, for an honest report      */
+    /* The file being read right now. Hashing one large model takes minutes and
+     * the file counter cannot move meanwhile, so the UI shows this instead of
+     * an apparently frozen "0 / 6". */
+    char current[128];
 } osa_sync_result;
 
 /* Identifies the files already present in the models folder by SHA-256 against

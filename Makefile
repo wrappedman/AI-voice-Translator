@@ -105,16 +105,24 @@ LLAMA_CPP := $(wildcard $(LLAMA_DIR)/src/*.cpp) $(wildcard $(LLAMA_DIR)/ggml/src
              $(filter-out $(LLAMA_DIR)/ggml/src/ggml-cpu/arch/x82%,$(wildcard $(LLAMA_DIR)/ggml/src/ggml-cpu/*.cpp))
 LLAMA_INC := -I$(LLAMA_DIR)/include -I$(LLAMA_DIR)/ggml/include -I$(LLAMA_DIR)/ggml/src \
              -I$(LLAMA_DIR)/ggml/src/ggml-cpu -I$(LLAMA_DIR)/src -I$(SRC)/third_party \
-             -I$(FTXT_DIR)/src
+             -I$(FTXT_DIR)/src -I$(SRC)/engines -I$(SRC)/core
 LLAMA_DEF := -DGGML_VERSION=\"b6018\" -DGGML_COMMIT=\"bda62193\" -D_GNU_SOURCE -DNDEBUG -DGGML_USE_CPU -DGGML_CPU_GENERIC -DGGML_USE_LLAMAFILE=0
 FTXT_SRC  := $(wildcard $(FTXT_DIR)/src/*.cc)
 WORKER_SRC := $(SRC)/worker/worker.cpp
+# The worker shares the language/script table with the GUI (it is what decides
+# whether a translation came back in the target language).
+LANGSCRIPT_SRC := $(SRC)/engines/lang_script.c
 WORKER_LINUX := $(BUILD)/OpenSpeechWorker
 WORKER_WIN := $(DIST)/bin/OpenSpeechWorker.exe
 WORKER_OBJ := $(patsubst %.c,$(BUILD)/worker-lin/%.c.o,$(LLAMA_C)) \
               $(patsubst %.cpp,$(BUILD)/worker-lin/%.cpp.o,$(LLAMA_CPP)) \
               $(patsubst %.cc,$(BUILD)/worker-lin/%.cc.o,$(FTXT_SRC)) \
+              $(BUILD)/worker-lin/src/engines/lang_script.o \
               $(BUILD)/worker-lin/$(WORKER_SRC).o
+
+$(BUILD)/worker-lin/src/engines/lang_script.o: $(LANGSCRIPT_SRC) $(SRC)/engines/lang_script.h
+	@mkdir -p $(dir $@)
+	$(CC) -std=c11 -O2 $(LLAMA_INC) -I$(SRC)/core -I$(SRC)/engines -c $< -o $@
 
 .PHONY: worker
 worker: $(WORKER_LINUX)
@@ -200,16 +208,20 @@ WIN_LIBS := -lws2_32 -lshlwapi -lshell32 -lole32 -loleaut32 -lgdi32 -luser32 \
 WORKER_WIN_OBJ := $(patsubst %.c,$(BUILD)/worker-win/%.c.o,$(LLAMA_C)) \
                   $(patsubst %.cpp,$(BUILD)/worker-win/%.cpp.o,$(LLAMA_CPP)) \
                   $(patsubst %.cc,$(BUILD)/worker-win/%.cc.o,$(FTXT_SRC)) \
+                  $(BUILD)/worker-win/src/engines/lang_script.o \
                   $(BUILD)/worker-win/$(WORKER_SRC).o
 $(BUILD)/worker-win/%.c.o: %.c
 	@mkdir -p $(dir $@)
-	$(WIN_CC) -std=c11 $(LLAMA_DEF) $(LLAMA_INC) -c $< -o $@
+	$(WIN_CC) -std=c11 -MMD -MP $(LLAMA_DEF) $(LLAMA_INC) -c $< -o $@
 $(BUILD)/worker-win/%.cpp.o: %.cpp
 	@mkdir -p $(dir $@)
-	$(WIN_CXX) -std=c++17 $(LLAMA_DEF) $(LLAMA_INC) -c $< -o $@
+	$(WIN_CXX) -std=c++17 -MMD -MP $(LLAMA_DEF) $(LLAMA_INC) -c $< -o $@
 $(BUILD)/worker-win/%.cc.o: %.cc
 	@mkdir -p $(dir $@)
-	$(WIN_CXX) -std=c++17 $(LLAMA_INC) -c $< -o $@
+	$(WIN_CXX) -std=c++17 -MMD -MP $(LLAMA_INC) -c $< -o $@
+$(BUILD)/worker-win/src/engines/lang_script.o: $(LANGSCRIPT_SRC) $(SRC)/engines/lang_script.h
+	@mkdir -p $(dir $@)
+	$(WIN_CC) -std=c11 -MMD -MP -I$(SRC)/core -I$(SRC)/engines -c $< -o $@
 $(BUILD)/worker-win/res.o: $(SRC)/platform/win32/worker.rc $(SRC)/platform/win32/worker.manifest
 	@mkdir -p $(dir $@)
 	$(ZIG) rc /fo $@ /I $(SRC)/platform/win32 $(SRC)/platform/win32/worker.rc
@@ -221,7 +233,7 @@ win: $(WIN_BIN) $(WORKER_WIN)
 
 $(BUILD)/win/%.o: %.c
 	@mkdir -p $(dir $@)
-	$(WIN_CC) -std=c11 $(INCLUDES) -DOSAI_WIN_MEDIA_FOUNDATION -c $< -o $@
+	$(WIN_CC) -std=c11 -MMD -MP $(INCLUDES) -DOSAI_WIN_MEDIA_FOUNDATION -DOSAI_WIN_SAPI -c $< -o $@
 
 $(BUILD)/win/sqlite3.o: $(SRC)/third_party/sqlite/sqlite3.c
 	@mkdir -p $(dir $@)

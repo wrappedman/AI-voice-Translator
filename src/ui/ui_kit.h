@@ -67,6 +67,16 @@ typedef struct ui_layout {
     int    win_w, win_h;
 } ui_layout;
 
+/* Clipboard shortcuts. The platform layer decodes the window's key events (only
+ * it can read the system clipboard) and raises these as private-use scalar
+ * values in ui_input.chars; the focused text widget consumes them. Choosing
+ * private-use code points keeps the key path identical to typed characters, so
+ * no widget needs to know about key codes or modifiers. */
+#define UI_KEY_PASTE      0xE000u
+#define UI_KEY_COPY       0xE001u
+#define UI_KEY_CUT        0xE002u
+#define UI_KEY_SELECT_ALL 0xE003u
+
 /* ---- interaction state ------------------------------------------- */
 typedef struct ui_input {
     float  mx, my;          /* current pointer                      */
@@ -106,6 +116,11 @@ typedef struct ui_context {
      * the shell says it has focus, otherwise clicking a button would leave the
      * caret blinking in an unfocused box. */
     int          focus_id;
+    /* Set by a focused text widget when the user pressed Ctrl+C (1) or
+     * Ctrl+X (2). The screen that owns the field reads it, puts the field's text
+     * on the clipboard and clears it: the widget does not know what "the text of
+     * this row" means for the screen's layout. */
+    int          copy_request;
     char         tooltip[256];
     osa_rect     tooltip_anchor;
     /* open drop-down, owned by the shell */
@@ -209,6 +224,10 @@ bool  ui_row(ui_context *u, int id, osa_rect r, bool selected);
 
 /* Segmented control over N labels separated by '|' ("فارسی|English"). */
 bool  ui_segmented(ui_context *u, int id, osa_rect r, const char *labels, int *value, int n);
+/* Same, but the segment at `disabled_slot` (0-based, -1 for none) is drawn
+ * inactive and cannot be selected: for a choice this build cannot honour. */
+bool  ui_segmented_disabled(ui_context *u, int id, osa_rect r, const char *labels,
+                            int *value, int n, int disabled_slot);
 
 /* Numeric stepper with -/+ buttons. Returns true when the value changed. */
 bool  ui_stepper(ui_context *u, int id, osa_rect r, int *value, int vmin, int vmax);

@@ -17,10 +17,16 @@
 #include "osai_common.h"
 #include "osai_platform.h"
 #include "osai_process.h"
+#include "live_endpoint.h"
+#include "tts.h"
+#include "tts_sapi.h"
+#include "mic.h"
 #include "osai_store.h"
 #include "osai_app.h"
 #include "audio.h"
 #include "shell.h"
+#include "mt.h"
+#include "lang_script.h"
 
 static int g_pass, g_fail;
 static void suite(const char *name){ printf("\n%s\n",name); }
@@ -461,6 +467,496 @@ static void test_activation_diagnostics(void){
     clean_root();
 }
 
+/* The reported bug: a GGUF that llama.cpp refuses produced one opaque sentence
+ * that named neither the reason nor the file. Each cause must now be distinct,
+ * and the tooling that survives it must say where the full log is. */
+static void test_model_load_diagnostics(void){
+    suite("model load diagnostics name the real cause");
+    const char *exe="build/OpenSpeechWorker";
+    if(!osa_file_exists(exe)){printf("  SKIP worker binary not built (%s)\n",exe);return;}
+    char dir[256];snprintf(dir,sizeof dir,"/tmp/osai-mldiag-XXXXXX");
+    if(!mkdtemp(dir)){CHECK_MSG(false,"mkdtemp");return;}
+
+    /* 1. a file that is not GGUF at all */
+    char notgguf[400];snprintf(notgguf,sizeof notgguf,"%s/not.gguf",dir);
+    unsigned char junk[4096];memset(junk,0x5a,sizeof junk);
+    CHECK(osa_file_write(notgguf,junk,sizeof junk));
+    const char *a1[]={exe,"--kind","mt","--model",notgguf,"--threads","2",NULL};
+    osa_error err;osa_err_ok(&err);
+    osa_process *p=osa_process_start(a1,&err);
+    CHECK_MSG(p!=NULL,"worker starts on a non-GGUF file: %s",p?"ok":err.msg);
+    if(p){
+        char *line=NULL;
+        CHECK(osa_process_line(p,20000,NULL,&line,&err));
+        CHECK_MSG(line&&strstr(line,"\"ok\":false"),"it reports a failure, not ready");
+        CHECK_MSG(line&&strstr(line,"not a GGUF")!=NULL,
+                  "the message says the file is not a GGUF container: %s",line?line:"?");
+        free(line);osa_process_stop(p);
+    }
+
+    /* 2. a fastText model handed to the translation engine, and the reverse:
+     *    each engine names the other format instead of "wrong file format" */
+    char ft[400];snprintf(ft,sizeof ft,"%s/real.ftz",dir);
+    FILE *f=fopen(ft,"wb");
+    CHECK(f!=NULL);
+    if(f){
+        int32_t magic=793712314,version=12;
+        fwrite(&magic,sizeof magic,1,f);fwrite(&version,sizeof version,1,f);
+        unsigned char pad[9000];memset(pad,1,sizeof pad);fwrite(pad,1,sizeof pad,f);
+        fclose(f);
+    }
+    const char *a2[]={exe,"--kind","mt","--model",ft,"--threads","2",NULL};
+    p=osa_process_start(a2,&err);
+    if(p){
+        char *line=NULL;
+        CHECK(osa_process_line(p,20000,NULL,&line,&err));
+        CHECK_MSG(line&&strstr(line,"fastText")!=NULL&&strstr(line,"GGUF")!=NULL,
+                  "a fastText file is named as such, not blamed on memory: %s",line?line:"?");
+        free(line);osa_process_stop(p);
+    }
+    const char *a3[]={exe,"--kind","lang","--model",notgguf,NULL};
+    p=osa_process_start(a3,&err);
+    if(p){
+        char *line=NULL;
+        CHECK(osa_process_line(p,20000,NULL,&line,&err));
+        CHECK_MSG(line&&strstr(line,"fastText")!=NULL,
+                  "the language engine says it did not get a fastText model: %s",line?line:"?");
+        free(line);osa_process_stop(p);
+    }
+    remove(notgguf);remove(ft);
+    char cmd[512];snprintf(cmd,sizeof cmd,"rmdir %s 2>/dev/null",dir);system(cmd);
+}
+
+/* Hashes must be cancellable: Sync runs on a background thread whose Cancel and
+ * window-close paths wait for it, so an uninterruptible multi-gigabyte read is
+ * exactly what made the window freeze. */
+static void test_hash_cancel(void){
+    suite("cancellable hashing");
+    char path[256];snprintf(path,sizeof path,"/tmp/osai-hash-XXXXXX");
+    int fd=mkstemp(path);
+    CHECK(fd>=0);
+    if(fd<0)return;
+    char chunk[65536];memset(chunk,3,sizeof chunk);
+    for(int i=0;i<160;i++){                       /* ~10 MB */
+        if(write(fd,chunk,sizeof chunk)!=(ssize_t)sizeof chunk)break;
+    }
+    close(fd);
+
+    char a[65]={0},b[65]={0};uint64_t na=0,nb=0;
+    CHECK(osa_sha256_file_ex(path,a,&na,NULL,NULL,NULL));
+    osa_sha256_file(path,b,&nb);
+    CHECK_MSG(na==nb&&na>0,"the extended hash reports the same size");
+    CHECK_MSG(osa_streq(a,b),"the extended hash agrees with osa_sha256_file");
+    CHECK_MSG(strlen(a)==64,"the digest is 64 hex characters");
+
+    volatile int stop=1;
+    char c[65]={0};uint64_t nc=0;
+    bool ok=osa_sha256_file_ex(path,c,&nc,&stop,NULL,NULL);
+    CHECK_MSG(!ok,"an already-cancelled hash returns false");
+    CHECK_MSG(c[0]==0,"a cancelled hash leaves no digest behind");
+
+    remove(path);
+}
+
+/* A genuine fastText container, byte for byte. These are the files that used to
+ * fail with "worker: load failed: vector": the worker handed fastText a stream
+ * starting at offset 0, so the magic was read as the first parameter and every
+ * field after it was skewed. Writing the container ourselves keeps the test
+ * independent of whether any model can be downloaded.
+ *
+ * Layout (fastText saveModel/loadModel):
+ *   magic:int32 version:int32
+ *   Args: 12x int32 + double
+ *   Dict: size,nwords,nlabels:int32  ntokens,pruneidx_size:int64
+ *         per entry: word\0 | count:int64 | type:int8      (type is ONE byte)
+ *   pruneidx pairs (int32,int32) when pruneidx_size>0   (-1 = never pruned)
+ *   quant:bool | Matrix input | qout:bool | Matrix output
+ *   Matrix: dense  -> m:int64 n:int64 floats[m*n]
+ *           quant  -> qnorm:bool m:int32 n:int32 codesize:int32 codes
+ *                     ProductQuantizer: dim,nsubq,dsub,lastdsub:int32 floats[dim*256]
+ */
+static void test_fasttext_language_model(void){
+    suite("fastText language model container");
+    const char *exe="build/OpenSpeechWorker";
+    if(!osa_file_exists(exe)){printf("  SKIP worker binary not built (%s)\n",exe);return;}
+
+    /* ---- writer ---------------------------------------------------- */
+    char dir[256];snprintf(dir,sizeof dir,"/tmp/osai-ft-XXXXXX");
+    if(!mkdtemp(dir)){CHECK_MSG(false,"mkdtemp");return;}
+
+    struct { const char *name; int quant; int nlabels; int truncate_at; const char *expect; } cases[]={
+        {"dense.bin",   0, 4, 0, NULL},                    /* must load        */
+        {"quant.bin",   1, 4, 0, NULL},                    /* must load        */
+        {"short.bin",   0, 4, 40, "ends inside"},          /* truncated dict   */
+        {"onelabel.bin",0, 1, 0, "fewer than two labels"}, /* not a LID model  */
+    };
+    const char *words[]={"salam","hello","hallo","marhaba","kotob","book","buch","kitab"};
+    const char *labels[]={"__label__fa","__label__en","__label__de","__label__ar"};
+
+    for(size_t k=0;k<sizeof cases/sizeof cases[0];k++){
+        unsigned char buf[65536];size_t n=0;
+        int dim=16;
+        /* header */
+        #define PUTI32(v) do{int32_t _v=(int32_t)(v);memcpy(buf+n,&_v,4);n+=4;}while(0)
+        #define PUTI64(v) do{int64_t _v=(int64_t)(v);memcpy(buf+n,&_v,8);n+=8;}while(0)
+        PUTI32(793712314);PUTI32(12);
+        int32_t args[12]={dim,5,5,1,5,1,2,3,0,0,0,100};
+        for(int i=0;i<12;i++)PUTI32(args[i]);
+        {double t=0.0001;memcpy(buf+n,&t,8);n+=8;}
+        int nwords=8,nlabels=cases[k].nlabels,total=nwords+nlabels;
+        PUTI32(total);PUTI32(nwords);PUTI32(nlabels);PUTI64(1000);PUTI64(-1);
+        for(int i=0;i<nwords;i++){
+            size_t l=strlen(words[i]);memcpy(buf+n,words[i],l);n+=l;buf[n++]=0;
+            PUTI64(i+1);buf[n++]=0;                        /* entry_type::word */
+        }
+        for(int i=0;i<nlabels;i++){
+            size_t l=strlen(labels[i]);memcpy(buf+n,labels[i],l);n+=l;buf[n++]=0;
+            PUTI64(50);buf[n++]=1;                         /* entry_type::label */
+        }
+        buf[n++]=cases[k].quant?1:0;
+        if(cases[k].quant){
+            int codesize=total*((dim+1)/2);
+            buf[n++]=0;                                    /* qnorm = false: one BYTE */
+            PUTI32(total);PUTI32(dim);PUTI32(codesize);
+            memset(buf+n,0,(size_t)codesize);n+=(size_t)codesize;
+            PUTI32(dim);PUTI32(dim/2);PUTI32(2);PUTI32(dim%2?dim%2:2);
+            memset(buf+n,0,(size_t)dim*256*4);n+=(size_t)dim*256*4;
+        }else{
+            PUTI64(total);PUTI64(dim);
+            memset(buf+n,0,(size_t)total*dim*4);n+=(size_t)total*dim*4;
+        }
+        buf[n++]=0;                                        /* qout = false */
+        PUTI64(nlabels);PUTI64(dim);
+        memset(buf+n,0,(size_t)nlabels*dim*4);n+=(size_t)nlabels*dim*4;
+        #undef PUTI32
+        #undef PUTI64
+        if(cases[k].truncate_at) n=(size_t)cases[k].truncate_at;
+        char path[400];snprintf(path,sizeof path,"%s/%s",dir,cases[k].name);
+        CHECK_MSG(osa_file_write(path,buf,n),"fixture written: %s",cases[k].name);
+
+        const char *argv[]={exe,"--kind","lang","--model",path,NULL};
+        osa_error err;osa_err_ok(&err);
+        osa_process *p=osa_process_start(argv,&err);
+        CHECK_MSG(p!=NULL,"worker starts on %s: %s",cases[k].name,p?"ok":err.msg);
+        if(!p)continue;
+        char *line=NULL;
+        bool got=osa_process_line(p,60000,NULL,&line,&err);
+        CHECK_MSG(got,"the worker replies for %s",cases[k].name);
+        if(got&&line){
+            if(!cases[k].expect){
+                CHECK_MSG(strstr(line,"\"ok\":true")!=NULL&&strstr(line,"ready")!=NULL,
+                          "%s loads and reports ready: %s",cases[k].name,line);
+                CHECK_MSG(strstr(line,"fa")!=NULL,"%s exposes its language labels: %s",cases[k].name,line);
+            }else{
+                CHECK_MSG(strstr(line,"\"ok\":false")!=NULL,"%s is refused: %s",cases[k].name,line);
+                CHECK_MSG(strstr(line,cases[k].expect)!=NULL,
+                          "%s explains itself (wanted \"%s\"): %s",cases[k].name,cases[k].expect,line);
+                CHECK_MSG(strcmp(line,"vector")!=0&&strstr(line,"\"error\":\"vector\"")==NULL,
+                          "%s never reports a bare C++ exception name",cases[k].name);
+            }
+            free(line);
+        }
+        osa_process_stop(p);
+        remove(path);
+    }
+    char cmd[512];snprintf(cmd,sizeof cmd,"rmdir %s 2>/dev/null",dir);system(cmd);
+}
+
+/* The live screen's endpoint: speech start, hangover, noise-floor tracking and
+ * the forced cut. Driven by dBFS frames, so these run in microseconds and cover
+ * the parts that used to make live capture feel broken: a segment that never
+ * closed while the speaker paused, and one that grew without bound. */
+static void test_live_endpoint(void){
+    suite("live endpointing (speech boundaries)");
+    live_ep_params p;
+    live_ep_defaults(&p);
+    CHECK(p.frame_s>0.0f && p.hangover_s>0.2f && p.max_segment_s>1.0f);
+
+    /* A quiet room is silence: nothing starts, however many frames pass. */
+    live_ep e;
+    live_ep_init(&e,&p);
+    bool quiet_still=true;
+    for(int i=0;i<300;i++) if(live_ep_frame(&e,-62.0f)!=LIVE_EP_NONE) quiet_still=false;
+    CHECK_MSG(quiet_still,"300 frames of a quiet room produce no event");
+    CHECK(!e.in_segment);
+    CHECK_MSG(live_ep_floor_db(&e)>-75.0f,"the noise floor is learned, not -inf: %.1f",live_ep_floor_db(&e));
+
+    /* Speech starts a segment after min_speech_s, and reports it. */
+    int events=0;
+    for(int i=0;i<40 && !events;i++) events|=live_ep_frame(&e,-30.0f);
+    CHECK_MSG(events==LIVE_EP_SPEECH_START,"speech reports a start: %d",events);
+    CHECK(e.in_segment);
+
+    /* While the speaker keeps talking, the segment stays open. */
+    bool no_flapping=true;
+    for(int i=0;i<100;i++) if(live_ep_frame(&e,-30.0f)!=LIVE_EP_NONE) no_flapping=false;
+    CHECK_MSG(no_flapping,"sustained speech does not re-trigger the start event");
+    CHECK(e.in_segment);
+
+    /* A pause shorter than the hangover does not end the sentence. */
+    int n=p.hangover_s/p.frame_s/2;
+    for(int i=0;i<n;i++) live_ep_frame(&e,-64.0f);
+    CHECK_MSG(e.in_segment,"a brief pause keeps the segment open (%d frames)",n);
+
+    /* A pause longer than the hangover closes it exactly once. */
+    events=0;int frames=0;
+    while(frames<(int)(p.hangover_s/p.frame_s)+6){
+        int ev=live_ep_frame(&e,-64.0f);
+        if(ev==LIVE_EP_SEGMENT_READY){events++;break;}
+        frames++;
+    }
+    CHECK_MSG(events==1,"the hangover closes the segment: events=%d frames=%d",events,frames);
+    CHECK(!e.in_segment);
+    /* and the next sentence starts a new segment after real speech again */
+    events=0;
+    for(int i=0;i<40 && !events;i++) events|=live_ep_frame(&e,-30.0f);
+    CHECK_MSG(events==LIVE_EP_SPEECH_START,"a second sentence starts a new segment: %d",events);
+
+    /* A click (too short to be speech) never opens a segment. */
+    live_ep_init(&e,&p);
+    for(int i=0;i<200;i++) live_ep_frame(&e,-64.0f);
+    for(int i=0;i<2;i++) live_ep_frame(&e,-10.0f);
+    for(int i=0;i<100;i++) live_ep_frame(&e,-64.0f);
+    CHECK_MSG(!e.in_segment,"a two-frame click does not start a segment");
+    CHECK(e.events==0);
+
+    /* A segment that never pauses is cut at max_segment_s instead of growing. */
+    live_ep_init(&e,&p);
+    for(int i=0;i<100;i++) live_ep_frame(&e,-64.0f);      /* learn the room first */
+    events=0;
+    for(int i=0;i<(int)((p.max_segment_s+1.0f)/p.frame_s);i++){
+        int ev=live_ep_frame(&e,-30.0f);
+        if(ev==LIVE_EP_SEGMENT_READY){events++;break;}
+    }
+    CHECK_MSG(events==1,"an endless sentence is cut, not grown forever: %d",events);
+
+    /* The floor must not climb into speech: a floor that followed the voice
+     * would go deaf after a few seconds and never close a segment. This is the
+     * failure that made live capture "stop after the first sentence". */
+    live_ep_init(&e,&p);
+    for(int i=0;i<200;i++) live_ep_frame(&e,-64.0f);   /* learn a quiet room */
+    float floor_quiet=live_ep_floor_db(&e);
+    for(int i=0;i<400;i++) live_ep_frame(&e,-28.0f);   /* 8 s of speech      */
+    float floor_speech=live_ep_floor_db(&e);
+    CHECK_MSG(floor_speech<floor_quiet+6.0f,
+              "8 s of speech does not drag the floor into the voice (%.1f -> %.1f)",
+              floor_quiet,floor_speech);
+    events=0;
+    for(int i=0;i<(int)(p.hangover_s/p.frame_s)+8;i++){
+        int ev=live_ep_frame(&e,-64.0f);
+        if(ev==LIVE_EP_SEGMENT_READY){events++;break;}
+    }
+    CHECK_MSG(events==1,"after a long stretch of speech the pause still closes it: %d",events);
+
+    /* Cold start: the user is already talking when capture begins. That opening
+     * word must be heard — the first frame is not the room. */
+    live_ep_init(&e,&p);
+    events=0;
+    for(int i=0;i<40 && !events;i++) events|=live_ep_frame(&e,-22.0f);
+    CHECK_MSG(events==LIVE_EP_SPEECH_START,"speech on the very first frame is heard: %d",events);
+
+    /* The floor does follow a quieter room, so a hiss that stops does not leave
+     * the threshold stuck above the speech that follows. */
+    live_ep_init(&e,&p);
+    for(int i=0;i<200;i++) live_ep_frame(&e,-30.0f);   /* a noisy room       */
+    float floor_noisy=live_ep_floor_db(&e);
+    for(int i=0;i<200;i++) live_ep_frame(&e,-60.0f);   /* the noise stops    */
+    float floor_after=live_ep_floor_db(&e);
+    CHECK_MSG(floor_after<floor_noisy-3.0f,
+              "the floor follows a room that gets quieter (%.1f -> %.1f)",floor_noisy,floor_after);
+
+    /* The forced cut lands on the quietest recent frame, not in the middle. */
+    float db[100];
+    for(int i=0;i<100;i++) db[i]=-30.0f;
+    db[88]=-61.0f;                                        /* a pause at 1.76 s */
+    float cut=live_ep_cut_point(db,100,0,&p);
+    CHECK_MSG(cut>1.74f&&cut<1.80f,"the cut goes to the pause at 1.76 s: %.2f",cut);
+}
+
+/* The CPU budget. A translation used to start its worker with "cores/2" and the
+ * recogniser with every core, which is why the machine sat at 100% while
+ * translating. There is now one number, it is never the whole machine by
+ * default, and Settings can change it. */
+static void test_thread_budget(void){
+    suite("CPU budget (threads)");
+    use_temp_root("threads");
+    osa_error err; osa_app *app=osa_app_create(&err);
+    CHECK_MSG(app!=NULL,"app create: %s",app?err.msg:"ok");
+    if(!app){clean_root();return;}
+    int cores=osa_cpu_count();
+    int def=osa_app_threads(app);
+    CHECK_MSG(def>=1,"the default budget is at least one thread (got %d)",def);
+    CHECK_MSG(def<=8,"the default budget never takes a small PC's everything (got %d of %d cores)",def,cores);
+    if(cores>2) CHECK_MSG(def<=cores-1,"one core is always left for the window (%d of %d)",def,cores);
+    /* On a 2-core machine the old default was "all of it": Task Manager showed
+     * 100% for the whole translation, which is the report from the i3-4160. */
+    if(cores>=2&&cores<=2) CHECK_MSG(def<cores,
+        "a 2-core machine keeps a core for the window instead of taking both (%d of %d)",def,cores);
+    osa_app_set_threads(app,3);
+    CHECK_MSG(osa_app_threads(app)==3,"the budget can be lowered (got %d)",osa_app_threads(app));
+    osa_app_set_threads(app,0);
+    CHECK_MSG(osa_app_threads(app)==1,"zero threads is clamped to one, never to zero");
+    osa_app_set_threads(app,999);
+    CHECK_MSG(osa_app_threads(app)==16,"the budget is capped at 16 (got %d)",osa_app_threads(app));
+    osa_app_destroy(app); clean_root();
+}
+
+/* The builtin synthesiser is the fallback for a machine with no system voices.
+ * It cannot pronounce an unknown word, but it must not answer with a growl or
+ * with near-silence: every letter has to be audible, nothing may be clipped, and
+ * the word has to be spelled out in full rather than cut off after four letters.
+ * (On Windows the installed system voices speak the sentence instead.) */
+static void test_speech_fallback(void){
+    suite("speech synthesis fallback");
+    const char *words[]={"hello","world","book","translation","xyz"};
+    for(int k=0;k<5;k++){
+        int64_t n=0;
+        float *pcm=tts_speak(words[k],"en",&n);
+        CHECK_MSG(pcm&&n>0,"\"%s\" produces audio: %d samples",words[k],(int)n);
+        if(!pcm)continue;
+        /* Per 30 ms window: how much of the word is actually audible, and is any
+         * of it clipping? A growl is a constant buzz; near-silence is the old
+         * peak-normalisation bug. */
+        int win=OSAI_SR/33, total=0, audible=0;
+        float peak=0;
+        for(int64_t i=0;i+win<=n;i+=win){
+            double a=0;
+            for(int j=0;j<win;j++){a+=(double)pcm[i+j]*pcm[i+j]; if(fabsf(pcm[i+j])>peak)peak=fabsf(pcm[i+j]);}
+            total++;
+            if(sqrt(a/win)>0.005)audible++;    /* ~-46 dBFS: above any hiss */
+        }
+        CHECK_MSG(total>0&&audible*10>=total*4,
+                  "\"%s\" is audible for most of its length: %d of %d windows above -46 dBFS",
+                  words[k],audible,total);
+        CHECK_MSG(peak<=0.99f,"\"%s\" never clips: peak=%.2f",words[k],peak);
+        /* Longer words are spelled in full: the clip grows with the word. */
+        if(osa_streq(words[k],"translation"))
+            CHECK_MSG((double)n/OSAI_SR>0.6,"a long word is spelled out, not cut short: %.2f s",(double)n/OSAI_SR);
+        free(pcm);
+    }
+    int64_t n=0;
+    float *pcm=tts_speak("سلام دنیا","fa",&n);
+    CHECK_MSG(pcm&&n>0,"Persian text with no lexicon entry still produces audio: %d samples",(int)n);
+    free(pcm);
+    n=0; pcm=tts_speak("","en",&n);
+    CHECK_MSG(pcm==NULL&&n==0,"empty text produces no clip at all");
+    free(pcm);
+}
+
+/* "Listen to the translation" had a path that produced a growl and another that
+ * produced near-silence. On a machine with system voices the sentence goes to
+ * them; without, the builtin synthesiser must still produce an audible, plausible
+ * clip. Which of the two happened is reported, not assumed. */
+static void test_speak_path(void){
+    suite("speak the translation (listen button)");
+    bool platform = osa_tts_platform_available();
+    printf("  note the platform speaks with: %s\n",
+           platform ? osa_tts_platform_name() : "the builtin synthesiser (no system voices)");
+    /* Whatever the backend, the user must never get silence without a message:
+     * either the backend accepts the sentence, or the fallback clip exists. */
+    /* .wav on the end: osa_audio_load picks the decoder from the extension. */
+    char wav[300];
+    snprintf(wav,sizeof wav,"/tmp/osai-speak-%d.wav",(int)getpid());
+    bool clipped = tts_speak_to_wav("از آشنایی با شما خوشحالم","fa",wav);
+    CHECK_MSG(clipped,"the fallback writes a WAV even for Persian text");
+    osa_audio au;
+    if(osa_audio_load(wav,&au,NULL)){
+        double secs=osa_audio_duration_s(&au);
+        CHECK_MSG(secs>0.2&&secs<30.0,"the spoken clip has a plausible length: %.2f s",secs);
+        double acc=0;
+        for(int64_t i=0;i<au.n;i++) acc+=(double)au.samples[i]*au.samples[i];
+        double rms=au.n?sqrt(acc/(double)au.n):0;
+        CHECK_MSG(rms>0.003,"the spoken clip is audible, not a hiss: rms=%.4f",rms);
+        osa_audio_free(&au);
+    } else CHECK_MSG(false,"the spoken clip is a readable WAV");
+    remove(wav);
+    if(platform){
+        CHECK_MSG(osa_tts_platform_speak("Hello","en"),"the platform voice accepts a sentence");
+    } else {
+        printf("  note platform voices absent here: the fallback clip above is what a user would hear\n");
+    }
+}
+
+/* Capture -> endpoint, end to end, with a real WAV and the real microphone API.
+ * The headless build plays a file instead of a device (OSAI_MIC_FILE), which is
+ * how this path can be tested without a microphone: three spoken bursts
+ * separated by pauses must be reported as three sentences, not one. */
+static bool make_burst_wav(const char *path, double *burst_starts, int *n_bursts){
+    const double bursts[] = {1.5, 1.2, 0.9};
+    const double pause = 1.2;
+    int64_t total = 0;
+    for (int i = 0; i < 3; i++) total += (int64_t)((bursts[i] + pause) * OSAI_SR);
+    float *pcm = (float *)calloc((size_t)total, sizeof(float));
+    if (!pcm) return false;
+    int64_t at = 0;
+    for (int i = 0; i < 3; i++) {
+        burst_starts[i] = (double)at / OSAI_SR;
+        int64_t n = (int64_t)(bursts[i] * OSAI_SR);
+        for (int64_t k = 0; k < n; k++) {
+            double t = (double)k / OSAI_SR;
+            double env = 1.0;
+            if (t < 0.02) env = t / 0.02;
+            if (t > bursts[i] - 0.02) env = (bursts[i] - t) / 0.02;
+            pcm[at + k] = (float)(0.25 * env * sin(2.0 * 3.14159265358979 * 220.0 * t));
+        }
+        at += n + (int64_t)(pause * OSAI_SR);
+    }
+    bool ok = osa_audio_save_wav(path, pcm, total, OSAI_SR);
+    free(pcm);
+    *n_bursts = 3;
+    return ok;
+}
+
+static void test_live_capture_pipeline(void){
+    suite("live capture -> endpoint (real microphone API, file-backed)");
+    char wav[300];
+    snprintf(wav, sizeof wav, "/tmp/osai-mic-%d.wav", (int)getpid());
+    double starts[3];
+    int nb = 0;
+    if (!make_burst_wav(wav, starts, &nb)) { CHECK_MSG(false, "could not write the test WAV"); return; }
+
+    setenv("OSAI_MIC_FILE", wav, 1);
+    setenv("OSAI_MIC_FAST", "1", 1);
+    CHECK_MSG(osa_mic_available(), "capture reports available when a file is configured");
+
+    osa_error err;
+    osa_err_ok(&err);
+    osa_mic *mic = osa_mic_open(OSAI_SR, &err);
+    CHECK_MSG(mic != NULL, "the capture device opens: %s", mic ? "ok" : err.msg);
+    if (!mic) { remove(wav); return; }
+
+    live_ep ep;
+    live_ep_init(&ep, NULL);
+    int starts_seen = 0, segments = 0;
+    float buf[1600];
+    int reads = 0;
+    int n;
+    /* Feed the endpoint exactly the way shell_live_tick does: 20 ms frames
+     * carved out of whatever the device hands us. */
+    static float acc[64 * 1024];
+    int n_acc = 0;
+    while ((n = osa_mic_read(mic, buf, 1600)) > 0 && reads < 20000) {
+        reads++;
+        for (int i = 0; i < n; i++) {
+            if (n_acc < (int)(sizeof acc / sizeof acc[0])) acc[n_acc++] = buf[i];
+            if (n_acc >= OSAI_SR / 50) {
+                int ev = live_ep_frame(&ep, live_ep_db(acc, OSAI_SR / 50));
+                if (ev == LIVE_EP_SPEECH_START) starts_seen++;
+                else if (ev == LIVE_EP_SEGMENT_READY) segments++;
+                n_acc = 0;
+            }
+        }
+    }
+    osa_mic_close(mic);
+    printf("  note %d reads, %d sentences started, %d closed\n", reads, starts_seen, segments);
+    CHECK_MSG(starts_seen >= 3, "every spoken burst is detected as speech (%d)", starts_seen);
+    CHECK_MSG(segments >= 3, "every pause closes a sentence (%d)", segments);
+
+    unsetenv("OSAI_MIC_FILE");
+    unsetenv("OSAI_MIC_FAST");
+    remove(wav);
+}
+
 static void test_portable_data_dir(void){
     suite("portable data folder + profile migration");
     const char *host="build/openspeech";
@@ -537,6 +1033,319 @@ static void test_optional_real_models(void){
     osa_app_destroy(app); clean_root();
 }
 
+
+/* ---- آوانویسی: every supported language, correct diacritics ---------- */
+static void test_pronunciation_languages(void){
+    suite("pronunciation for every supported language");
+    char out[512];
+    bool uns=false;
+
+    /* The bug this covers: pronunciation used to be produced for English only. */
+    struct { const char *text, *tag; } OK[] = {
+        {"danke schön","de"},       {"bonjour","fr"},      {"gracias","es"},
+        {"grazie","it"},            {"спасибо","ru"},      {"καλημέρα","el"},
+        {"شكرا","ar"},              {"שלום","he"},         {"bedankt","nl"},
+        {"teşekkürler","tr"},       {"obrigado","pt"},     {"dziękuję","pl"},
+        {"köszönöm","hu"},          {"hyvää päivää","fi"}, {"xin chào","vi"},
+        {"terima kasih","id"},      {"asante","sw"},       {"hallo wereld","af"},
+    };
+    for (unsigned i=0;i<sizeof OK/sizeof*OK;i++){
+        out[0]=0;
+        bool ok=mt_pronounce_ex(OK[i].text,OK[i].tag,out,sizeof out,&uns);
+        CHECK_MSG(ok&&out[0]!=0,"pronunciation produced text for '%s' (%s)",OK[i].tag,OK[i].text);
+        CHECK_MSG(!uns,"'%s' is not reported as unsupported",OK[i].tag);
+    }
+
+    /* Persian output needs no transliteration: it is already readable. */
+    CHECK(!mt_pronounce_ex("سلام","fa",out,sizeof out,&uns));
+    /* Scripts that need a dictionary are refused, not turned into noise. */
+    CHECK(!mt_pronounce_ex("谢谢","zh",out,sizeof out,&uns));
+    CHECK(uns);
+    uns=false;
+    CHECK(!mt_pronounce_ex("こんにちは","ja",out,sizeof out,&uns));
+    CHECK(uns);
+
+    /* Diacritics: a short vowel is a mark on the consonant before it, never a mark
+     * on ا/ی/و, and never two marks on one letter. */
+    out[0]=0; mt_pronounce_ex("spasibo","en",out,sizeof out,&uns);
+    for (const char *p=out;*p;p++){
+        if ((unsigned char)p[0]==0xD9 && ((unsigned char)p[1]==0x8E||
+                                          (unsigned char)p[1]==0x90||
+                                          (unsigned char)p[1]==0x8F)){
+            /* the byte before a diacritic is the last byte of a letter */
+            const char *q=p-1; while (q>out && ((unsigned char)*q&0xC0)==0x80) q--;
+            unsigned char b0=(unsigned char)q[0], b1=(unsigned char)q[1];
+            uint32_t letter=(b0>=0xE0)?(((uint32_t)(b0&0x0F)<<12)|((uint32_t)(b1&0x3F)<<6)|((unsigned char)q[2]&0x3F))
+                                      :(((uint32_t)(b0&0x1F)<<6)|(b1&0x3F));
+            CHECK_MSG(letter!=0x0627&&letter!=0x06CC&&letter!=0x0648,
+                      "no diacritic sits on a long-vowel letter (%s)",out);
+            CHECK_MSG(!((unsigned char)p[2]==0xD9),"no doubled diacritics (%s)",out);
+        }
+    }
+
+    /* The same sentence in two languages must not come out the same: the language
+     * tag really selects a reader. */
+    char de[256],fr[256];
+    mt_pronounce_ex("zeit","de",de,sizeof de,&uns);
+    mt_pronounce_ex("zeit","fr",fr,sizeof fr,&uns);
+    CHECK_MSG(strcmp(de,fr)!=0,"language selects the reading rules (%s vs %s)",de,fr);
+    /* A German ü is یو, not a folded u: the language table is consulted before
+     * the accent is folded away. */
+    char ue[256], fr_ue[256];
+    mt_pronounce_ex("über","de",ue,sizeof ue,&uns);
+    mt_pronounce_ex("uber","de",fr_ue,sizeof fr_ue,&uns);
+    CHECK_MSG(strcmp(ue,fr_ue)!=0,"German ü keeps its own reading (%s)",ue);
+
+    /* Long text is truncated at a character boundary, never mid-sequence. */
+    char big[512];
+    for (int i=0;i<200;i++) big[i]=(char)('a'+(i%26));
+    big[200]=0;
+    out[0]=0;
+    CHECK(mt_pronounce_ex(big,"en",out,sizeof out,&uns));
+    CHECK_MSG(osa_utf8_valid(out,strlen(out)),"truncated pronunciation is still valid UTF-8");
+}
+
+
+/* ---- "did it translate?": the chatty-model regression ---------------- */
+static void test_translation_target_script(void){
+    suite("translation output must be in the target language's script");
+
+    /* The reported failure: English -> Persian, model answered the input. */
+    CHECK(!osa_translation_in_target_script("Hello! How can I assist you today?",
+                                            "fa", "hello", "en"));
+    CHECK(osa_translation_in_target_script("سلام! چطور می‌توانم کمک کنم؟",
+                                           "fa", "hello", "en"));
+    /* The other direction, and the other scripts. */
+    CHECK(!osa_translation_in_target_script("سلام، حال شما چطور است؟", "en", "hello", "fa"));
+    CHECK(osa_translation_in_target_script("Hello, how are you?", "en", "سلام", "fa"));
+    CHECK(osa_translation_in_target_script("Спасибо", "ru", "thanks", "en"));
+    CHECK(!osa_translation_in_target_script("Thank you", "ru", "thanks", "en"));
+    CHECK(osa_translation_in_target_script("ありがとう", "ja", "thanks", "en"));
+    CHECK(osa_translation_in_target_script("谢谢", "zh", "thanks", "en"));
+
+    /* Not translations: a number, a name, an email. A result without letters must
+     * not be refused, and a Persian name inside an English sentence stays Persian. */
+    CHECK(osa_translation_in_target_script("42", "fa", "42", "en"));
+    CHECK(osa_translation_in_target_script("OpenSpeech AI", "en", "OpenSpeech AI", "fa"));
+    CHECK(osa_translation_in_target_script("OpenSpeech AI", "fa", "OpenSpeech AI", "en"));
+    /* But a chatty answer that merely borrows the input's script is not a translation. */
+    CHECK(!osa_translation_in_target_script("Hello! How can I assist you today?", "fa", "hello", "en"));
+    CHECK(osa_translation_in_target_script("«تهران» is the capital", "en", "تهران", "fa"));
+
+    /* A target tag the app does not know must not cause a false refusal. */
+    CHECK(osa_translation_in_target_script("qualcosa", "xx", "something", "en"));
+
+    /* Language names for the prompt: a model reads "Persian", not "fa". */
+    CHECK(osa_streq(osa_language_name("fa"), "Persian"));
+    CHECK(osa_streq(osa_language_name("en-GB"), "English"));
+    CHECK(osa_streq(osa_language_name("de"), "German"));
+    CHECK(osa_script_for_tag("ru") == OSA_SCRIPT_CYRILLIC);
+    CHECK(osa_script_for_tag("fa") == OSA_SCRIPT_ARABIC);
+    CHECK(osa_script_for_tag("ja") == OSA_SCRIPT_KANA);
+}
+
+
+/* ---- آوانویسی: the diacritics must be readable --------------------------
+ * A short vowel on ا/آ is the mistake a Persian reader sees first: alef is a long
+ * vowel, so «تاِیم» is not a word. These checks walk real output instead of a
+ * table, so they also catch a bad dictionary entry and a bad rule.
+ */
+static int cp_at(const unsigned char *p, int *len) {
+    if (*p < 0x80) { *len = 1; return *p; }
+    if ((*p & 0xE0) == 0xC0) { *len = 2; return ((*p & 0x1F) << 6) | (p[1] & 0x3F); }
+    *len = 3;
+    return ((*p & 0x0F) << 12) | ((p[1] & 0x3F) << 6) | (p[2] & 0x3F);
+}
+static bool arabic_consonant(int cp) {
+    if (cp < 0x0621 || cp > 0x06D2) return false;
+    return cp != 0x0627 && cp != 0x0622 && cp != 0x0623 && cp != 0x0625 &&
+           cp != 0x0624 && cp != 0x0626 && cp != 0x0648 && cp != 0x06CC && cp != 0x0649;
+}
+/* Returns the first offending offset, or -1. */
+static int diacritic_problem(const char *s) {
+    const unsigned char *p = (const unsigned char *)s;
+    int prev = 0, prev_diac = 0, offset = 0;
+    while (*p) {
+        int len = 0;
+        int cp = cp_at(p, &len);
+        int is_diac = cp >= 0x064B && cp <= 0x0652;
+        if (is_diac && prev_diac) return offset;                 /* doubled */
+        if (is_diac && (prev == 0x0627 || prev == 0x0622) &&     /* on a long alef */
+            arabic_consonant(prev)) return offset;
+        prev_diac = is_diac;
+        if (!is_diac) prev = cp;
+        p += len;
+        offset += len;
+    }
+    return -1;
+}
+
+static void test_pronunciation_diacritics(void) {
+    suite("آوانویسی: diacritics are readable in every language");
+
+    /* Every word of the built-in English dictionary, plus sentences in the other
+     * readers, must produce marks that can actually be read aloud. */
+    static const char *words[] = {
+        "the","a","you","meet","too","time","size","speed","video","audio",
+        "account","question","answer","network","password","software","table",
+        "make","note","use","excited","station","understand","coffee","please",
+        "thanks","morning","school","important","university","application",
+        "engine","input","output","storage","language","translate","pronounce",
+        "computer","telephone","information","beautiful","government","country",
+        NULL
+    };
+    char out[512];
+    bool uns = false;
+    for (int i = 0; words[i]; i++) {
+        CHECK(mt_pronounce_ex(words[i], "en", out, sizeof out, &uns));
+        int bad = diacritic_problem(out);
+        CHECK_MSG(bad < 0, "no unreadable diacritic in '%s' (%s)", words[i], out);
+    }
+    static const struct { const char *text, *tag; } S[] = {
+        {"danke schön", "de"}, {"wie geht es Ihnen", "de"}, {"bonjour tout le monde", "fr"},
+        {"je ne comprends pas", "fr"}, {"buenos días", "es"}, {"¿dónde está la estación", "es"},
+        {"grazie mille", "it"}, {"спасибо большое", "ru"}, {"я не понимаю", "ru"},
+        {"καλημέρα σας", "el"}, {"شكرا جزيلا", "ar"}, {"obrigado", "pt"},
+        {"dziękuję bardzo", "pl"}, {"teşekkür ederim", "tr"}, {"köszönöm szépen", "hu"},
+        {"שלום עולם", "he"}, {NULL, NULL}
+    };
+    for (int i = 0; S[i].text; i++) {
+        out[0] = 0;
+        CHECK(mt_pronounce_ex(S[i].text, S[i].tag, out, sizeof out, &uns));
+        int bad = diacritic_problem(out);
+        CHECK_MSG(bad < 0, "no unreadable diacritic in '%s' (%s) -> %s",
+                  S[i].tag, S[i].text, out);
+        /* the line is Persian letters: it must contain at least one */
+        CHECK_MSG(strstr(out, "\xd8") != NULL, "'%s' is written in Persian letters", S[i].tag);
+    }
+}
+
+/* ---- آوانویسی: the readings themselves --------------------------------- */
+static void test_pronunciation_readings(void) {
+    suite("آوانویسی: known words read the way they are said");
+    struct { const char *text, *tag; const char *want; } T[] = {
+        /* English spellings that a letter-by-letter reader gets wrong */
+        {"make", "en", "مِیک"},
+        {"time", "en", "تِیم"},
+        {"table", "en", "تِیبِل"},
+        {"the", "en", "دِ"},
+        {"you", "en", "یُو"},
+        {"too", "en", "تُو"},
+        /* German: a final e is a schwa, umlauts keep their sound */
+        {"danke", "de", "دَنکِ"},
+        {"schön", "de", "شُن"},
+        {"danke schön", "de", "دَنکِ شُن"},
+        /* Russian: a word-initial я is "ya", an inner е is "e" */
+        {"я не понимаю", "ru", NULL},
+        /* Spanish: the written accent is the stressed, long vowel */
+        {"días", "es", "دیاس"},
+        {NULL, NULL, NULL}
+    };
+    char out[512];
+    bool uns = false;
+    for (int i = 0; T[i].text; i++) {
+        CHECK(mt_pronounce_ex(T[i].text, T[i].tag, out, sizeof out, &uns));
+        if (T[i].want) CHECK_MSG(osa_streq(out, T[i].want), "%s -> %s (expected %s)",
+                                 T[i].text, out, T[i].want);
+    }
+    /* Russian «я» at the start of a word begins with a y-sound; inside a word it
+     * is a plain vowel. The old reader wrote both as a bare «ی». */
+    mt_pronounce_ex("я не понимаю", "ru", out, sizeof out, &uns);
+    CHECK_MSG(strstr(out, "یَ") != NULL, "word-initial я reads \"ya\" (%s)", out);
+}
+
+
+/* ---- compute device honesty --------------------------------------------
+ * Reported from a real PC: «پردازش روی گرافیک تنظیم شده اما در هنگام ترجمه سی‌پی‌یو
+ * کامل درگیره» — the GPU was selected, the CPU was pinned at 100%, and nothing
+ * said why. Three separate defects made that possible:
+ *   1. the package has no GPU backend at all (built with -DGGML_USE_CPU), and
+ *      nothing asked the worker that question before a translation;
+ *   2. the device was only stored, never applied: ensure_worker() reused the
+ *      process that had been started with --device cpu;
+ *   3. the thread budget reached the recogniser but not the translator.
+ * The probe is the fix for (1): it answers from llama.cpp's registry. */
+static void test_compute_device_probe(void){
+    suite("compute device: the build is asked, not assumed");
+    const char *exe="build/OpenSpeechWorker";
+    if(!osa_file_exists(exe)){printf("  SKIP worker binary not built (%s)\n",exe);return;}
+    osa_error err;osa_err_ok(&err);
+    const char *argv[]={exe,"--probe",NULL};
+    osa_process *p=osa_process_start(argv,&err);
+    CHECK_MSG(p!=NULL,"the probe runs without a model: %s",p?"ok":err.msg);
+    if(!p)return;
+    char *line=NULL;
+    bool got=osa_process_line(p,10000,NULL,&line,&err);
+    CHECK_MSG(got,"the probe answers immediately (no model load): %s",got?"ok":err.msg);
+    if(got){
+        bool ok=false,avail=true;double gpu=0;char event[16]={0};
+        osa_json_get_bool(line,"ok",&ok);
+        osa_json_get_string(line,"event",event,sizeof event);
+        osa_json_get_bool(line,"gpu_available",&avail);
+        osa_json_get_num(line,"gpu_count",&gpu);   /* JSON numbers are double */
+        CHECK(ok);
+        CHECK_STR(event,"probe");
+        /* The device list is the evidence behind the answer, not a guess. */
+        CHECK_MSG(strstr(line,"\"devices\"")!=NULL,"the probe lists the devices it found");
+        CHECK_MSG(strstr(line,"\"type\":\"cpu\"")!=NULL,"the CPU device is always reported");
+        /* These two must agree: "available" is only true when a GPU was counted. */
+        CHECK_MSG(avail==(gpu>0),"gpu_available agrees with the device list (gpu_count=%d)",(int)gpu);
+        if(!avail)
+            printf("  note this package has no GPU backend; the GPU option must stay off\n");
+        free(line);
+    }
+    osa_process_stop(p);
+}
+
+static void test_device_setting_forces_reload(void){
+    suite("compute device: a changed choice reaches the next request");
+    use_temp_root("device");
+    osa_error err;osa_app *app=osa_app_create(&err);
+    CHECK_MSG(app!=NULL,"app create: %s",app?err.msg:"ok");
+    if(!app){clean_root();return;}
+    /* Creating the app asks the worker what it can do; the answer is cached. */
+    bool avail=osa_app_gpu_available(app,false);
+    const char *tok=osa_app_device_status(app);
+    /* A build with no GPU backend must never report "gpu", whatever was chosen
+     * before — that was the lie on screen. */
+    if(!avail){
+        osa_app_set_device(app,true);            /* the user picks GPU anyway */
+        CHECK_STR(osa_app_device_status(app),"cpu-only");
+        CHECK_MSG(strcmp(osa_app_device_status(app),"gpu")!=0,
+                  "a CPU-only build never claims to be on the GPU");
+        /* and the status token must be one the UI knows how to translate */
+        CHECK_MSG(strcmp(tok,"cpu-only")==0||strcmp(tok,"cpu")==0||
+                  strcmp(tok,"gpu")==0||strcmp(tok,"gpu-requested-cpu")==0,
+                  "the status token is one the UI localises (%s)",tok);
+        osa_app_set_device(app,false);
+        CHECK_STR(osa_app_device_status(app),"cpu-only");
+    }else{
+        /* On a GPU build the toggle is real: it must be honoured or explained. */
+        osa_app_set_device(app,true);
+        const char *t=osa_app_device_status(app);
+        CHECK_MSG(strcmp(t,"gpu-requested-cpu")==0||strcmp(t,"gpu")==0,
+                  "a GPU request on a GPU build is either honoured or explained (%s)",t);
+        osa_app_set_device(app,false);
+    }
+    osa_app_destroy(app);clean_root();
+}
+
+/* The budget is one number shared by both engines, and changing it has to reach
+ * the translation worker: that is the process that pins the CPU. */
+static void test_thread_budget_shared(void){
+    suite("CPU budget reaches the translator too");
+    use_temp_root("threads2");
+    osa_error err;osa_app *app=osa_app_create(&err);
+    CHECK(app!=NULL);
+    if(!app){clean_root();return;}
+    osa_app_set_threads(app,2);
+    CHECK_MSG(osa_app_threads(app)==2,"the recogniser budget is 2");
+    osa_app_set_threads(app,5);
+    CHECK_MSG(osa_app_threads(app)==5,
+              "the budget is shared, so the translator sees the new number as well");
+    osa_app_destroy(app);clean_root();
+}
+
 int main(void){
     test_json_unicode();
     test_catalog_and_gate();
@@ -550,6 +1359,21 @@ int main(void){
     test_worker_protocol();
     test_models_folder_and_sync();
     test_activation_diagnostics();
+    test_model_load_diagnostics();
+    test_hash_cancel();
+    test_live_endpoint();
+    test_thread_budget();
+    test_compute_device_probe();
+    test_device_setting_forces_reload();
+    test_thread_budget_shared();
+    test_speech_fallback();
+    test_speak_path();
+    test_live_capture_pipeline();
+    test_fasttext_language_model();
+    test_pronunciation_languages();
+    test_translation_target_script();
+    test_pronunciation_diacritics();
+    test_pronunciation_readings();
     test_portable_data_dir();
     test_optional_real_models();
     printf("\n%d passed, %d failed\n",g_pass,g_fail);

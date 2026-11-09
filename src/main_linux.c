@@ -122,6 +122,16 @@ static int run_snapshots(const char *dir, int w, int h, shell_lang lang, bool da
         "transcribe", "live", "translate", "history", "models",
         "training", "evaluation", "settings", "about"
     };
+    /* The Translate screen is shown with a finished translation and its
+     * آوانویسی line, or the line would never be in a still — and the way it draws
+     * is exactly what this release changed. The text is fixed, so the frame stays
+     * byte-identical between runs. */
+    osa_strlcpy(shell.tr_out, "Danke schön, bis bald!", sizeof shell.tr_out);
+    osa_strlcpy(shell.tr_out_lang, "de", sizeof shell.tr_out_lang);
+    shell.show_phonetic = true;
+    osa_app_pronounce(shell.tr_out, shell.tr_out_lang, shell.tr_phonetic,
+                      sizeof shell.tr_phonetic);
+
     int written = 0;
     for (int i = 0; i < SCREEN_COUNT; i++) {
         shell.screen = (shell_screen)i;
@@ -301,6 +311,24 @@ int main(int argc, char **argv) {
     bool train = false;
 
     if (argc <= 1) { usage(); return 0; }
+
+    /* Clipboard plumbing, headless: the tests and the file-driven live session
+     * below need a real clipboard and a real text-input path, and both are
+     * reachable from the command line without a window. */
+    for (int i = 1; i < argc; i++) {
+        if (osa_streq(argv[i], "--clip-set") && i + 1 < argc) {
+            printf("%s\n", osa_clipboard_set(argv[i + 1]) ? "ok" : "unavailable");
+            return 0;
+        }
+        if (osa_streq(argv[i], "--clip-get")) {
+            osa_arena ar;
+            osa_arena_init(&ar);
+            const char *clip = osa_clipboard_get(&ar);
+            printf("%s\n", clip ? clip : "");
+            osa_arena_free(&ar);
+            return 0;
+        }
+    }
     for (int i = 1; i < argc; i++) {
         const char *a = argv[i];
         if (osa_streq(a, "--version")) { printf("OpenSpeech AI %s\n", OSAI_VERSION); return 0; }

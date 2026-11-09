@@ -109,6 +109,7 @@ static const pron PRON[] = {
     {"should", P_SHIN M_DAMM P_DAL}, {"could", P_KAF M_DAMM P_DAL},
     {"must", P_MIM M_FATH P_SIN P_TE},
     {"do", P_DAL M_DAMM P_VAV}, {"does", P_DAL M_FATH P_ZE},
+    {"too", P_TE M_DAMM P_VAV},
     {"did", P_DAL P_YE P_DAL}, {"done", P_DAL M_FATH P_NUN},
     {"have", P_HEH M_FATH P_VAV}, {"has", P_HEH M_FATH P_ZE},
     {"had", P_HEH M_FATH P_DAL},
@@ -134,7 +135,7 @@ static const pron PRON[] = {
     {"speech", P_ALEF M_KASR P_SIN P_PE P_YE P_CHE},
     {"recognition", P_RE M_KASR P_KAF P_ALEF P_GAFF P_NUN P_YE P_SHIN M_KASR P_NUN},
     {"recognize", P_RE M_KASR P_KAF P_ALEF P_GAFF P_NUN P_ALEF P_YE P_ZE},
-    {"audio", P_ALEF P_DAL P_YE M_DAMM P_VAV},
+    {"audio", P_ALEF P_DAL P_YE P_VAV},
     {"text", P_TE M_KASR P_KAF P_SIN P_TE},
     {"model", P_MIM P_ALEF P_DAL M_KASR P_LAM},
     {"models", P_MIM P_ALEF P_DAL M_KASR P_LAM P_ZE},
@@ -142,7 +143,7 @@ static const pron PRON[] = {
     {"translate", P_TE P_RE P_ALEF P_NUN P_SIN P_LAM P_YE P_TE},
     {"translation", P_TE P_RE P_ALEF P_NUN P_SIN P_LAM P_YE P_SHIN M_KASR P_NUN},
     {"system", P_SIN P_YE P_SIN P_TE M_KASR P_MIM},
-    {"software", P_SIN P_ALEF P_FE P_TE P_VAV M_KASR P_RE},
+    {"software", P_SIN P_ALEF P_FE P_TE P_VAV P_RE},
     {"computer", P_KAF M_DAMM P_MIM P_PE P_YE P_VAV P_TE M_KASR P_RE},
     {"microphone", P_MIM P_ALEF P_YE P_KAF P_RE M_DAMM P_FE P_VAV P_NUN},
     {"recording", P_RE M_KASR P_KAF P_VAV P_RE P_DAL P_YE P_NUN P_GAFF},
@@ -158,8 +159,8 @@ static const pron PRON[] = {
     {"name", P_NUN P_YE P_MIM}, {"number", P_NUN M_FATH P_MIM P_BE M_KASR P_RE},
     {"work", P_VAV M_KASR P_RE P_KAF}, {"world", P_VAV M_KASR P_RE P_LAM P_DAL},
     {"word", P_VAV M_KASR P_RE P_DAL},
-    {"question", P_KAF P_VAV M_KASR P_SIN P_TE P_SHIN M_KASR P_NUN},
-    {"answer", P_ALEF P_NUN P_SIN P_VAV M_KASR P_RE},
+    {"question", P_KAF P_VAV M_KASR P_SIN P_TE P_CHE M_KASR P_NUN},
+    {"answer", P_ALEF P_NUN P_SIN P_VAV P_RE},
     {"because", P_BE P_YE P_KAF P_ALEF P_ZE},
     {"ready", P_RE M_KASR P_DAL P_YE},
     {"download", P_DAL P_ALEF P_VAV P_NUN P_LAM P_VAV P_DAL},
@@ -185,7 +186,7 @@ static const pron PRON[] = {
     {"offline", P_ALEF P_FE P_LAM P_ALEF P_YE P_NUN},
     {"online", P_ALEF P_NUN P_LAM P_ALEF P_YE P_NUN},
     {"internet", P_ALEF P_YE P_NUN P_TE M_KASR P_RE P_NUN M_KASR P_TE},
-    {"network", P_NUN M_KASR P_TE P_VAV M_KASR P_RE P_KAF},
+    {"network", P_NUN M_KASR P_TE P_VAV P_RE P_KAF},
     {"data", P_DAL P_YE P_TE P_ALEF},
     {"version", P_VAV M_KASR P_RE P_ZHE M_KASR P_NUN},
     {"update", P_ALEF P_PE P_DAL P_YE P_TE},
@@ -196,7 +197,7 @@ static const pron PRON[] = {
     {"search", P_SIN M_KASR P_RE P_CHE},
     {"find", P_FE P_ALEF P_YE P_NUN P_DAL},
     {"use", P_YE P_VAV P_ZE}, {"user", P_YE P_VAV P_ZE M_KASR P_RE},
-    {"password", P_PE M_FATH P_SIN P_VAV M_DAMM P_RE P_DAL},
+    {"password", P_PE M_FATH P_SIN P_VAV P_RE P_DAL},
     {"different", P_DAL P_YE P_FE P_RE M_KASR P_NUN P_TE},
     {"same", P_SIN P_YE P_MIM},
     {"all", P_ALEF P_LAM}, {"some", P_SIN M_FATH P_MIM},
@@ -233,7 +234,7 @@ static const pron PRON[] = {
     {"button", P_BE M_FATH P_TE P_NUN},
     {"screen", P_ALEF M_KASR P_SIN P_KAF P_RE P_YE P_NUN},
     {"page", P_PE P_YE P_JIM},
-    {"video", P_VAV M_KASR P_DAL P_YE M_DAMM P_VAV},
+    {"video", P_VAV M_KASR P_DAL P_YE P_VAV},
     {"voice", P_VAV M_DAMM P_YE P_SIN},
     {"sound", P_SIN P_ALEF P_VAV P_NUN P_DAL},
     {"noise", P_NUN M_DAMM P_YE P_ZE},
@@ -252,7 +253,7 @@ static const pron PRON[] = {
     {"people", P_PE M_KASR P_YE P_PE M_KASR P_LAM},
     {"family", P_FE M_FATH P_MIM M_KASR P_LAM P_YE},
     {"friend", P_FE P_RE P_YE P_NUN P_DAL},
-    {"time", P_TE P_ALEF M_KASR P_YE P_MIM},
+    {"time", P_TE M_KASR P_YE P_MIM},
     {"year", P_YE M_KASR P_RE},
     {"month", P_MIM M_FATH P_NUN P_TE},
     {"week", P_VAV P_YE P_KAF},
@@ -291,10 +292,10 @@ static const pron PRON[] = {
     {"output", P_ALEF M_DAMM P_VAV P_TE P_PE M_DAMM P_VAV P_TE},
     {"quality", P_KAF P_VAV P_ALEF P_LAM M_KASR P_TE P_YE},
     {"speed", P_ALEF M_KASR P_SIN P_PE P_YE P_DAL},
-    {"size", P_SIN P_ALEF M_KASR P_YE P_ZE},
+    {"size", P_SIN M_KASR P_YE P_ZE},
     {"memory", P_MIM M_FATH P_MIM P_RE P_YE},
     {"storage", P_ALEF M_KASR P_SIN P_TE P_VAV P_RE P_JIM},
-    {"account", P_ALEF M_FATH P_KAF P_ALEF M_DAMM P_VAV P_NUN P_TE},
+    {"account", P_ALEF M_FATH P_KAF P_VAV P_NUN P_TE},
     {"ticket", P_TE M_KASR P_KAF P_TE},
     
 
@@ -506,6 +507,16 @@ static void render_rule_word(const char *word, char *out, size_t cap, size_t *o)
             emit(out, cap, o, M_KASR);
         }
     }
+}
+
+/* A dictionary word, or NULL. Used by the reader in pronounce.c for English
+ * irregular spellings; keeping one dictionary in one place means the two readers
+ * cannot drift apart. */
+const char *mt_pronounce_known(const char *word) {
+    if (!word) return NULL;
+    for (int i = 0; i < PRON_N; i++)
+        if (osa_streq(PRON[i].en, word)) return PRON[i].fa;
+    return NULL;
 }
 
 /* ---------------------------------------------------------------------

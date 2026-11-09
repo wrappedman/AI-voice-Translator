@@ -8,6 +8,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <limits.h>
+#include <vector>
 
 struct wsp_ctx {
     struct whisper_context *ctx;
@@ -39,7 +40,7 @@ bool wsp_is_model_file(const char *path) {
     return got == 4 && ((m[0] == 0x6c && m[1] == 0x6d && m[2] == 0x67 && m[3] == 0x67) || (m[0]=='G'&&m[1]=='G'&&m[2]=='U'&&m[3]=='F'));
 }
 
-static wsp_ctx *load_impl(const char *path, char *err, size_t cap) {
+static wsp_ctx *load_impl(const char *path, char *err, size_t cap, int n_threads) {
     if (!path || !*path) { set_err(err, cap, "no model path"); return NULL; }
     if (!g_log_set) { whisper_log_set(silent_log, NULL); g_log_set = true; }
     if (!wsp_is_model_file(path)) { set_err(err, cap, "not a whisper model file"); return NULL; }
@@ -52,7 +53,7 @@ static wsp_ctx *load_impl(const char *path, char *err, size_t cap) {
     wsp_ctx *c = (wsp_ctx *)calloc(1, sizeof *c);
     if (!c) { whisper_free(ctx); set_err(err, cap, "out of memory"); return NULL; }
     c->ctx = ctx;
-    c->n_threads = 4;
+    c->n_threads = n_threads > 0 ? n_threads : 4;
 
     /* name = file name without directory or extension */
     const char *base = strrchr(path, '/');
@@ -71,13 +72,20 @@ void wsp_free(wsp_ctx *c) {
     free(c);
 }
 
+/* Recognition on a file is one long pass; on the live screen it is a stream of
+ * short passes whose latency the user feels directly. The same model therefore
+ * gets a different thread count in the two cases: file transcription leaves a
+ * core for the UI, live transcription takes what is there. */
+void wsp_set_threads(wsp_ctx *c, int n) { if (c && n > 0) c->n_threads = n; }
+int  wsp_threads(const wsp_ctx *c) { return c ? c->n_threads : 0; }
+
 const char *wsp_model_name(const wsp_ctx *c) { return c ? c->name : ""; }
 void wsp_set_cancel(wsp_ctx *c, volatile int *cancel) { if(c) c->cancel=cancel; }
 int wsp_languages(wsp_ctx *c,const char **codes,int max) { if(!c||!codes||max<=0)return 0; int n=0; for(int i=0;i<=whisper_lang_max_id()&&n<max;i++){const char*s=whisper_lang_str(i);if(s&&*s&&whisper_lang_id(s)>=0)codes[n++]=s;} return n; }
 static bool abort_cb(void *ud){volatile int *p=(volatile int*)ud;return p&&*p;}
 
 static bool transcribe_impl(wsp_ctx *c, const float *pcm, int64_t n, const char *lang,
-                            wsp_result *out, char *err, size_t cap) {
+                            int max_tokens, wsp_result *out, char *err, size_t cap) {
     if (!c || !c->ctx || !pcm || n <= 0 || !out) { set_err(err, cap, "no audio"); return false; }
     memset(out, 0, sizeof *out);
 
@@ -88,6 +96,11 @@ static bool transcribe_impl(wsp_ctx *c, const float *pcm, int64_t n, const char 
     wp.print_timestamps = false;
     wp.print_special = false;
     wp.no_context = true;                     /* each pass stands on its own */
+    /* A live partial pass must not sit at the decoder spinning out its 16k-token
+     * text context: the text of a 12 s segment is a few dozen tokens. Capping it
+     * is the single largest latency win for the live screen, and it cannot
+     * truncate a file transcription because those passes leave it at 0. */
+    wp.n_max_text_ctx = max_tokens > 0 ? max_tokens : 0;
     wp.translate = false;
     wp.abort_callback=abort_cb; wp.abort_callback_user_data=(void*)c->cancel;
     wp.suppress_blank=true; wp.suppress_nst=true; wp.temperature_inc=0.0f;
@@ -101,8 +114,17 @@ static bool transcribe_impl(wsp_ctx *c, const float *pcm, int64_t n, const char 
         wp.language = lang;
         wp.detect_language = false;
     } else {
-        wp.language = "auto";
-        wp.detect_language = true;
+        /* Never hand whisper_full a "detect and decode" pass: it stops after
+         * detection. Detect here, then decode with the language pinned. */
+        char code[16] = {0};
+        float prob = 0.0f;
+        if (wsp_detect_language(c, pcm, n, code, sizeof code, &prob)) {
+            wp.language = code;
+            wp.detect_language = false;
+        } else {
+            wp.language = "auto";      /* last resort: whisper's own detect */
+            wp.detect_language = false;/* whisper_full auto-detects from "auto" */
+        }
     }
 
     if (n > INT_MAX) { set_err(err,cap,"audio is too long for one pass"); return false; }
@@ -141,23 +163,61 @@ static bool transcribe_impl(wsp_ctx *c, const float *pcm, int64_t n, const char 
     return true;
 }
 
+/* ---- language identification only ---------------------------------
+ *
+ * whisper_full() with detect_language = true is not a language detector: it
+ * auto-detects the language and then *returns 0 immediately*, before decoding a
+ * single word (see whisper_full_with_state: `if (params.detect_language) return
+ * 0;`). That is why transcription with source language "auto" produced no text
+ * at all — the pass "succeeded" with zero segments — while the same audio with
+ * an explicit language worked. Recognition and language detection have to be
+ * two separate calls: detect first, then transcribe with the result pinned. */
+bool wsp_detect_language(wsp_ctx *c, const float *pcm, int64_t n, char *lang, size_t cap,
+                         float *prob) {
+    if (!c || !c->ctx || !pcm || n <= 0 || !lang || !cap) return false;
+    if (lang && cap) lang[0] = 0;
+    if (n > INT_MAX) n = INT_MAX;
+    try {
+        if (whisper_pcm_to_mel(c->ctx, pcm, (int)n, c->n_threads) != 0) return false;
+        std::vector<float> probs(whisper_lang_max_id() + 1, 0.0f);
+        const int id = whisper_lang_auto_detect(c->ctx, 0, c->n_threads, probs.data());
+        if (id < 0) return false;
+        const char *code = whisper_lang_str(id);
+        if (!code || !*code) return false;
+        snprintf(lang, cap, "%s", code);
+        if (prob) *prob = probs[(size_t)id];
+        return true;
+    } catch (...) {
+        return false;
+    }
+}
+
 /* whisper.cpp reports a corrupt model by throwing (std::bad_alloc on a garbage
  * header), so every entry point catches: a bad file must never end the program. */
-wsp_ctx *wsp_load(const char *path, char *err, size_t cap) {
+wsp_ctx *wsp_load_ex(const char *path, int n_threads, char *err, size_t cap) {
     try {
-        return load_impl(path, err, cap);
+        return load_impl(path, err, cap, n_threads);
     } catch (...) {
         set_err(err, cap, "the whisper model file is damaged");
         return NULL;
     }
 }
 
-bool wsp_transcribe(wsp_ctx *c, const float *pcm, int64_t n, const char *lang,
-                    wsp_result *out, char *err, size_t cap) {
+wsp_ctx *wsp_load(const char *path, char *err, size_t cap) {
+    return wsp_load_ex(path, 4, err, cap);
+}
+
+bool wsp_transcribe_ex(wsp_ctx *c, const float *pcm, int64_t n, const char *lang,
+                       int max_tokens, wsp_result *out, char *err, size_t cap) {
     try {
-        return transcribe_impl(c, pcm, n, lang, out, err, cap);
+        return transcribe_impl(c, pcm, n, lang, max_tokens, out, err, cap);
     } catch (...) {
         set_err(err, cap, "recognition failed inside the whisper engine");
         return false;
     }
+}
+
+bool wsp_transcribe(wsp_ctx *c, const float *pcm, int64_t n, const char *lang,
+                    wsp_result *out, char *err, size_t cap) {
+    return wsp_transcribe_ex(c, pcm, n, lang, 0, out, err, cap);
 }

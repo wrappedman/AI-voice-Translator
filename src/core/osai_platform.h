@@ -44,7 +44,10 @@ int64_t osa_file_mtime(const char *path);
 
 /* ---------------- threads ---------------- */
 typedef struct osa_mutex  { void *h; } osa_mutex;
-typedef struct osa_thread { void *h; } osa_thread;
+/* `h` is opaque (a HANDLE / pthread_t *). `done` lets a caller wait for a
+ * bounded time without a portable timed join. Zero it before osa_thread_start;
+ * the thread sets it as its very last action. */
+typedef struct osa_thread { void *h; volatile int done; } osa_thread;
 typedef void (*osa_thread_fn)(void *ud);
 
 void osa_mutex_init(osa_mutex *m);
@@ -53,6 +56,10 @@ void osa_mutex_lock(osa_mutex *m);
 void osa_mutex_unlock(osa_mutex *m);
 bool osa_thread_start(osa_thread *t, osa_thread_fn fn, void *ud);
 void osa_thread_join(osa_thread *t);
+/* Waits at most `ms` for the thread to finish. Returns true when it ended (and
+ * the handle is released), false when it is still running (the handle stays
+ * valid so the caller can detach it later). */
+bool osa_thread_join_timeout(osa_thread *t, int ms);
 void osa_thread_detach(osa_thread *t);
 void osa_thread_exit(void);
 int  osa_cpu_count(void);

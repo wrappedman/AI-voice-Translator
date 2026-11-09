@@ -16,6 +16,7 @@
  *  owns the state and the platform owns the window.
  * ===================================================================== */
 #include "shell_internal.h"
+#include "../core/tts_sapi.h"
 #include "../core/osai_platform.h"
 #include "../core/tts.h"
 #include <stdio.h>
@@ -82,9 +83,13 @@ void shell_load_prefs(shell_state *s) {
      * number, so using the host's core count would make the rendered snapshot
      * depend on the machine (2 cores here, 4 in CI, 16 on a workstation) and the
      * visual-regression job would fail on a difference that is not one. */
-    s->asr_threads = 4;
-    if (s->asr_threads < 1) s->asr_threads = 1;
-    if (s->asr_threads > 16) s->asr_threads = 16;
+    /* Default: leave one core for the window and the operating system. The old
+     * default of 4 was also not applied anywhere, so the workers sized
+     * themselves from the core count and a translation pinned every core. */
+    {
+        int cores = osa_cpu_count();
+        s->asr_threads = osa_clampi(cores > 2 ? cores - 1 : cores, 1, 8);
+    }
     osa_strlcpy(s->lang_src, "auto", sizeof s->lang_src);
     osa_strlcpy(s->lang_dst, "fa", sizeof s->lang_dst);
     s->style = MT_STYLE_NEUTRAL;
@@ -109,6 +114,7 @@ void shell_load_prefs(shell_state *s) {
             else if (osa_streq(key, "privacylogs")) s->privacy_logs = osa_starts(val, "1");
             else if (osa_streq(key, "phonetic")) s->show_phonetic = osa_starts(val, "1");
             else if (osa_streq(key, "threads")) s->asr_threads = atoi(val);
+            else if (osa_streq(key, "budget")) s->asr_threads = atoi(val);
             else if (osa_streq(key, "langsrc")) osa_strlcpy(s->lang_src, val, sizeof s->lang_src);
             else if (osa_streq(key, "langdst")) osa_strlcpy(s->lang_dst, val, sizeof s->lang_dst);
             else if (osa_streq(key, "style")) {
@@ -153,6 +159,9 @@ bool shell_init(shell_state *s, osa_app *app) {
     if (!s) return false;
     memset(s, 0, sizeof *s); s->app = app; s->screen = SCREEN_TRANSCRIBE; s->ds_sel = -1;
     shell_load_prefs(s);
+    /* The saved thread budget goes to the app before any worker starts: one
+     * place decides how many cores inference may use. */
+    osa_app_set_threads(s->app, s->asr_threads);
     shell_refresh_models_dir(s);
     osa_strlcpy(s->tr_in, "از آشنایی با شما خوشحالم", sizeof s->tr_in);
     s->restoring = true; s->working = true;
@@ -171,6 +180,15 @@ void shell_shutdown(shell_state *s) {
  * replaced: the UI never accumulates audio files without the user asking. */
 void shell_speak(shell_state *s, const char *text, const char *lang) {
     if (!s || !text || !*text) return;
+    /* Prefer the voices the operating system already has (Windows SAPI): they
+     * are offline and they speak the sentence in its own script. The builtin
+     * synthesiser is the fallback for a machine with no voices installed, and it
+     * cannot say anything outside its small lexicon — which is what the "only
+     * growling" report was. */
+    if (osa_tts_platform_speak(text, lang && *lang ? lang : "en")) {
+        shell_set_message(s, false, "%s", tt(s->lang, "msg.playing"));
+        return;
+    }
     int64_t n = 0;
     float *pcm = tts_speak(text, lang && *lang ? lang : "en", &n);
     if (!pcm || n <= 0) {
@@ -269,7 +287,13 @@ void shell_refresh_phonetic(shell_state *s) {
 bool shell_run_transcribe(shell_state *s) {
     if (!s || !s->audio_path[0]) { shell_set_message(s,true,"%s",tt(s->lang,"msg.nofile")); return false; }
     if (!s->models_ready) { shell_set_message(s,true,"%s",tt(s->lang,"models.required")); return false; }
-    return shell_start_job(s,SHELL_JOB_TRANSCRIBE,s->audio_path);
+    /* Say what is happening, and how long a whole-file pass normally takes:
+     * whisper decodes the file in one go, and a 3 GB model on a laptop can
+     * spend a minute on a short clip. Silence during that minute is what "it
+     * takes a long time and does nothing" feels like. */
+    if(!shell_start_job(s,SHELL_JOB_TRANSCRIBE,s->audio_path))return false;
+    shell_set_message(s,false,"%s",tt(s->lang,"transcribe.working"));
+    return true;
 }
 bool shell_select_audio(shell_state *s,const char *path){
     if(!s||!path||!*path)return false;
@@ -279,7 +303,7 @@ bool shell_select_audio(shell_state *s,const char *path){
     return shell_start_job(s,SHELL_JOB_LOAD_AUDIO,path);
 }
 bool shell_delete_model(shell_state *s,const char *id){return shell_start_job(s,SHELL_JOB_DELETE,id);}
-bool shell_sync_models(shell_state *s){s->sync_valid=false;s->sync_done=s->sync_total=0;return shell_start_job(s,SHELL_JOB_SYNC,NULL);}
+bool shell_sync_models(shell_state *s){s->sync_valid=false;s->sync_done=s->sync_total=0;s->sync_reading[0]=0;return shell_start_job(s,SHELL_JOB_SYNC,NULL);}
 void shell_refresh_models_dir(shell_state *s){if(s&&s->app)osa_app_models_dir(s->app,s->models_dir,sizeof s->models_dir);}
 void shell_set_models_dir(shell_state *s,const char *path){
     if(!s||!s->app||!path||!*path)return;
@@ -741,8 +765,8 @@ static void draw_result_pane(shell_state *s, ui_context *u, osa_rect r,
         osa_rect copy_r = rectf(u->L.rtl ? r.x + pad : r.x + r.w - pad - 54 * u->L.scale,
                                 r.y + 9 * u->L.scale, 54 * u->L.scale, 26 * u->L.scale);
         if (ui_button_ghost(u, id, copy_r, tt(s->lang, "btn.copy"))) {
-            osa_clipboard_set(text);
-            shell_set_message(s, false, "%s", tt(s->lang, "msg.copied"));
+            if (osa_clipboard_set(text)) shell_set_message(s, false, "%s", tt(s->lang, "msg.copied"));
+            else shell_set_message(s, true, "%s", tt(s->lang, "msg.clipfail"));
         }
     }
     c_hline(u->c, r.x + pad, r.x + r.w - pad, r.y + 44 * u->L.scale, 1, u->t.border_soft);
@@ -1008,25 +1032,49 @@ bool shell_start_job(shell_state*s,shell_job_kind kind,const char*arg){
     if((kind==SHELL_JOB_TRANSCRIBE||kind==SHELL_JOB_TRANSLATE)&&!s->models_ready){shell_set_message(s,true,"%s",tt(s->lang,"models.required"));return false;}
     shell_job*j=calloc(1,sizeof*j);if(!j)return false;j->kind=kind;j->app=s->app;if(arg)osa_strlcpy(j->arg,arg,sizeof j->arg);
     if(kind==SHELL_JOB_TRANSLATE){j->input=osa_strdup(s->tr_in);if(!j->input){free(j);return false;}}
+    /* An abandoned job (see shell_cancel_jobs) is still running and still reads
+     * its `app` pointer. Starting a new job over it used to overwrite s->job,
+     * leak the old shell_job, and leave two background jobs racing on the same
+     * app. Refuse instead, and say why. */
+    if(s->abandoned){shell_set_message(s,true,"%s",tt(s->lang,"live.stopfirst"));free(j->input);free(j);return false;}
     if(!osa_thread_start(&j->th,job_worker,j)){free(j->input);free(j);return false;}
     s->job=j;s->working=kind!=SHELL_JOB_DOWNLOAD;s->downloading=kind==SHELL_JOB_DOWNLOAD;
     s->activating=kind==SHELL_JOB_ACTIVATE;s->syncing=kind==SHELL_JOB_SYNC;s->message[0]=0;
     if(s->activating)shell_set_message(s,false,"%s",tt(s->lang,"models.activating"));
     if(kind==SHELL_JOB_DELETE)shell_set_message(s,false,"%s",tt(s->lang,"models.deleting"));
-    if(kind==SHELL_JOB_SYNC){s->sync_done=s->sync_total=0;shell_set_message(s,false,"%s",tt(s->lang,"settings.synchint"));}
+    if(kind==SHELL_JOB_SYNC){s->sync_done=s->sync_total=0;s->sync_reading[0]=0;shell_set_message(s,false,"%s",tt(s->lang,"settings.synchint"));}
     if(kind==SHELL_JOB_DOWNLOAD){s->dl_progress=0;s->dl_got=s->dl_total=0;osa_strlcpy(s->dl_pack,arg,sizeof s->dl_pack);}return true;
 }
 void shell_job_tick(shell_state*s){
-    if(!s||!s->job)return;shell_job*j=s->job;
+    if(!s)return;
+    if(!s->job){
+        /* An abandoned job owns its own memory; drop the block once the app is
+         * no longer busy so the next Sync/Activate can run. */
+        if(s->abandoned&&!s->working&&!s->syncing&&!s->activating)s->abandoned=false;
+        return;
+    }
+    shell_job*j=s->job;
     if(j->kind==SHELL_JOB_DOWNLOAD){s->dl_progress=j->permille/1000.0;s->dl_got=j->got;s->dl_total=j->total;}
-    if(j->kind==SHELL_JOB_SYNC){s->sync_done=(int)j->got;s->sync_total=(int)j->total;}if(!osa_atomic_load(&j->done))return;
-    osa_thread_join(&j->th);s->job=NULL;s->working=false;s->downloading=false;s->activating=false;s->syncing=false;s->restoring=false;s->models_ready=osa_app_ready(s->app);s->status_valid=false;
+    if(j->kind==SHELL_JOB_SYNC){
+        s->sync_done=(int)j->got;s->sync_total=(int)j->total;
+        osa_strlcpy(s->sync_reading,j->sync.current,sizeof s->sync_reading);
+    }
+    if(!osa_atomic_load(&j->done))return;
+    osa_thread_join(&j->th);s->job=NULL;s->working=false;s->sync_reading[0]=0;s->downloading=false;s->activating=false;s->syncing=false;s->restoring=false;s->models_ready=osa_app_ready(s->app);s->status_valid=false;
     if(j->ok){
       switch(j->kind){
         case SHELL_JOB_RESTORE:osa_app_get_languages(s->app,s->lang_src,sizeof s->lang_src,s->lang_dst,sizeof s->lang_dst);s->style=osa_app_style(s->app);if(!s->models_ready)s->screen=SCREEN_MODELS;break;
         case SHELL_JOB_LOAD_AUDIO:free(s->peaks);s->peaks=j->peaks;j->peaks=NULL;s->n_peaks=j->n_peaks;shell_set_message(s,false,"%s",tt(s->lang,"msg.fileselected"));break;
         case SHELL_JOB_TRANSCRIBE:osa_strlcpy(s->transcript,j->tr.text,sizeof s->transcript);osa_strlcpy(s->correction,j->tr.text,sizeof s->correction);osa_strlcpy(s->translation,j->mt.text,sizeof s->translation);osa_strlcpy(s->detected_lang,j->tr.language,sizeof s->detected_lang);osa_strlcpy(s->transcript_id,j->tr.id,sizeof s->transcript_id);s->transcript_conf=(float)j->tr.confidence;s->transcript_rtf=j->tr.rtf;s->transcript_dur=j->tr.duration_s;s->transcript_ms=j->tr.proc_ms;s->transcript_words=j->tr.n_words;shell_refresh_phonetic(s);free(s->history_json);s->history_json=osa_app_history_json(s->app,100,NULL);shell_set_message(s,false,"%s",tt(s->lang,"msg.ok"));break;
-        case SHELL_JOB_TRANSLATE:osa_strlcpy(s->tr_out,j->mt.text,sizeof s->tr_out);osa_strlcpy(s->tr_out_lang,j->mt.target_lang,sizeof s->tr_out_lang);s->tr_score=j->mt.confidence;s->tr_phonetic[0]=0;if(s->show_phonetic)osa_app_pronounce(j->mt.text,j->mt.target_lang,s->tr_phonetic,sizeof s->tr_phonetic);shell_set_message(s,false,"%s (%s → %s)",tt(s->lang,"translate.done"),shell_lang_name(s,j->mt.source_lang),shell_lang_name(s,j->mt.target_lang));break;
+        case SHELL_JOB_TRANSLATE:osa_strlcpy(s->tr_out,j->mt.text,sizeof s->tr_out);osa_strlcpy(s->tr_out_lang,j->mt.target_lang,sizeof s->tr_out_lang);s->tr_score=j->mt.confidence;s->tr_same_lang=j->mt.same_language;s->tr_phonetic[0]=0;
+            /* A pronunciation line is only meaningful for a translation. When the
+             * two languages are the same the text is unchanged, so writing it out
+             * again ("Excited to meet you too" -> «اکسکید تُ میت یو تو») is not a
+             * transliteration, it is noise. */
+            if(s->show_phonetic&&!j->mt.same_language)osa_app_pronounce(j->mt.text,j->mt.target_lang,s->tr_phonetic,sizeof s->tr_phonetic);
+            if(j->mt.same_language)shell_set_message(s,true,"%s",tt(s->lang,"translate.samelang"));
+            else shell_set_message(s,false,"%s (%s → %s)",tt(s->lang,"translate.done"),shell_lang_name(s,j->mt.source_lang),shell_lang_name(s,j->mt.target_lang));
+            break;
         case SHELL_JOB_DOWNLOAD:free(s->models_json);s->models_json=NULL;s->models_tab=0;shell_set_message(s,false,"%s",tt(s->lang,"models.installed_inactive"));break;
         case SHELL_JOB_ACTIVATE:{
             free(s->models_json);s->models_json=NULL;
@@ -1066,8 +1114,15 @@ void shell_job_tick(shell_state*s){
         const char*raw=j->err.msg[0]?j->err.msg:tt(s->lang,"msg.cancelled");
         const char*hint=NULL;
         if(strstr(raw,"memory")||strstr(raw,"bad_alloc")||strstr(raw,"free RAM"))hint=tt(s->lang,"err.memory");
-        else if(strstr(raw,"cannot be opened")||strstr(raw,"cannot open")||strstr(raw,"missing"))hint=tt(s->lang,"err.modelfile");
-        else if(strstr(raw,"integrity")||strstr(raw,"wrong file format"))hint=tt(s->lang,"err.integrity");
+        else if(strstr(raw,"cannot be opened")||strstr(raw,"cannot open")||strstr(raw,"cannot read")||strstr(raw,"missing"))hint=tt(s->lang,"err.modelfile");
+        else if(strstr(raw,"integrity"))hint=tt(s->lang,"err.integrity");
+        /* The engine now names the real cause; give each kind the one action
+         * the user can take, in their own language. */
+        else if(strstr(raw,"not a GGUF")||strstr(raw,"not a fastText")||strstr(raw,"whisper (.bin)")||
+                strstr(raw,"not in a format")||strstr(raw,"wrong header"))hint=tt(s->lang,"err.format");
+        else if(strstr(raw,"truncated")||strstr(raw,"damaged")||strstr(raw,"corrupt")||strstr(raw,"ends inside"))hint=tt(s->lang,"err.damaged");
+        else if(strstr(raw,"fewer than two labels"))hint=tt(s->lang,"err.nolabels");
+        else if(strstr(raw,"no speech recognised"))hint=tt(s->lang,"err.nospeech");
         const char *where=j->kind==SHELL_JOB_ACTIVATE?tt(s->lang,"models.loghint"):"";
         /* Put the engine's sentence and the log pointer on their own lines.
          * A single mixed RTL/LTR line could still be clipped by the toast's
@@ -1079,7 +1134,34 @@ void shell_job_tick(shell_state*s){
     }
     s->dl_pack[0]=0;s->dl_progress=0;s->dl_got=s->dl_total=0;free(j->input);free(j->peaks);free(j->eval_json);free(j);
 }
-void shell_cancel_jobs(shell_state*s){if(!s)return;osa_app_cancel(s->app);if(s->job){shell_job*j=s->job;__sync_lock_test_and_set(&j->cancel,1);osa_thread_join(&j->th);free(j->input);free(j->peaks);free(j->eval_json);free(j);s->job=NULL;}s->working=s->downloading=s->activating=s->syncing=s->restoring=false;}
+/* Cancel, then wait a *bounded* time for the job to stop. This runs on the UI
+ * thread (Cancel button, and window close), so an unbounded join meant the
+ * whole window froze until a hash or a download noticed the flag. Everything
+ * here is now cancellable, so the wait is short; if it is still not done the
+ * job is abandoned to finish on its own and its thread is detached, because
+ * the window must never hang on background work. */
+#define SHELL_JOB_STOP_MS 4000
+void shell_cancel_jobs(shell_state*s){
+    if(!s)return;
+    osa_app_cancel(s->app);
+    if(s->job){
+        shell_job*j=s->job;
+        __sync_lock_test_and_set(&j->cancel,1);
+        if(osa_thread_join_timeout(&j->th,SHELL_JOB_STOP_MS)){
+            free(j->input);free(j->peaks);free(j->eval_json);free(j);
+            s->abandoned=false;
+        }else{
+            /* Still finishing: let the thread own its own memory. It reads
+             * nothing from shell_state, so detaching is safe — but no new job
+             * may start while it still holds the app, or two engines would be
+             * driven at once. s->abandoned records that until it is reaped. */
+            osa_thread_detach(&j->th);
+            s->abandoned=true;
+        }
+        s->job=NULL;
+    }
+    s->working=s->downloading=s->activating=s->syncing=s->restoring=false;
+}
 /* Legacy entry points now share the same job queue; installation never happens on the UI thread. */
 bool shell_download_start(shell_state*s,const char*id){return shell_start_job(s,SHELL_JOB_DOWNLOAD,id);}
 void shell_download_tick(shell_state*s){shell_job_tick(s);}

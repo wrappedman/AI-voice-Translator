@@ -18,7 +18,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 
-#define OSAI_VERSION        "1.4.2"
+#define OSAI_VERSION        "1.6.1"
 #define OSAI_APP_NAME       "OpenSpeech AI"
 #define OSAI_APP_ID         "OpenSpeechAI"
 
@@ -103,6 +103,14 @@ void osa_sha256_update(osa_sha256 *c, const void *data, size_t n);
 void osa_sha256_final(osa_sha256 *c, uint8_t digest[32]);
 void osa_sha256_hex(const void *data, size_t n, char out[65]);
 void osa_sha256_file(const char *path, char out[65], uint64_t *size_out);
+/* Same digest, but it can be stopped and reports how far it got. `cancel` is
+ * polled once per chunk and `progress` is called with (done, total) bytes;
+ * either may be NULL. Returns false when cancelled or when the file cannot be
+ * read, and out[] is then left empty. Sync uses this so that closing the app,
+ * or pressing Cancel, never has to wait for a multi-gigabyte read to finish. */
+bool osa_sha256_file_ex(const char *path, char out[65], uint64_t *size_out,
+                        volatile int *cancel,
+                        void (*progress)(int64_t, int64_t, void *), void *ud);
 
 uint32_t osa_crc32(uint32_t seed, const void *data, size_t n);
 uint64_t osa_hash64(const void *data, size_t n);

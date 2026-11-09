@@ -8,6 +8,7 @@
  *  triggered the action of the panel behind it.
  * ===================================================================== */
 #include "ui_kit.h"
+#include "../core/osai_platform.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -168,6 +169,7 @@ bool ui_init(ui_context *u, osa_canvas *c) {
     u->L.win_h = c->h;
     u->next_id = 1;
     u->focus_id = 0;
+    u->copy_request = 0;
     u->popup_id = 0;
     return true;
 }
@@ -665,6 +667,14 @@ bool ui_row(ui_context *u, int id, osa_rect r, bool selected) {
 /* ---- controls ------------------------------------------------------ */
 
 bool ui_segmented(ui_context *u, int id, osa_rect r, const char *labels, int *value, int n) {
+    return ui_segmented_disabled(u, id, r, labels, value, n, -1);
+}
+
+/* A segment the machine cannot honour: drawn, but visibly inactive and not
+ * clickable. A greyed-out option that still accepts the click is the same lie as
+ * no hint at all — the user selects it and wonders why nothing changed. */
+bool ui_segmented_disabled(ui_context *u, int id, osa_rect r, const char *labels,
+                           int *value, int n, int disabled_slot) {
     if (n <= 0) return false;
     c_fill_round(u->c, r, r.h * 0.5f, u->t.panel_alt);
     c_stroke_round(u->c, r, r.h * 0.5f, 1.0f, u->t.border_soft);
@@ -683,12 +693,13 @@ bool ui_segmented(ui_context *u, int id, osa_rect r, const char *labels, int *va
         int slot = u->L.rtl ? (n - 1 - i) : i;
         osa_rect sr = rectf(r.x + slot * seg_w + 2, r.y + 2, seg_w - 4, r.h - 4);
         bool sel = *value == i;
-        if (sel) {
+        bool off = i == disabled_slot;
+        if (sel && !off) {
             c_fill_round(u->c, sr, sr.h * 0.5f, u->t.accent);
         }
         ui_label(u, sr, part, UI_FS_SMALL * u->L.scale,
-                 sel ? u->t.on_accent : u->t.text_dim, 1);
-        if (hover(u, sr) && u->in.clicked && !u->consumed_click && !sel) {
+                 off ? u->t.text_faint : (sel ? u->t.on_accent : u->t.text_dim), 1);
+        if (!off && hover(u, sr) && u->in.clicked && !u->consumed_click && !sel) {
             u->consumed_click = true;
             *value = i;
             changed = true;
@@ -842,6 +853,34 @@ static bool text_input_apply(ui_context *u, char *buf, size_t cap, bool multilin
                 continue;
             }
         } else if (cp == 9 || cp == 27 || cp < 32) {
+            continue;
+        } else if (cp >= 0xE000 && cp <= 0xF8FF) {
+            /* Private-use markers the platform layer raises for the clipboard
+             * shortcuts (see ui_kit.h): they never become text themselves. */
+            if (cp == UI_KEY_PASTE) {
+                osa_arena ar;
+                osa_arena_init(&ar);
+                const char *clip = osa_clipboard_get(&ar);
+                if (clip && *clip) {
+                    size_t cl = strlen(clip);
+                    if (n + cl + 1 < cap) {
+                        memcpy(buf + n, clip, cl);
+                        n += cl;
+                        buf[n] = 0;
+                        changed = true;
+                    }
+                }
+                osa_arena_free(&ar);
+            } else if (cp == UI_KEY_COPY) {
+                u->copy_request = 1;
+            } else if (cp == UI_KEY_CUT) {
+                u->copy_request = 1;
+                buf[0] = 0;
+                n = 0;
+                changed = true;
+            } else if (cp == UI_KEY_SELECT_ALL) {
+                u->copy_request = 1;      /* the caller copies the whole field */
+            }
             continue;
         } else {
             char tmp[4];

@@ -12,6 +12,7 @@
 #include "shell_internal.h"
 #include "../core/osai_platform.h"
 #include "../core/tts.h"
+#include "../core/live_endpoint.h"
 #include "../platform/mic.h"
 #include <stdio.h>
 #include <stdlib.h>
@@ -71,24 +72,55 @@ static void stat_tile(ui_context *u, osa_rect r, const char *label, const char *
              u->L.rtl ? 2 : 0);
 }
 
-/* ---- Live --------------------------------------------------------- */
-
-/* Live capture state. One growing segment of audio is recognised again every
- * time it gets longer, and the text of the whole segment replaces the pane.
+/* ---- Live ---------------------------------------------------------
  *
- * Whisper is an offline segment recogniser, not a streaming decoder. A pass
- * needs enough context: short sliding windows produce stray words. Recognise
- * the whole growing segment, at most one pass at a time, and translate that
- * result on the same worker. The UI thread only applies finished results. */
-#define LIVE_MIN_S      1.2        /* no pass before this much audio       */
-#define LIVE_SEG_MAX_S  25.0       /* commit and start a new segment here  */
+ * The live screen used to recognise one long, ever-growing segment on a timer.
+ * That is why it felt slow even though it "worked": a pass only started after
+ * 1.2 s of audio, each pass re-read the whole segment (so the work grew without
+ * bound), and the sentence you had already finished was only recognised when
+ * the next timer fired. Nothing was ever cut where you actually stopped
+ * speaking.
+ *
+ * It is now a pipeline:
+ *
+ *   microphone ──► 20 ms energy frames ──► endpoint state machine
+ *                                          │  speech starts
+ *                                          ▼
+ *                          partial pass on the segment so far, repeated
+ *                          while the segment grows (one pass at a time)
+ *                                          │  hangover: the speaker stopped
+ *                                          ▼
+ *                          final pass, then translate, then commit the text
+ *                          and start an empty segment for the next sentence
+ *
+ * The endpoint decision itself lives in src/core/live_endpoint.c so it is
+ * testable without a microphone; this file only moves audio, threads and text.
+ *
+ * Latency notes. A partial pass costs one whisper decode of the segment, so
+ * repeating it every 0.7 s over a 12 s segment would queue work faster than the
+ * CPU can retire it, which is what made the old screen lag behind the speaker.
+ * So the interval grows with the segment: short sentences stay responsive and
+ * long ones stay affordable. Only one pass is ever in flight, and while one is
+ * running the audio keeps accumulating — the pass never blocks capture.
+ */
+#define LIVE_FRAME_MS     20                    /* endpoint frame             */
+#define LIVE_FRAME_N      (OSAI_SR / 1000 * LIVE_FRAME_MS)
+#define LIVE_RING_S       40.0                  /* ring that holds the segment */
+#define LIVE_PARTIAL_MIN_S 0.9                  /* first partial this early   */
 
 static struct {
     osa_mic *mic;
     struct live_job *job;            /* the pass in flight, or NULL */
-    float    ring[OSAI_SR * 30];
-    int64_t  n;
-    double   since_emit;
+    float    ring[OSAI_SR * (int)LIVE_RING_S];
+    int64_t  n;                      /* valid samples in ring      */
+    int64_t  ring_base;              /* absolute sample index of ring[0] */
+    /* endpoint state over the segment currently in the ring */
+    live_ep  ep;
+    int64_t  seg_start;              /* absolute sample index where it began */
+    int64_t  frame_cursor;           /* absolute sample index of the next frame */
+    double   since_pass;             /* seconds since a pass started */
+    double   pass_cost;              /* how long the last pass took */
+    bool     had_speech;             /* anything was heard this session */
     /* text already committed from earlier segments, and the tail currently
      * being recognised; the pane shows committed + partial */
     char     committed[16384];
@@ -96,11 +128,19 @@ static struct {
     char     final_text[32768];
     char     translation[65536];
     bool     stopping;
+    bool     pending_final;          /* a sentence closed while a pass ran */
 } g_live;
 
 static void live_reset(void) {
     g_live.n = 0;
-    g_live.since_emit = 0;
+    g_live.ring_base = 0;
+    g_live.seg_start = 0;
+    g_live.frame_cursor = 0;
+    g_live.since_pass = 0;
+    g_live.pass_cost = 0;
+    g_live.had_speech = false;
+    g_live.pending_final = false;
+    live_ep_init(&g_live.ep, NULL);
     g_live.committed[0] = 0;
     g_live.partial[0] = 0;
     g_live.final_text[0] = 0;
@@ -112,20 +152,55 @@ static void live_join(char *dst, size_t cap, const char *a, const char *b) {
     else osa_strlcpy(dst, (a && *a) ? a : (b ? b : ""), cap);
 }
 
+/* The ring is a plain linear buffer: g_live.ring[i] is the absolute sample
+ * g_live.ring_base + i. Trimming moves the survivors to the front, so the
+ * address of any sample never depends on modulo arithmetic that a trim could
+ * desynchronise. */
+
+/* Drops everything older than `keep_from` (absolute index). Called only when no
+ * pass is in flight, so the copy a pass holds is never touched. */
+static void live_trim(int64_t keep_from) {
+    if (keep_from <= g_live.ring_base) return;
+    int64_t drop = keep_from - g_live.ring_base;
+    if (drop >= g_live.n) { g_live.n = 0; g_live.ring_base = keep_from; return; }
+    memmove(g_live.ring, g_live.ring + drop,
+            (size_t)(g_live.n - drop) * sizeof g_live.ring[0]);
+    g_live.ring_base = keep_from;
+    g_live.n -= drop;
+}
+
+/* Starts a fresh segment at absolute index `from`, keeping `context_s` of the
+ * audio before it so the first syllable is not clipped by the cut. */
+static void live_new_segment(int64_t from, int64_t context) {
+    int64_t end = g_live.ring_base + g_live.n;
+    if (from > end) from = end;
+    if (from < g_live.ring_base) from = g_live.ring_base;
+    g_live.seg_start = from - context > g_live.ring_base ? from - context : g_live.ring_base;
+    g_live.since_pass = 0;
+    /* Keep the learned noise floor across sentences: re-learning it after every
+     * sentence made the first words of each one arrive late. */
+    float floor_db = live_ep_floor_db(&g_live.ep);
+    live_ep_init(&g_live.ep, NULL);
+    live_ep_seed_floor(&g_live.ep, floor_db);
+}
+
 /* ---- recognition worker -------------------------------------------
- * A pass recognises the whole segment, which takes seconds with the whisper
- * engine. Passes run on a worker thread so the window keeps painting: the pass
- * sees a private copy of the audio, one pass is in flight at a time, and its
- * result is applied on the UI thread by live_reap(). */
+ * A pass recognises the segment accumulated so far, which takes a fraction of a
+ * second to a few seconds with the whisper engine. Passes run on a worker thread
+ * so capture and painting never wait for one: the pass sees a private copy of
+ * the audio, one pass is in flight at a time, and its result is applied on the
+ * UI thread by live_reap(). */
 typedef struct live_job {
     float    *pcm;
     int64_t   n;
     osa_app  *app;
+    bool      final_pass;    /* the endpoint closed this sentence */
     char      text[32768];
     char      lang[8];
     char      translation[65536];
     float     conf;
     bool      ok, mt_ok;
+    double    took_s;
     volatile int done;
     osa_thread th;
 } live_job;
@@ -134,36 +209,94 @@ static void live_worker(void *ud) {
     live_job *j = (live_job *)ud;
     osa_error e;
     osa_err_ok(&e);
-    j->ok = osa_app_recognize(j->app, j->pcm, j->n, j->text, sizeof j->text,
-                              j->lang, sizeof j->lang, &j->conf, &e);
-    if(j->ok&&j->text[0]){osa_app_translation mt;osa_error me;osa_err_ok(&me);j->mt_ok=osa_app_translate_live(j->app,j->text,j->lang,&mt,&me);if(j->mt_ok)osa_strlcpy(j->translation,mt.text,sizeof j->translation);}
-    __sync_synchronize(); j->done = 1;
+    int64_t t0 = osa_now_ms();
+    j->ok = osa_app_recognize_live(j->app, j->pcm, j->n, !j->final_pass,
+                                   j->text, sizeof j->text,
+                                   j->lang, sizeof j->lang, &j->conf, &e);
+    /* Translate only when there is something to translate. A final pass also
+     * translates, because that text is what the session commits: translating it
+     * here keeps the sentence and its translation in one atomic result, instead
+     * of leaving the translation to arrive a pass later. */
+    if (j->ok && j->text[0]) {
+        osa_app_translation mt;
+        osa_error me;
+        osa_err_ok(&me);
+        j->mt_ok = osa_app_translate_live(j->app, j->text, j->lang, &mt, &me);
+        if (j->mt_ok) osa_strlcpy(j->translation, mt.text, sizeof j->translation);
+    }
+    j->took_s = (double)(osa_now_ms() - t0) / 1000.0;
+    osa_worker_log_note("live pass: %s %.1f s audio in %.2f s -> %d chars, %d words",
+                        j->final_pass ? "final" : "partial",
+                        (double)j->n / OSAI_SR, j->took_s,
+                        (int)strlen(j->text), j->ok ? 1 : 0);
+    __sync_synchronize();
+    j->done = 1;
 }
 
-static bool live_start_pass(shell_state *s) {
+/* How long to wait between partial passes over the same growing segment: the
+ * longer the segment, the more expensive one pass is, so the interval follows
+ * the measured cost of the last pass with a floor. */
+static double live_pass_interval(void) {
+    double iv = 0.55 + g_live.pass_cost * 0.8;
+    if (iv < 0.45) iv = 0.45;
+    if (iv > 6.0) iv = 6.0;
+    return iv;
+}
+
+static bool live_start_pass(shell_state *s, bool final_pass) {
     if (g_live.job) return false;
-    if (g_live.n < (int64_t)(OSAI_SR * LIVE_MIN_S)) return false;
+    /* A final pass recognises the whole sentence even if it is shorter than the
+     * partial-pass threshold: "mm-hm", "بله" or "yes" are real answers. */
+    int64_t from = g_live.seg_start;
+    int64_t to = g_live.ring_base + g_live.n;
+    if (to - from < (int64_t)(OSAI_SR * LIVE_PARTIAL_MIN_S)) return false;
     live_job *j = (live_job *)calloc(1, sizeof *j);
     if (!j) return false;
-    j->pcm = (float *)malloc((size_t)g_live.n * sizeof(float));
+    if (from < g_live.ring_base) from = g_live.ring_base;
+    int64_t count = to - from;
+    if (count <= 0) return false;
+    j->pcm = (float *)malloc((size_t)count * sizeof(float));
     if (!j->pcm) { free(j); return false; }
-    memcpy(j->pcm, g_live.ring, (size_t)g_live.n * sizeof(float));
-    j->n = g_live.n;
+    memcpy(j->pcm, g_live.ring + (from - g_live.ring_base),
+           (size_t)count * sizeof(float));
+    j->n = count;
     j->app = s->app;
+    j->final_pass = final_pass;
     if (!osa_thread_start(&j->th, live_worker, j)) { free(j->pcm); free(j); return false; }
     g_live.job = j;
+    g_live.since_pass = 0;
     return true;
 }
 
-/* Shows the result of a finished pass. */
-static void live_apply(shell_state *s, const live_job *j) {
+/* Shows the result of a finished pass. A partial replaces the tail of the pane;
+ * a final one is appended to the committed text and clears the tail, so the
+ * next sentence starts on a clean pane instead of re-editing the last one. */
+static void live_apply(shell_state *s, live_job *j) {
     if (!j->ok || !j->text[0]) return;
-    osa_strlcpy(g_live.partial, j->text, sizeof g_live.partial);
-    char joined[32768]; live_join(joined,sizeof joined,g_live.committed,g_live.partial);
-    if (osa_streq(joined, g_live.final_text)) return;
-    osa_strlcpy(g_live.final_text,joined,sizeof g_live.final_text);
-    if(j->mt_ok)osa_strlcpy(g_live.translation,j->translation,sizeof g_live.translation);
-    s->live_words=0;for(const char*c=g_live.final_text;*c;c++)if(*c==' ')s->live_words++;if(g_live.final_text[0])s->live_words++;
+    g_live.had_speech = true;
+    if (j->final_pass) {
+        char joined[32768];
+        live_join(joined, sizeof joined, g_live.committed, j->text);
+        osa_strlcpy(g_live.committed, joined, sizeof g_live.committed);
+        g_live.partial[0] = 0;
+        if (j->mt_ok && j->translation[0]) {
+            char tr[65536];
+            live_join(tr, sizeof tr, g_live.translation, j->translation);
+            osa_strlcpy(g_live.translation, tr, sizeof g_live.translation);
+        }
+    } else {
+        osa_strlcpy(g_live.partial, j->text, sizeof g_live.partial);
+        if (j->mt_ok) osa_strlcpy(g_live.translation, j->translation, sizeof g_live.translation);
+    }
+    char shown[32768];
+    live_join(shown, sizeof shown, g_live.committed, g_live.partial);
+    /* Only touch the pane when the text actually changed: rewriting it every
+     * pass made the panes flicker while the speaker was still talking. */
+    if (osa_streq(shown, g_live.final_text)) return;
+    osa_strlcpy(g_live.final_text, shown, sizeof g_live.final_text);
+    s->live_words = 0;
+    for (const char *c = g_live.final_text; *c; c++) if (*c == ' ') s->live_words++;
+    if (g_live.final_text[0]) s->live_words++;
 }
 
 /* Collects a finished pass. Joined here, on the UI thread, so the worker's
@@ -171,49 +304,143 @@ static void live_apply(shell_state *s, const live_job *j) {
 static void live_finish_job(shell_state *s) {
     live_job *j = g_live.job;
     osa_thread_join(&j->th);
+    g_live.pass_cost = j->took_s;
     live_apply(s, j);
+    bool was_final = j->final_pass;
     free(j->pcm);
     free(j);
     g_live.job = NULL;
+    if (was_final) {
+        /* The sentence is committed. Keep a short lead-in of its tail so the
+         * next segment does not begin with a clipped consonant, and let the
+         * endpoint state machine start again from silence. */
+        int64_t to = g_live.ring_base + g_live.n;
+        int64_t ctx = (int64_t)(OSAI_SR * 0.15);
+        live_new_segment(to, ctx);
+        osa_worker_log_note("live sentence committed: %d chars, %d chars translated",
+                            (int)strlen(g_live.committed), (int)strlen(g_live.translation));
+        if (g_live.stopping) {
+            g_live.stopping = false;
+            s->live = false;
+            s->live_level = 0;
+            if (g_live.mic) { osa_mic_close(g_live.mic); g_live.mic = NULL; }
+            osa_strlcpy(s->translation, g_live.translation, sizeof s->translation);
+            osa_strlcpy(s->transcript, g_live.final_text, sizeof s->transcript);
+            shell_set_message(s, !g_live.final_text[0], "%s",
+                              kl(s, g_live.final_text[0] ? "live.done" : "live.nothing"));
+        }
+    }
 }
+
+/* Forward declaration: live_segment_done_impl() is defined below, and this
+ * function may call it as soon as a pass finishes. */
+static void live_segment_done_impl(shell_state *s);
 
 static void live_reap(shell_state *s) {
     if (!g_live.job || !osa_atomic_load(&g_live.job->done)) return;
+    bool was_final = g_live.job->final_pass;
     live_finish_job(s);
-    if(g_live.stopping){g_live.stopping=false;s->live=false;s->live_level=0;osa_strlcpy(s->translation,g_live.translation,sizeof s->translation);shell_set_message(s,!g_live.final_text[0],"%s",kl(s,g_live.final_text[0]?"live.done":"live.nothing"));}
+    /* The speaker stopped while a *partial* pass was in flight. Whisper is not
+     * interrupted once it starts, so the sentence is recognised once more, now
+     * with its ending included, instead of committing a pass that was cut short
+     * mid-sentence. That is the price of a real sentence boundary, and it is one
+     * extra pass, not the endless re-decoding the old screen did. */
+    if (!was_final && g_live.pending_final && !g_live.stopping) {
+        g_live.pending_final = false;
+        live_segment_done_impl(s);
+    }
 }
 
-/* A segment that has grown past the window is committed and the buffer starts
- * again from empty. Only called with no pass in flight, so the commit and the
- * pass cannot disagree about which text is partial. */
-static void live_commit_if_long(shell_state *s) {
-    if (g_live.n < (int64_t)(OSAI_SR * LIVE_SEG_MAX_S)) return;
-    if (g_live.partial[0]) {
-        char joined[32768];
-        live_join(joined, sizeof joined, g_live.committed, g_live.partial);
-        osa_strlcpy(g_live.committed, joined, sizeof g_live.committed);
-        g_live.partial[0] = 0;
+/* A forced cut: the sentence reached the endpoint's maximum length. The audio
+ * from the quietest recent frame onwards belongs to the *next* sentence, so it
+ * is dropped from this segment before it is recognised rather than being cut in
+ * the middle of a word. */
+static void live_force_cut(void) {
+    int64_t from = g_live.seg_start;
+    int64_t to = g_live.ring_base + g_live.n;
+    int64_t frames = (to - from) / LIVE_FRAME_N;
+    if (frames <= 0) return;
+    float db[1024];
+    if (frames > (int64_t)(sizeof db / sizeof db[0])) {
+        from = to - (int64_t)(sizeof db / sizeof db[0]) * LIVE_FRAME_N;
+        frames = (int64_t)(sizeof db / sizeof db[0]);
     }
-    /* keep the last 2 s as the context lead-in for the next segment */
-    int64_t keep = OSAI_SR * 2;
-    if (keep > g_live.n) keep = g_live.n;
-    memmove(g_live.ring, g_live.ring + (g_live.n - keep), (size_t)keep * sizeof(float));
-    g_live.n = keep;
-    (void)s;
+    for (int64_t i = 0; i < frames; i++)
+        db[i] = live_ep_db(g_live.ring + (from - g_live.ring_base) + i * LIVE_FRAME_N,
+                           LIVE_FRAME_N);
+    float cut_s = live_ep_cut_point(db, (int)frames, 0, &g_live.ep.p);
+    int64_t cut = from + (int64_t)(cut_s * OSAI_SR);
+    if (cut <= g_live.seg_start) cut = to;
+    if (cut > to) cut = to;
+    /* Recognise only up to the cut: temporarily shorten what a pass can see. */
+    g_live.n = cut - g_live.ring_base;
+}
+
+/* Called when the endpoint closes a sentence. Runs the final pass over it. */
+static void live_segment_done_impl(shell_state *s) {
+    if (g_live.job) { g_live.pending_final = true; return; }  /* reap runs it */
+    if (g_live.ep.last_cut_was_forced) live_force_cut();
+    if (!live_start_pass(s, true)) {
+        /* nothing worth recognising (a cough, a click): start over */
+        live_new_segment(g_live.ring_base + g_live.n, (int64_t)(OSAI_SR * 0.15));
+    }
 }
 
 static void live_stop(shell_state *s) {
-    if(g_live.mic){osa_mic_close(g_live.mic);g_live.mic=NULL;}
-    s->live_level=0;
-    if(g_live.job){g_live.stopping=true;return;} /* reap on a later timer tick, never join on UI thread */
-    if(live_start_pass(s)){g_live.stopping=true;return;}
-    s->live=false;osa_strlcpy(s->translation,g_live.translation,sizeof s->translation);
-    shell_set_message(s,!g_live.final_text[0],"%s",kl(s,g_live.final_text[0]?"live.done":"live.silent"));
+    if (g_live.mic) { osa_mic_close(g_live.mic); g_live.mic = NULL; }
+    s->live_level = 0;
+    /* Stop means "finish this sentence": the segment in the ring is recognised
+     * once more (a final pass) and then the session closes in live_reap, never
+     * by joining a thread on the UI thread. */
+    if (g_live.job) { g_live.stopping = true; return; }
+    if (live_start_pass(s, true) || g_live.final_text[0] || g_live.committed[0]) {
+        g_live.stopping = true;
+        return;
+    }
+    s->live = false;
+    shell_set_message(s, true, "%s", kl(s, "live.nothing"));
 }
-void shell_live_shutdown(shell_state*s){
-    if(g_live.mic){osa_mic_close(g_live.mic);g_live.mic=NULL;}
-    if(g_live.job){live_job*j=g_live.job;osa_thread_join(&j->th);free(j->pcm);free(j);g_live.job=NULL;}
-    g_live.stopping=false;s->live=false;s->live_level=0;
+
+void shell_live_shutdown(shell_state *s) {
+    if (g_live.mic) { osa_mic_close(g_live.mic); g_live.mic = NULL; }
+    if (g_live.job) {
+        live_job *j = g_live.job;
+        osa_thread_join(&j->th);
+        free(j->pcm);
+        free(j);
+        g_live.job = NULL;
+    }
+    g_live.stopping = false;
+    g_live.pending_final = false;
+    s->live = false;
+    s->live_level = 0;
+}
+
+/* Feeds every captured frame through the endpoint and returns what happened.
+ * `decided` marks how much audio the endpoint has already accounted for, so a
+ * frame is never counted twice even when the ring is trimmed. */
+static int live_advance_endpoint(void) {
+    int events = LIVE_EP_NONE;
+    int64_t to = g_live.ring_base + g_live.n;
+    while (g_live.frame_cursor + LIVE_FRAME_N <= to) {
+        int64_t idx = g_live.frame_cursor - g_live.ring_base;
+        if (idx < 0) { g_live.frame_cursor = g_live.ring_base; break; }
+        float db = live_ep_db(g_live.ring + idx, LIVE_FRAME_N);
+        g_live.frame_cursor += LIVE_FRAME_N;
+        int ev = live_ep_frame(&g_live.ep, db);
+        if (ev == LIVE_EP_SPEECH_START) {
+            /* the segment starts where speech started, in absolute samples:
+             * one frame before the frame that triggered it */
+            int64_t at = g_live.frame_cursor - LIVE_FRAME_N;
+            g_live.seg_start = at;
+            if (g_live.seg_start < g_live.ring_base) g_live.seg_start = g_live.ring_base;
+            g_live.since_pass = 999;      /* recognise the first words at once */
+            events |= LIVE_EP_SPEECH_START;
+        } else if (ev == LIVE_EP_SEGMENT_READY) {
+            events |= LIVE_EP_SEGMENT_READY;
+        }
+    }
+    return events;
 }
 
 void shell_live_tick(shell_state *s, double dt) {
@@ -222,20 +449,49 @@ void shell_live_tick(shell_state *s, double dt) {
     s->live_time += dt;
     float buf[1600];
     int n;
-    /* drain the device every tick: the reader is what re-queues finished
-     * buffers, so not reading would stop capture after one buffer */
+    /* Drain the device every tick: the reader is what re-queues finished
+     * buffers, so not reading would stop capture after one buffer. */
     while ((n = osa_mic_read(g_live.mic, buf, 1600)) > 0) {
-        for (int i = 0; i < n && g_live.n < (int64_t)(sizeof g_live.ring / sizeof g_live.ring[0]); i++)
+        int64_t cap = (int64_t)(sizeof g_live.ring / sizeof g_live.ring[0]);
+        for (int i = 0; i < n; i++) {
+            if (g_live.n >= cap) {
+                /* Full: drop the oldest whole frames (a pass holds its own
+                 * copy, so this can never pull audio out from under one). The
+                 * endpoint keeps its own absolute cursor and simply resumes at
+                 * the new base. */
+                int64_t drop = LIVE_FRAME_N * 8;
+                live_trim(g_live.ring_base + drop);
+                if (g_live.seg_start < g_live.ring_base) g_live.seg_start = g_live.ring_base;
+                if (g_live.frame_cursor < g_live.ring_base) g_live.frame_cursor = g_live.ring_base;
+            }
             g_live.ring[g_live.n++] = buf[i];
-        if (g_live.n >= (int64_t)(sizeof g_live.ring / sizeof g_live.ring[0])) break;
+        }
     }
     s->live_level = osa_mic_level(g_live.mic);
+
+    int ev = live_advance_endpoint();
+
+    /* A forced cut: the segment reached the endpoint's maximum length. Cut at
+     * the quietest recent frame so the cut does not land inside a word. */
+    if (ev & LIVE_EP_SEGMENT_READY) {
+        live_segment_done_impl(s);
+        return;
+    }
+
     live_reap(s);
-    if (!g_live.job) live_commit_if_long(s);
-    g_live.since_emit += dt;
-    if (g_live.since_emit >= 0.7 && !g_live.job) {
-        g_live.since_emit = 0;
-        live_start_pass(s);
+    if (g_live.job) return;                   /* one pass at a time */
+
+    int64_t seg_len = g_live.ring_base + g_live.n - g_live.seg_start;
+    /* Keep the ring bounded to the current segment: a long session must not
+     * grow forever, and the text is already committed. */
+    if (seg_len > (int64_t)(sizeof g_live.ring / sizeof g_live.ring[0]) - OSAI_SR) {
+        live_trim(g_live.seg_start);
+    }
+
+    g_live.since_pass += dt;
+    bool long_enough = seg_len >= (int64_t)(OSAI_SR * LIVE_PARTIAL_MIN_S);
+    if (long_enough && g_live.since_pass >= live_pass_interval()) {
+        live_start_pass(s, false);
     }
 }
 
@@ -322,7 +578,9 @@ static void draw_live(shell_state *s, ui_context *u, osa_rect body) {
         num_fa(s, raw, loc, sizeof loc);
         ui_label(u, rectf(sess.x + 12 * u->L.scale, sess.y + 8 * u->L.scale,
                           sess.w - 24 * u->L.scale, 15 * u->L.scale),
-                 kl(s, "live.session"), UI_FS_TINY * u->L.scale, u->t.text_faint,
+                 kl(s, s->live && g_live.ep.in_segment ? "live.hearing" : "live.session"),
+                 UI_FS_TINY * u->L.scale,
+                 s->live && g_live.ep.in_segment ? u->t.accent : u->t.text_faint,
                  u->L.rtl ? 2 : 0);
         ui_label(u, rectf(sess.x + 12 * u->L.scale, sess.y + 24 * u->L.scale,
                           sess.w - 24 * u->L.scale, 26 * u->L.scale),
@@ -394,11 +652,14 @@ static void draw_live(shell_state *s, ui_context *u, osa_rect body) {
         } else {
             /* The two panes must not say the same thing twice: the source pane
              * explains how to start, the translation pane waits for it. */
-            const char *head = s->live ? kl(s, "live.listening")
+            /* While listening, the empty pane must say what the pipeline is
+             * doing: hearing (audio is arriving) is a different state from
+             * waiting (the sentence ended and its pass is running). */
+            const char *head = s->live ? (i == 0 ? kl(s, "live.listening")
+                                                 : kl(s, "live.waiting"))
                              : i == 0 ? kl(s, "live.empty")
                                       : kl(s, "live.emptyout");
-            const char *hint = s->live ? (i == 0 ? kl(s, "live.speaking")
-                                                : kl(s, "live.waiting"))
+            const char *hint = s->live ? (i == 0 ? kl(s, "live.auto") : NULL)
                              : i == 0 ? kl(s, "live.emptyhint") : NULL;
             ui_label(u, rectf(tr.x, tr.y + tr.h * 0.34f, tr.w, 22 * u->L.scale), head,
                      UI_FS_BODY * u->L.scale, u->t.text_faint, 1);
@@ -619,6 +880,28 @@ static void draw_translate(shell_state *s, ui_context *u, osa_rect body) {
         s->tr_phonetic[0] = 0;
         u->focus_id = 3200;
     }
+    /* Paste sits with the other actions rather than in the header: Ctrl+V works
+     * once the box has focus, and a visible button is what makes that
+     * discoverable. It replaces the box's contents, because pasting into a
+     * translator means "translate this", not "append". */
+    osa_rect paste_r = rectf(u->L.rtl ? clr_r.x + clr_r.w + 8 * u->L.scale
+                                      : clr_r.x - 8 * u->L.scale - bw,
+                             by, bw, btn_h);
+    if (ui_button_ghost(u, 3205, paste_r, kl(s, "btn.paste"))) {
+        osa_arena ar;
+        osa_arena_init(&ar);
+        const char *clip = osa_clipboard_get(&ar);
+        if (clip && *clip) {
+            osa_strlcpy(s->tr_in, clip, sizeof s->tr_in);
+            s->tr_out[0] = 0;
+            s->tr_phonetic[0] = 0;
+            u->focus_id = 3200;
+            shell_set_message(s, false, "%s", kl(s, "msg.pasted"));
+        } else {
+            shell_set_message(s, true, "%s", kl(s, "msg.clipempty"));
+        }
+        osa_arena_free(&ar);
+    }
 
     /* ---------- output ---------- */
     ui_card(u, out_r);
@@ -633,8 +916,8 @@ static void draw_translate(shell_state *s, ui_context *u, osa_rect body) {
         osa_rect copy_r = rectf(u->L.rtl ? out_r.x + p : out_r.x + out_r.w - p - ow,
                                 out_r.y + 9 * u->L.scale, ow, 28 * u->L.scale);
         if (ui_button_ghost(u, 3203, copy_r, kl(s, "btn.copy"))) {
-            osa_clipboard_set(s->tr_out);
-            shell_set_message(s, false, "%s", kl(s, "msg.copied"));
+            if (osa_clipboard_set(s->tr_out)) shell_set_message(s, false, "%s", kl(s, "msg.copied"));
+            else shell_set_message(s, true, "%s", kl(s, "msg.clipfail"));
         }
         osa_rect say_r = rectf(u->L.rtl ? out_r.x + p + ow + 6 * u->L.scale
                                         : out_r.x + out_r.w - p - ow * 2 - 6 * u->L.scale,
@@ -648,8 +931,12 @@ static void draw_translate(shell_state *s, ui_context *u, osa_rect body) {
     c_hline(u->c, out_r.x + p, out_r.x + out_r.w - p, out_r.y + 42 * u->L.scale, 1,
             u->t.border_soft);
 
-    bool ph = s->show_phonetic && s->tr_phonetic[0];
-    float ph_h = ph ? 52 * u->L.scale : 0;
+    /* The آوانویسی box appears whenever the switch is on: when a script cannot be
+     * read letter by letter it says so, because an empty line is indistinguishable
+     * from a broken feature. */
+    bool ph = s->show_phonetic && (s->tr_phonetic[0] || s->tr_out[0]);
+    bool ph_note = ph && !s->tr_phonetic[0];
+    float ph_h = ph ? (ph_note ? 58 : 52) * u->L.scale : 0;
     osa_rect tr = rectf(out_r.x + p, out_r.y + 52 * u->L.scale, out_r.w - p * 2,
                         out_r.h - 64 * u->L.scale - ph_h);
     if (tr.h < 24) tr.h = 24;
@@ -680,10 +967,17 @@ static void draw_translate(shell_state *s, ui_context *u, osa_rect body) {
         po.max_width = pr.w - 24 * u->L.scale;
         po.rtl = true;
         po.align = 2;
-        text_draw_box(u->c, u->reg, UI_FS_BODY * u->L.scale, u->t.text,
-                      rectf(pr.x + 12 * u->L.scale, pr.y + 18 * u->L.scale,
-                            pr.w - 24 * u->L.scale, 24 * u->L.scale),
-                      s->tr_phonetic, po);
+        if (ph_note) {
+            text_draw_box(u->c, u->reg, UI_FS_TINY * u->L.scale, u->t.text_faint,
+                          rectf(pr.x + 12 * u->L.scale, pr.y + 18 * u->L.scale,
+                                pr.w - 24 * u->L.scale, 32 * u->L.scale),
+                          kl(s, "phonetic.unsupported"), po);
+        } else {
+            text_draw_box(u->c, u->reg, UI_FS_BODY * u->L.scale, u->t.text,
+                          rectf(pr.x + 12 * u->L.scale, pr.y + 18 * u->L.scale,
+                                pr.w - 24 * u->L.scale, 24 * u->L.scale),
+                          s->tr_phonetic, po);
+        }
     }
 
 }
@@ -1276,12 +1570,58 @@ static void draw_settings(shell_state *s, ui_context *u, osa_rect body) {
     }
     y += row_h;
 
+    /* Compute device: CPU or GPU. The hint is not decorative — it says what this
+     * build can do, because a package with the CPU backend cannot honour a GPU
+     * request and must say so instead of quietly ignoring it. */
+    bool gpu_possible = false;
+    {
+        /* The status is a token from the app, localised here: an English
+         * sentence in the middle of a Persian row reads like a bug. */
+        const char *tok = osa_app_device_status(s->app);
+        gpu_possible = !osa_streq(tok, "cpu-only");
+        /* "cpu-only" is the honest case: this package was built with the CPU
+         * backend and no CUDA/Vulkan sources at all, so a GPU request can never
+         * be honoured. Measured with `OpenSpeechWorker --probe`, which registers
+         * zero GPU devices. Saying so here is the difference between a setting
+         * that silently does nothing and one the user understands. */
+        const char *hint = osa_streq(tok, "gpu") ? kl(s, "settings.dev.gpu")
+                         : osa_streq(tok, "gpu-requested-cpu") ? kl(s, "settings.dev.gpureq")
+                         : osa_streq(tok, "cpu-only") ? kl(s, "settings.dev.cpuonly")
+                         : kl(s, "settings.dev.cpu");
+        setting_row(u, rectf(a.x + p, y, a.w - p * 2, row_h), kl(s, "settings.device"), hint);
+    }
+    {
+        osa_rect sr = rectf(u->L.rtl ? a.x + p : a.x + a.w - p - ctrl_w,
+                            y + 6 * u->L.scale, ctrl_w, 32 * u->L.scale);
+        /* The labels are localised before the widget sees them: it takes a
+         * "left|right" string, not keys. */
+        char labels[96];
+        snprintf(labels, sizeof labels, "%s|%s", kl(s, "settings.devicecpu"),
+                 kl(s, "settings.devicegpu"));
+        /* A CPU-only build shows the GPU segment greyed out and unclickable, so
+         * it can never be left selected and then quietly ignored. */
+        int sel = (gpu_possible && osa_app_gpu(s->app)) ? 1 : 0;
+        if (ui_segmented_disabled(u, 8005, sr, labels, &sel, 2, gpu_possible ? -1 : 1)) {
+            osa_app_set_device(s->app, sel == 1);
+            shell_save_prefs(s);
+        }
+    }
+    y += row_h;
+
     setting_row(u, rectf(a.x + p, y, a.w - p * 2, row_h), kl(s, "settings.threads"),
                 kl(s, "settings.threadshint"));
     {
         osa_rect sr = rectf(u->L.rtl ? a.x + p : a.x + a.w - p - ctrl_w,
                             y + 6 * u->L.scale, ctrl_w, 32 * u->L.scale);
-        if (ui_stepper(u, 8003, sr, &s->asr_threads, 1, 16)) shell_save_prefs(s);
+        int budget = s->asr_threads;
+        if (ui_stepper(u, 8003, sr, &budget, 1, 16)) {
+            s->asr_threads = budget;
+            /* The number is a real budget, not a label: it is what both workers
+             * and the recogniser are started with. Applying it here is what makes
+             * lowering it bring the CPU back down without a restart. */
+            osa_app_set_threads(s->app, s->asr_threads);
+            shell_save_prefs(s);
+        }
     }
 
     /* ================= translation ================= */
@@ -1421,10 +1761,19 @@ static void draw_settings(shell_state *s, ui_context *u, osa_rect body) {
             s->request = SHELL_REQ_PICK_MODELS_DIR;
         bool syncing = s->syncing;
         if (syncing) {
-            char raw[64], loc[128], label[192];
+            char raw[64], loc[128], label[256];
             snprintf(raw, sizeof raw, "%d / %d", s->sync_done, s->sync_total);
             text_localize_digits(raw, s->lang == UI_FA ? "fa" : "en", loc, sizeof loc);
-            snprintf(label, sizeof label, tt(s->lang, "settings.syncing"), loc);
+            /* Verifying a multi-gigabyte model takes minutes and the file count
+             * cannot move meanwhile, so say which file is being read. "0 / 6"
+             * on its own looked exactly like a frozen window. */
+            if (s->sync_reading[0]) {
+                char first[160];
+                snprintf(first, sizeof first, tt(s->lang, "settings.syncing"), loc);
+                snprintf(label, sizeof label, tt(s->lang, "settings.syncbig"), first, s->sync_reading);
+            } else {
+                snprintf(label, sizeof label, tt(s->lang, "settings.syncing"), loc);
+            }
             c_fill_round(u->c, syncb, u->L.radius_sm, u->t.panel_alt);
             ui_label(u, syncb, label, UI_FS_TINY * u->L.scale, u->t.accent, 1);
         } else if (ui_button(u, 8401, syncb, kl(s, "settings.sync"), !s->job)) {

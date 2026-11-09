@@ -2,7 +2,7 @@
 
 **Offline multilingual speech recognition and translation for Windows — no bundled models.**
 
-version 1.4.1 · Windows 10 1903+ / 11 x64 · GPL-3.0-or-later
+version 1.6.1 · Windows 10 1903+ / 11 x64 · GPL-3.0-or-later
 
 خلاصهٔ فارسی: برنامه هیچ مدل ازپیش‌نصب‌شده‌ای همراه ندارد. در بخش «مدل‌ها» یک مدل
 گفتار Whisper، یک مدل ترجمه Qwen GGUF و یک مدل تشخیص زبان (fastText یا GlotLID) را از منابع
@@ -15,13 +15,30 @@ version 1.4.1 · Windows 10 1903+ / 11 x64 · GPL-3.0-or-later
 ```
 dist/bin/OpenSpeechAI.exe          GUI executable, x86-64, static, worker embedded
 dist/bin/OpenSpeechWorker.exe      isolated neural inference worker
-dist/OpenSpeechAI-1.4.1-win64.zip  exe + worker + fonts/catalog/docs (no weights)
-dist/checksums-1.4.1.txt           SHA-256 of exe, worker and zip
+dist/OpenSpeechAI-1.6.1-win64.zip  exe + worker + fonts/catalog/docs (no weights)
+dist/checksums-1.6.1.txt           SHA-256 of exe, worker and zip
 ```
 
 ![Fresh-install Models screen](dist/screenshots/screen-04-models.png)
 
 ---
+
+## What changed in 1.6.1
+
+| Area | Behaviour |
+|---|---|
+| **The GPU switch told the truth, and now it can be trusted** | Reported with a screenshot: «پردازش روی گرافیک تنظیم شده اما در هنگام ترجمه سی‌پی‌یو کامل درگیره» — GPU selected, CPU pinned at 100%, no explanation. The shipped package is built with `-DGGML_USE_CPU` and contains no CUDA/Vulkan sources, so it registers exactly one device: the CPU. A new `OpenSpeechWorker --probe` asks llama.cpp's registry which devices exist and answers in milliseconds **without loading a model**; the app calls it once at startup. On a CPU-only package the GPU segment is now drawn inactive and cannot be selected, and the row says why in Persian rather than leaving the user to guess. A translation can never be reported as "on the GPU" when it is not. |
+| **The device choice actually reaches the engine** | Even on a build that *can* offload, changing the setting did nothing: `ensure_worker()` reused the process that had been started with `--device cpu` until it exited. Changing the device (or the thread budget) now restarts the translation worker, so the next request really runs where the setting says. |
+| **A slower-but-polite CPU** | Three sources of a permanently pinned processor, all fixed. The default thread budget only left a core free on machines with more than two cores, so a 2-core/4-thread i3-4160 used **every** core; it now always keeps one for the window, the OS and audio. The budget reached the recogniser but never the translator, so lowering it in Settings changed nothing during a translation. And llama.cpp's threadpool ships with `poll=50`, which spins ~6.5 M pause instructions per wait before sleeping — the worker now attaches a sleeping pool (`poll=0`) and threads cost microseconds of wake-up per token instead of burning a core between tokens. |
+
+## What changed in 1.6.0
+
+| Area | Behaviour |
+|---|---|
+| **آوانویسی for every language, not just English** | The line under the translation used to be produced for English only, and its vowels were placed by rule of thumb — often on ا/ی/و, which carries no short vowel in Persian. A new reader (`src/engines/pronounce.c`) works from the **script** instead of one language pair: Latin (with per-language rules for German, French, Spanish, Italian, Portuguese, Dutch, Turkish, Polish, Czech, Swedish, Finnish, Hungarian, Romanian, Vietnamese), Cyrillic, Greek, Arabic, Hebrew and Persian. Three rules are enforced by the emitter itself rather than by each table: a short vowel is a diacritic on the consonant *before* it (or gets a carrier at the start of a word), never on a long-vowel letter and never doubled; a long vowel is a letter. So `спасибо` → سپاسیبو, `καλημέρα` → کالیمِرا, `danke schön` → دَنکِ شُن, `dziękuję` → دزیکُیِ, `שלום` → شلوم. Accented letters are folded onto their base letter by a generated table (`tools/gen_pronounce_fold.py`), and a language's own rule still wins, so German `ü` stays یو while Polish `ś` is just ش. |
+| **Translations no longer come back as a chat reply** | Reported: English → Persian, input «hello», output «Hello! How can I assist you today?». The worker asked for a translation by ISO code only (`"the language with ISO code fa"`), which a small quantised model does not reliably follow, and it answered the text instead of translating it. The prompt now names both languages in words (*from English into Persian*), forbids replying or greeting, and requires the output to be written in the target language's own script. The worker then **verifies** that with a script check shared with the UI (`src/engines/lang_script.c`): an answer in the wrong script is refused with an explanation and nothing is saved, instead of quietly showing an answer that is not a translation. A proper noun that legitimately comes back unchanged, a number, or a reply already written in the target script still passes. |
+| **Honest limits instead of silence** | Chinese, Japanese, Korean, Thai and the Indic scripts cannot be read letter by letter without a dictionary. They are reported as unsupported and the Translate screen prints one sentence saying so, instead of an empty box that looks broken. |
+| **CPU or GPU, with the truth reported** | Settings has a «پردازش روی» row (سی‌پی‌یو / گرافیک). The choice is stored in preferences and passed to the translation worker as `--device`; the worker asks llama.cpp whether it can offload and reports back which device it **actually** used. When the build has no GPU backend (the shipped build is CPU-only, `-DGGML_USE_CPU`), the row says so in Persian: the option exists, the app explains why it has no effect, and it never silently pretends. |
 
 ## What changed in 1.4.1
 
@@ -177,10 +194,12 @@ tests only; the shipped app always uses `<exe folder>\data`.
 
 ## Validation status
 
-- Linux: `make tests` (145 checks, including the exact Windows argv quoting
+- Linux: `make tests` (306 checks, including the exact Windows argv quoting
   regression, a real worker handshake, `detect` round trips against a synthetic
-  fastText fixture, and a load from a spaces/Persian/backslash path) and
-  `make snapshots` pass in this environment.
+  fastText fixture, a load from a spaces/Persian/backslash path, and
+  pronunciation for eighteen languages, and the "answered instead of translated"
+  case) and `make snapshots` pass in this
+  environment.
 - Windows: cross-build succeeds; `tools/verify_exe.py` checks PE subsystem,
   manifests, the embedded worker payload and load-bearing strings.
 - **Not performed here:** native Windows microphone/Media Foundation runtime and
