@@ -118,12 +118,58 @@ static char *worker_reply(osa_process*p,const char*request,volatile int*cancel,o
     if(!osa_process_line(p,WORKER_TIMEOUT_MS,cancel,&line,err))return NULL;
     bool ok=false;osa_json_get_bool(line,"ok",&ok);if(!ok){char msg[512];if(!osa_json_get_string(line,"error",msg,sizeof msg))osa_strlcpy(msg,"model worker failed",sizeof msg);osa_err_set(err,"%s",msg);free(line);return NULL;}return line;
 }
+/* Rough resident-memory estimate for a pack, used only to explain a failure. */
+static int estimate_ram_mb(const char*kind,int64_t bytes,const char*ext){
+    double mb=(double)bytes/1048576.0;
+    if(osa_streq(kind,"lang"))return osa_streq(ext,"ftz")?300:1500;
+    if(osa_streq(kind,"mt"))return (int)(mb*1.15)+500;   /* mmap + KV cache */
+    return (int)(mb*1.6)+400;                            /* whisper + state */
+}
+static int free_ram_mb(void){
+    osa_sys_stats st;memset(&st,0,sizeof st);osa_sys_stats_sample(&st);
+    if(st.ram_total_mb<=0)return -1;
+    int free_mb=(int)(st.ram_total_mb-st.ram_used_mb);return free_mb>0?free_mb:0;
+}
+/* Starts the worker and waits for its ready event. Every failure path keeps the
+ * worker's own sentence: "model did not become ready" told the user nothing,
+ * while the worker always reports why (bad file, unsupported GGUF, bad_alloc).
+ * The attempt and the outcome are also appended to <data>/Logs/worker.log. */
 static osa_process *start_worker(const char*kind,const char*path,volatile int*cancel,osa_error*err){
     char exe[OSAI_MAX_PATH];
     if(!osa_worker_path(exe,sizeof exe,err))return NULL;
-    char threads[8];snprintf(threads,sizeof threads,"%d",osa_clampi(osa_cpu_count()/2,1,8));const char*argv[]={exe,"--kind",kind,"--model",path,"--threads",threads,NULL};
-    osa_process*p=osa_process_start(argv,err);if(!p)return NULL;char*line=NULL;if(!osa_process_line(p,WORKER_TIMEOUT_MS,cancel,&line,err)){osa_process_stop(p);return NULL;}
-    bool ok=false;char event[32]={0};osa_json_get_bool(line,"ok",&ok);osa_json_get_string(line,"event",event,sizeof event);free(line);if(!ok||!osa_streq(event,"ready")){osa_process_stop(p);osa_err_set(err,"model did not become ready");return NULL;}return p;
+    char threads[8];snprintf(threads,sizeof threads,"%d",osa_clampi(osa_cpu_count()/2,1,8));
+    const char*argv[]={exe,"--kind",kind,"--model",path,"--threads",threads,NULL};
+    osa_worker_log_note("activate kind=%s threads=%s model=%s",kind,threads,path);
+    osa_process*p=osa_process_start(argv,err);
+    if(!p){osa_worker_log_note("spawn failed: %s",err&&err->msg[0]?err->msg:"?");return NULL;}
+    char*line=NULL;
+    if(!osa_process_line(p,WORKER_TIMEOUT_MS,cancel,&line,err)){
+        char tail[512]={0};int code=-1;bool exited=osa_process_exited(p,&code);
+        osa_worker_log_tail(tail,sizeof tail);
+        char base[600];osa_strlcpy(base,err&&err->msg[0]?err->msg:"no reply from the model worker",sizeof base);
+        osa_process_stop(p);
+        if(tail[0])osa_err_set(err,"%s — worker log: %s",base,tail);
+        else if(exited)osa_err_set(err,"%s — the model worker exited with code %d",base,code);
+        else osa_err_set(err,"%s",base);
+        osa_worker_log_note("handshake failed: %s",err&&err->msg[0]?err->msg:"?");
+        return NULL;
+    }
+    bool ok=false;char event[32]={0},msg[512]={0};
+    osa_json_get_bool(line,"ok",&ok);osa_json_get_string(line,"event",event,sizeof event);
+    osa_json_get_string(line,"error",msg,sizeof msg);
+    free(line);
+    if(!ok||!osa_streq(event,"ready")){
+        int code=-1;bool exited=osa_process_exited(p,&code);
+        osa_process_stop(p);
+        if(!msg[0]){char tail[512]={0};if(osa_worker_log_tail(tail,sizeof tail))osa_strlcpy(msg,tail,sizeof msg);}
+        if(!msg[0])snprintf(msg,sizeof msg,"unexpected reply from the model worker (exit code %d)",exited?code:-1);
+        const char*label=osa_streq(kind,"mt")?"translation":"language-identification";
+        osa_err_set(err,"the %s model could not be loaded: %s",label,msg);
+        osa_worker_log_note("load failed: %s",msg);
+        return NULL;
+    }
+    osa_worker_log_note("ready kind=%s",kind);
+    return p;
 }
 static bool ensure_worker(osa_app*a,const char*kind,osa_error*err){osa_process**slot=osa_streq(kind,"mt")?&a->mt:&a->lid;const char*path=osa_streq(kind,"mt")?a->mt_path:a->lid_path;if(*slot)return true;if(!path[0]){osa_err_set(err,"activate the required %s model first",kind);return false;}*slot=start_worker(kind,path,&a->cancel,err);return *slot!=NULL;}
 
@@ -140,6 +186,12 @@ osa_app *osa_app_create(osa_error*err){
     osa_app*a=calloc(1,sizeof*a);if(!a){osa_err_set(err,"out of memory");return NULL;}osa_mutex_init(&a->db_mu);osa_mutex_init(&a->engine_mu);osa_mutex_init(&a->life_mu);
     osa_strlcpy(a->models_dir,osa_path(OSAI_DIR_MODELS),sizeof a->models_dir);osa_strlcpy(a->audio_dir,osa_path(OSAI_DIR_AUDIO),sizeof a->audio_dir);
     char dbp[OSAI_MAX_PATH];osa_path_join(dbp,sizeof dbp,osa_path(OSAI_DIR_DB),"openspeech.db");a->db=osa_db_open(dbp,err);if(!a->db){osa_mutex_destroy(&a->db_mu);osa_mutex_destroy(&a->engine_mu);osa_mutex_destroy(&a->life_mu);free(a);return NULL;}a->db_ready=true;migrate_legacy(a);
+    /* The models folder is a persisted choice; it must be read after the
+     * database is open, and only honoured when it still exists. */
+    {osa_arena ar2;osa_arena_init(&ar2);char*md=osa_db_get_setting(a->db,"models_dir",&ar2,"");
+     if(md&&*md&&osa_dir_exists(md)){osa_strlcpy(a->models_dir,md,sizeof a->models_dir);
+         size_t n=strlen(a->models_dir);if(n&&a->models_dir[n-1]!=OSAI_PATH_SEP[0]&&n+1<sizeof a->models_dir){a->models_dir[n]=OSAI_PATH_SEP[0];a->models_dir[n+1]=0;}}
+     osa_arena_free(&ar2);}
     lockd(a);osa_arena ar;osa_arena_init(&ar);char*s=osa_db_get_setting(a->db,"lang_src",&ar,"auto");char*d=osa_db_get_setting(a->db,"lang_dst",&ar,"fa");char*st=osa_db_get_setting(a->db,"mt_style",&ar,"0");osa_strlcpy(a->lang_src,s,sizeof a->lang_src);osa_strlcpy(a->lang_dst,d,sizeof a->lang_dst);a->style=(mt_style)osa_clampi(atoi(st),0,2);osa_arena_free(&ar);unlockd(a);return a;
 }
 void osa_app_destroy(osa_app*a){if(!a)return;osa_atomic_inc(&a->cancel);osa_mutex_lock(&a->life_mu);locke(a);if(a->asr){wsp_free(a->asr);a->asr=NULL;}osa_process*mt=a->mt,*lid=a->lid;a->mt=a->lid=NULL;unlocke(a);osa_process_stop(mt);osa_process_stop(lid);lockd(a);osa_db_close(a->db);a->db=NULL;unlockd(a);osa_mutex_unlock(&a->life_mu);osa_mutex_destroy(&a->life_mu);osa_mutex_destroy(&a->engine_mu);osa_mutex_destroy(&a->db_mu);free(a);}
@@ -150,8 +202,147 @@ bool osa_app_refresh(osa_app*a,osa_error*err){(void)a;osa_err_ok(err);return tru
 static bool activate(osa_app*a,const char*id,osa_error*err){
     osa_model m;if(!get_model(a,id,&m,err))return false;const pack_def*p=find_pack(id);if(!p||!osa_streq(p->kind,m.kind)||!verify(m.path,p,err)){osa_err_set(err,"installed model is missing, unsupported or failed integrity verification");return false;}
     if(osa_streq(m.kind,"asr")){char e[512]={0};wsp_ctx*n=wsp_load(m.path,e,sizeof e);if(!n){osa_err_set(err,"%s",e);return false;}wsp_set_cancel(n,&a->cancel);lockd(a);bool ok=osa_store_model_set_active(a->db,id,err);unlockd(a);if(!ok){wsp_free(n);return false;}locke(a);wsp_ctx*old=a->asr;a->asr=n;osa_strlcpy(a->asr_id,id,sizeof a->asr_id);osa_strlcpy(a->asr_name,m.name,sizeof a->asr_name);unlocke(a);wsp_free(old);return true;}
-    osa_process*n=start_worker(m.kind,m.path,&a->cancel,err);if(!n)return false;lockd(a);bool ok=osa_store_model_set_active(a->db,id,err);unlockd(a);if(!ok){osa_process_stop(n);return false;}locke(a);osa_process*old=NULL;if(osa_streq(m.kind,"mt")){old=a->mt;a->mt=n;a->mt_loaded=true;osa_strlcpy(a->mt_id,id,sizeof a->mt_id);osa_strlcpy(a->mt_name,m.name,sizeof a->mt_name);osa_strlcpy(a->mt_path,m.path,sizeof a->mt_path);const pack_def*pd=find_pack(id);osa_strlcpy(a->mt_langs,pd&&pd->langs?pd->langs:QWEN_LANGS,sizeof a->mt_langs);}else{old=a->lid;a->lid=n;a->lid_loaded=true;osa_strlcpy(a->lid_id,id,sizeof a->lid_id);osa_strlcpy(a->lid_name,m.name,sizeof a->lid_name);osa_strlcpy(a->lid_path,m.path,sizeof a->lid_path);}unlocke(a);osa_process_stop(old);return true;
+    /* Release the previous engine of this kind *before* loading the new one:
+     * two resident translation models is exactly what a 8 GB PC cannot do. */
+    locke(a);
+    osa_process*old=osa_streq(m.kind,"mt")?a->mt:a->lid;
+    if(osa_streq(m.kind,"mt")){a->mt=NULL;a->mt_loaded=false;}else{a->lid=NULL;a->lid_loaded=false;}
+    unlocke(a);
+    osa_process_stop(old);
+    int need=estimate_ram_mb(m.kind,m.size_bytes,p->ext),have=free_ram_mb();
+    if(have>=0&&have<need/2)osa_worker_log_note("warning: ~%d MB free, this model needs ~%d MB",have,need);
+    osa_process*n=start_worker(m.kind,m.path,&a->cancel,err);
+    if(!n){
+        if(have>=0&&have<need){
+            char base[600];osa_strlcpy(base,err&&err->msg[0]?err->msg:"load failed",sizeof base);
+            osa_err_set(err,"%s [free RAM ~%d MB, this model needs ~%d MB — choose a smaller model]",base,have,need);
+        }
+        return false;
+    }
+    /* The handshake proves the file loads. Keep the engine out of memory while
+     * it is idle so activating the next category still fits; ensure_worker()
+     * reloads it on the first request. */
+    osa_process_stop(n);
+    lockd(a);bool ok=osa_store_model_set_active(a->db,id,err);unlockd(a);
+    if(!ok)return false;
+    locke(a);
+    if(osa_streq(m.kind,"mt")){
+        a->mt=NULL;a->mt_loaded=true;
+        osa_strlcpy(a->mt_id,id,sizeof a->mt_id);osa_strlcpy(a->mt_name,m.name,sizeof a->mt_name);
+        osa_strlcpy(a->mt_path,m.path,sizeof a->mt_path);
+        osa_strlcpy(a->mt_langs,p->langs?p->langs:QWEN_LANGS,sizeof a->mt_langs);
+    }else{
+        a->lid=NULL;a->lid_loaded=true;
+        osa_strlcpy(a->lid_id,id,sizeof a->lid_id);osa_strlcpy(a->lid_name,m.name,sizeof a->lid_name);
+        osa_strlcpy(a->lid_path,m.path,sizeof a->lid_path);
+    }
+    unlocke(a);
+    return true;
 }
+/* ---- delete a model ------------------------------------------------ */
+bool osa_app_remove_model(osa_app*a,const char*id,osa_error*err){
+    if(!a||!id||!*id){osa_err_set(err,"bad arguments");return false;}
+    osa_mutex_lock(&a->life_mu);
+    osa_model m;
+    if(!get_model(a,id,&m,err)){osa_mutex_unlock(&a->life_mu);return false;}
+    /* Unload first: an open file cannot be deleted on Windows. */
+    locke(a);
+    wsp_ctx*old_asr=NULL;osa_process*old_proc=NULL;
+    if(osa_streq(m.kind,"asr")&&osa_streq(a->asr_id,id)){old_asr=a->asr;a->asr=NULL;a->asr_id[0]=a->asr_name[0]=0;}
+    else if(osa_streq(m.kind,"mt")&&osa_streq(a->mt_id,id)){old_proc=a->mt;a->mt=NULL;a->mt_loaded=false;a->mt_id[0]=a->mt_name[0]=a->mt_path[0]=0;a->mt_langs[0]=0;}
+    else if(osa_streq(m.kind,"lang")&&osa_streq(a->lid_id,id)){old_proc=a->lid;a->lid=NULL;a->lid_loaded=false;a->lid_id[0]=a->lid_name[0]=a->lid_path[0]=0;}
+    unlocke(a);
+    if(old_asr)wsp_free(old_asr);
+    if(old_proc)osa_process_stop(old_proc);
+    lockd(a);bool ok=osa_store_model_delete(a->db,id,err);unlockd(a);
+    if(ok){
+        if(m.path[0]&&osa_file_exists(m.path)&&!osa_file_remove(m.path))
+            osa_worker_log_note("could not delete model file %s",m.path);
+        const pack_def*p=find_pack(id);
+        if(p){char part[OSAI_MAX_PATH];
+            snprintf(part,sizeof part,"%s%s.%s",osa_path(OSAI_DIR_DOWNLOADS),p->id,p->ext);
+            if(osa_file_exists(part))osa_file_remove(part);
+            snprintf(part,sizeof part,"%s%s.%s.part",osa_path(OSAI_DIR_DOWNLOADS),p->id,p->ext);
+            if(osa_file_exists(part))osa_file_remove(part);}
+        osa_worker_log_note("removed model %s (%s)",id,m.path);
+    }
+    osa_mutex_unlock(&a->life_mu);
+    return ok;
+}
+
+/* ---- models folder + synchronisation ------------------------------- */
+void osa_app_models_dir(osa_app*a,char*out,size_t cap){
+    if(!out||!cap)return;out[0]=0;
+    if(!a){osa_strlcpy(out,osa_path(OSAI_DIR_MODELS),cap);return;}
+    osa_strlcpy(out,a->models_dir,cap);
+}
+static void norm_dir(char*dir,size_t cap){
+    size_t n=strlen(dir);
+    while(n>1&&(dir[n-1]=='/'||dir[n-1]=='\\'))dir[--n]=0;
+    if(n+1<cap){dir[n]=OSAI_PATH_SEP[0];dir[n+1]=0;}
+}
+bool osa_app_set_models_dir(osa_app*a,const char*dir,osa_error*err){
+    if(!a||!dir||!*dir){osa_err_set(err,"bad arguments");return false;}
+    char path[OSAI_MAX_PATH];osa_strlcpy(path,dir,sizeof path);norm_dir(path,sizeof path);
+    if(!osa_mkdirs(path)||!osa_dir_exists(path)){osa_err_set(err,"the models folder cannot be created: %s",path);return false;}
+    char probe[OSAI_MAX_PATH];snprintf(probe,sizeof probe,"%s.write-test",path);
+    if(!osa_file_write(probe,"",0)){osa_err_set(err,"the models folder is not writable: %s",path);return false;}
+    osa_file_remove(probe);
+    osa_strlcpy(a->models_dir,path,sizeof a->models_dir);
+    lockd(a);osa_db_set_setting(a->db,"models_dir",path);unlockd(a);
+    osa_worker_log_note("models folder set to %s",path);
+    return true;
+}
+/* Appends a name to a short comma-separated report without overflowing it. */
+static void append_name(char*buf,size_t cap,const char*name){
+    size_t n=strlen(buf),m=strlen(name);
+    const char*sep=n?", ":"";size_t sl=n?2:0;
+    if(n+sl+m+1>=cap)return;
+    memcpy(buf+n,sep,sl);memcpy(buf+n+sl,name,m+1);
+}
+static bool model_ext(const char*name){
+    return osa_ends(name,".gguf")||osa_ends(name,".bin")||osa_ends(name,".ftz");
+}
+bool osa_app_sync_models(osa_app*a,volatile int*cancel,
+                         void(*progress)(int64_t,int64_t,void*),void*ud,
+                         osa_sync_result*out,osa_error*err){
+    if(!a||!out){osa_err_set(err,"bad arguments");return false;}
+    memset(out,0,sizeof*out);
+    char dir[OSAI_MAX_PATH];osa_app_models_dir(a,dir,sizeof dir);
+    if(!osa_dir_exists(dir)){osa_err_set(err,"the models folder does not exist: %s",dir);return false;}
+    char**names=NULL;int n=osa_dir_scan(dir,NULL,&names,4096);
+    /* Only model-shaped files are hashed; anything else is ignored silently. */
+    int*keep=calloc((size_t)(n>0?n:1),sizeof(int));int total=0;
+    if(!keep){osa_dir_free_list(names,n);osa_err_set(err,"out of memory");return false;}
+    for(int i=0;i<n;i++){
+        char full[OSAI_MAX_PATH];osa_path_join(full,sizeof full,dir,names[i]);
+        if(model_ext(names[i])&&!osa_ends(names[i],".part")&&osa_file_size(full)>65536)keep[total++]=i;
+    }
+    bool ok=true;
+    for(int k=0;k<total;k++){
+        if(cancel&&osa_atomic_load(cancel)){ok=false;osa_err_set(err,"cancelled");break;}
+        if(progress)progress(k,total,ud);
+        const char*name=names[keep[k]];
+        char full[OSAI_MAX_PATH];osa_path_join(full,sizeof full,dir,name);
+        out->scanned++;
+        int64_t size=osa_file_size(full);
+        const pack_def*match=NULL;
+        /* Size first: it rejects almost everything without reading a byte. */
+        for(int i=0;i<NPACKS;i++)if(PACKS[i].bytes==size){match=PACKS+i;break;}
+        if(!match){out->unknown++;append_name(out->unknown_names,sizeof out->unknown_names,name);continue;}
+        char hex[65]={0};uint64_t got=0;osa_sha256_file(full,hex,&got);
+        if((int64_t)got!=match->bytes||!osa_strieq(hex,match->sha256)){
+            out->unknown++;append_name(out->unknown_names,sizeof out->unknown_names,name);continue;}
+        osa_model existing;osa_error ignored;osa_err_ok(&ignored);
+        if(get_model(a,match->id,&existing,&ignored)){out->existing++;continue;}
+        if(register_pack(a,match,full,err)){out->added++;osa_worker_log_note("sync: registered %s from %s",match->id,full);}
+        else{ok=false;break;}
+    }
+    if(progress)progress(total,total,ud);
+    free(keep);osa_dir_free_list(names,n);
+    return ok;
+}
+
 bool osa_app_activate_model(osa_app*a,const char*id,osa_error*err){if(!a||!id){osa_err_set(err,"bad arguments");return false;}osa_mutex_lock(&a->life_mu);bool ok=activate(a,id,err);osa_mutex_unlock(&a->life_mu);return ok;}
 bool osa_app_restore_saved(osa_app*a,osa_error*err){if(!a)return false;osa_err_ok(err);osa_mutex_lock(&a->life_mu);osa_rs rs;lockd(a);bool ok=osa_sql_query(a->db,"SELECT id FROM Models WHERE active=1 ORDER BY CASE kind WHEN 'lang' THEN 0 WHEN 'mt' THEN 1 ELSE 2 END",&rs,err);char ids[3][40]={{0}};int n=ok?osa_clampi(rs.nrows,0,3):0;for(int i=0;i<n;i++)osa_strlcpy(ids[i],osa_rs_val(&rs,i,"id"),40);osa_rs_free(&rs);unlockd(a);for(int i=0;i<n;i++){osa_error e={0};if(!activate(a,ids[i],&e)){osa_err_set(err,"%s",e.msg);ok=false;}}osa_mutex_unlock(&a->life_mu);return ok;}
 

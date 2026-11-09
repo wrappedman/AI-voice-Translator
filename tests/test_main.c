@@ -37,6 +37,7 @@ static void use_temp_root(const char *tag){
     snprintf(g_root,sizeof g_root,"/tmp/osai-%s-XXXXXX",tag);
     if(!mkdtemp(g_root)){perror("mkdtemp");exit(2);}
     setenv("OSAI_DATA_DIR",g_root,1);
+    osa_paths_reset();
 }
 static void clean_root(void){ osa_dir_remove_recursive(g_root); }
 
@@ -174,6 +175,117 @@ static void test_shell_gate(void){
     shell_shutdown(&sh); osa_app_destroy(app); clean_root();
 }
 
+/* The real worker, a real (synthetic) fastText file, a real round trip. This is
+ * the test that would have caught the child inheriting a non-inheritable stdin:
+ * the handshake succeeded and every request afterwards failed. */
+static void test_worker_protocol(void){
+    suite("worker protocol (real process)");
+    const char *exe="build/OpenSpeechWorker", *model="build/test-lid.bin";
+    if(!osa_file_exists(exe)||!osa_file_exists(model)){
+        printf("  SKIP worker or fixture missing (run make tests)\n");return;
+    }
+    osa_error err;osa_err_ok(&err);
+    const char *argv[]={exe,"--kind","lang","--model",model,"--threads","1",NULL};
+    osa_process *p=osa_process_start(argv,&err);
+    CHECK_MSG(p!=NULL,"worker starts: %s",p?"ok":err.msg);
+    if(!p)return;
+    char *line=NULL;
+    bool got=osa_process_line(p,20000,NULL,&line,&err);
+    CHECK_MSG(got,"ready line arrives: %s",got?"ok":err.msg);
+    if(got){
+        bool ok=false;char event[32]={0},kind[16]={0};
+        osa_json_get_bool(line,"ok",&ok);
+        osa_json_get_string(line,"event",event,sizeof event);
+        osa_json_get_string(line,"kind",kind,sizeof kind);
+        CHECK(ok);CHECK_STR(event,"ready");CHECK_STR(kind,"lang");
+        CHECK_MSG(strstr(line,"\"en\"")!=NULL,"the label list is populated (nwords+nlabels)");
+        free(line);line=NULL;
+    }
+    /* two requests over the same pipe: stdin must still be open after ready */
+    const char *reqs[]={"{\"op\":\"detect\",\"text\":\"hello world\"}",
+                        "{\"op\":\"detect\",\"text\":\"سلام دنیا\"}"};
+    const char *want[]={"en","fa"};
+    for(int i=0;i<2;i++){
+        CHECK(osa_process_write(p,reqs[i],&err));
+        got=osa_process_line(p,20000,NULL,&line,&err);
+        CHECK_MSG(got,"reply %d arrives: %s",i+1,got?"ok":err.msg);
+        if(got){char code[8]={0};osa_json_get_string(line,"language",code,sizeof code);
+            CHECK_STR(code,want[i]);free(line);line=NULL;}
+    }
+    osa_process_write(p,"{\"op\":\"shutdown\"}",&err);
+    osa_process_stop(p);
+
+    /* A bad file must report the loader's own sentence, not a generic one. */
+    const char *bad[]={exe,"--kind","lang","--model","build/does-not-exist.bin","--threads","1",NULL};
+    osa_process *q=osa_process_start(bad,&err);
+    if(q){
+        line=NULL;
+        if(osa_process_line(q,20000,NULL,&line,&err)){
+            bool ok=true;char msg[512]={0};
+            osa_json_get_bool(line,"ok",&ok);osa_json_get_string(line,"error",msg,sizeof msg);
+            CHECK(!ok);
+            CHECK_MSG(msg[0]!=0,"the worker explains the failure: %s",msg);
+            free(line);
+        }else CHECK_MSG(false,"a failing load still answers with one line");
+        osa_process_stop(q);
+    }
+}
+
+/* Models folder: the choice persists, and Sync reports what it cannot verify
+ * instead of registering an arbitrary file as an engine. */
+static void test_models_folder_and_sync(void){
+    suite("models folder + sync");
+    osa_error err;osa_err_ok(&err);
+    osa_app *app=osa_app_create(&err);
+    CHECK_MSG(app!=NULL,"app created: %s",app?err.msg:"");
+    if(!app)return;
+    char dir[OSAI_MAX_PATH]={0};osa_app_models_dir(app,dir,sizeof dir);
+    CHECK_MSG(strstr(dir,"Models")!=NULL,"default models folder is data/Models (%s)",dir);
+
+    char chosen[512];snprintf(chosen,sizeof chosen,"%smy-models",osa_path(OSAI_DIR_ROOT));
+    CHECK(osa_mkdirs(chosen));
+    CHECK(osa_app_set_models_dir(app,chosen,&err));
+    char back[OSAI_MAX_PATH]={0};osa_app_models_dir(app,back,sizeof back);
+    CHECK_MSG(strstr(back,"my-models")!=NULL,"the chosen folder is reported back (%s)",back);
+
+    /* a file that is not in the catalogue: reported, never registered */
+    char fake[700];snprintf(fake,sizeof fake,"%s/random.gguf",chosen);
+    char *junk=malloc(200000);memset(junk,7,200000);
+    CHECK(osa_file_write(fake,junk,200000));free(junk);
+    osa_sync_result res;
+    CHECK(osa_app_sync_models(app,NULL,NULL,NULL,&res,&err));
+    CHECK_MSG(res.added==0,"an unverified file is never registered (%d added)",res.added);
+    CHECK_MSG(res.unknown==1,"the unverified file is reported (%d unknown)",res.unknown);
+    CHECK_MSG(strstr(res.unknown_names,"random.gguf")!=NULL,"the report names the file");
+    char *json=osa_app_models_json(app,NULL);
+    CHECK_MSG(json&&osa_streq(json,"[]"),"nothing was installed by the sync");
+    free(json);
+
+    /* the choice survives a restart */
+    osa_app_destroy(app);
+    app=osa_app_create(&err);
+    if(app){char again[OSAI_MAX_PATH]={0};osa_app_models_dir(app,again,sizeof again);
+        CHECK_MSG(strstr(again,"my-models")!=NULL,"the folder choice persisted (%s)",again);}
+
+    /* delete removes the row and the file */
+    osa_model m;memset(&m,0,sizeof m);
+    osa_strlcpy(m.id,"test-delete",sizeof m.id);osa_strlcpy(m.name,"Test",sizeof m.name);
+    osa_strlcpy(m.kind,"mt",sizeof m.kind);osa_strlcpy(m.engine,"llama.cpp",sizeof m.engine);
+    osa_strlcpy(m.path,fake,sizeof m.path);osa_strlcpy(m.status,"installed",sizeof m.status);
+    m.size_bytes=200000;
+    char appdb[600];snprintf(appdb,sizeof appdb,"%sopenspeech.db",osa_path(OSAI_DIR_DB));
+    osa_db *db=osa_db_open(appdb,&err);
+    CHECK_MSG(db!=NULL,"second connection to the app database: %s",db?"ok":err.msg);
+    if(db){CHECK(osa_store_model_add(db,&m,&err));osa_db_close(db);}
+    CHECK(osa_file_exists(fake));
+    CHECK_MSG(osa_app_remove_model(app,"test-delete",&err),"remove succeeds: %s",err.msg);
+    CHECK(!osa_file_exists(fake));
+    json=osa_app_models_json(app,NULL);
+    CHECK_MSG(json&&osa_streq(json,"[]"),"the database row is gone");
+    free(json);
+    osa_app_destroy(app);
+}
+
 static void test_worker_path(void){
     suite("worker resolution");
     char path[OSAI_MAX_PATH]={0}; osa_error err;
@@ -263,7 +375,6 @@ static void test_optional_real_models(void){
 }
 
 int main(void){
-    osa_paths_init();
     test_json_unicode();
     test_catalog_and_gate();
     test_store_active();
@@ -272,6 +383,8 @@ int main(void){
     test_worker_isolation();
     test_shell_gate();
     test_worker_path();
+    test_worker_protocol();
+    test_models_folder_and_sync();
     test_portable_data_dir();
     test_optional_real_models();
     printf("\n%d passed, %d failed\n",g_pass,g_fail);

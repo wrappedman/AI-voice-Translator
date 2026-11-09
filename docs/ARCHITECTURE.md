@@ -1,4 +1,4 @@
-# OpenSpeech AI — Architecture (1.3.0)
+# OpenSpeech AI — Architecture (1.3.1)
 
 ## Product contract
 
@@ -60,6 +60,20 @@ working directory, and an inheritable append handle to `data/Logs/worker.log` as
 stderr, so a failed model load leaves a diagnosable trace. Spawn failures report
 the Windows error code.
 
+## Worker stdio contract
+
+The child owns exactly two inherited handles: the read end of its stdin pipe and
+the write end of its stdout pipe. The parent's ends are marked non-inheritable.
+Getting this wrong (clearing inheritance on "the read end" of both pipes) gave the
+worker an invalid stdin: it printed `ready`, then `std::getline` failed and the
+process exited, so activation looked fine and every request afterwards failed.
+`tests/test_main.c` now starts the real worker with a synthetic fastText file and
+performs two `detect` round trips over the same pipe.
+
+Diagnostics: the app appends `activate kind=… model=…`, `ready`, `load failed: …`
+notes to `data/Logs/worker.log`, and the worker's stderr goes to the same file. A
+failed handshake quotes the worker's own error, its exit code and the log tail.
+
 ## Data layout
 
 Everything is relative to the executable, never to the user profile:
@@ -100,7 +114,12 @@ catalog (pinned URL + size + SHA-256)
 ```
 
 Reinstall of an already-present verified file registers it without overwriting
-an active/loaded model file. There is no local-file import in the UI (removed in
+an active/loaded model file. **Sync** (`osa_app_sync_models`) walks the configured
+models folder, matches each candidate by exact byte size and then SHA-256 against
+the pinned catalogue, and registers matches inactive; anything else is counted
+and named in the report, never registered. **Delete** (`osa_app_remove_model`)
+unloads the engine first (an open file cannot be deleted on Windows), removes the
+row and deletes the file plus leftover `.part` downloads. There is no local-file import in the UI (removed in
 1.3.0): only a pinned catalogue download installs a model.
 
 ## Gating and UI state

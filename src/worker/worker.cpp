@@ -28,10 +28,15 @@ struct LanguageModel {
     fasttext::FastText ft;
     std::vector<std::string> labels;
     void load(const std::string &path) {
+        std::fprintf(stderr, "fastText: loading %s\n", path.c_str());
         ft.loadModel(path);
+        std::fprintf(stderr, "fastText: loaded, %d labels\n", (int)ft.getDictionary()->nlabels());
         auto dict=ft.getDictionary();
         if (dict->nlabels() < 2) throw std::runtime_error("not a language-identification model");
-        for (int32_t i=0; i<dict->nwords(); ++i) {
+        // nwords() + nlabels() covers the whole dictionary; iterating only
+        // nwords() stopped before the labels and produced an empty list.
+        const int32_t total=dict->nwords()+dict->nlabels();
+        for (int32_t i=0; i<total; ++i) {
             if (dict->getType(i)==fasttext::entry_type::label) {
                 std::string s=dict->getWord(i);
                 const std::string prefix="__label__";
@@ -70,8 +75,9 @@ struct TranslationModel {
         llama_backend_init();
         auto mp=llama_model_default_params();
         mp.n_gpu_layers=0; mp.use_mmap=true; mp.use_mlock=false; mp.check_tensors=true;
+        std::fprintf(stderr,"llama.cpp: loading %s (threads=%d)\n",path.c_str(),threads);
         model=llama_model_load_from_file(path.c_str(),mp);
-        if(!model) throw std::runtime_error("cannot load GGUF translation model (damaged, unsupported or insufficient RAM)");
+        if(!model) throw std::runtime_error("cannot load the GGUF translation model: the file is unsupported or there is not enough free memory (try a smaller quantization)");
         vocab=llama_model_get_vocab(model);
         if(llama_vocab_type(vocab)!=LLAMA_VOCAB_TYPE_NONE && !llama_model_chat_template(model,nullptr)) {
             throw std::runtime_error("model has no supported instruction chat template");
@@ -82,7 +88,8 @@ struct TranslationModel {
         cp.n_threads=threads; cp.n_threads_batch=threads; cp.flash_attn=false;
         cp.offload_kqv=false; cp.no_perf=true; cp.embeddings=false;
         ctx=llama_init_from_model(model,cp);
-        if(!ctx) throw std::runtime_error("not enough memory for translation context");
+        if(!ctx) throw std::runtime_error("not enough free memory for the translation context");
+        std::fprintf(stderr,"llama.cpp: ready, ctx=%u\n",context);
     }
     std::vector<llama_token> tokens(const std::string &s,bool add_special,bool parse_special) const {
         std::vector<llama_token> t(s.size()+64);
@@ -164,6 +171,7 @@ int main(int argc,char **argv) {
         send(ready);
         std::string line;
         while(std::getline(std::cin,line)) {
+            if(line.find_first_not_of(" \t\r\n")==std::string::npos) continue; // keepalive
             if(line.size()>1048576) { fail("request too large"); continue; }
             try {
                 json j=json::parse(line);
@@ -173,6 +181,12 @@ int main(int argc,char **argv) {
             catch(...) { fail("model inference failed"); }
         }
         return 0;
-    } catch(const std::exception &e) { fail(e.what()); return 1; }
-    catch(...) { fail("cannot initialize model worker"); return 1; }
+    } catch(const std::exception &e) {
+        std::fprintf(stderr,"worker: load failed: %s\n",e.what());
+        fail(e.what()); return 1;
+    }
+    catch(...) {
+        std::fprintf(stderr,"worker: load failed: unknown exception\n");
+        fail("cannot initialize model worker"); return 1;
+    }
 }

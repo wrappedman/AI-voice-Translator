@@ -26,6 +26,7 @@
 #include <windowsx.h>
 #include <commdlg.h>
 #include <shellapi.h>
+#include <shlobj.h>
 #include <stdbool.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -53,6 +54,7 @@
 #define REQ_OPEN_FOLDER SHELL_REQ_OPEN_FOLDER
 #define REQ_SAVE_TEXT   SHELL_REQ_SAVE_TRANSCRIPT
 #define REQ_OPEN_URL    SHELL_REQ_OPEN_URL
+#define REQ_PICK_MDIR   SHELL_REQ_PICK_MODELS_DIR
 /* Compile-time proof that the two enums still line up. They drifted once and the
  * result was a button that did nothing, so this cannot be left to review. */
 _Static_assert(REQ_PICK_AUDIO  == 1, "shell_request order changed");
@@ -60,6 +62,7 @@ _Static_assert(REQ_PICK_DATA   == 2, "shell_request order changed");
 _Static_assert(REQ_OPEN_FOLDER == 3, "shell_request order changed");
 _Static_assert(REQ_SAVE_TEXT   == 4, "shell_request order changed");
 _Static_assert(REQ_OPEN_URL    == 5, "shell_request order changed");
+_Static_assert(REQ_PICK_MDIR   == 6, "shell_request order changed");
 
 typedef struct host {
     HWND         hwnd;
@@ -91,6 +94,7 @@ typedef struct host {
      * second one on the spot (the modal loop is still dispatching our timer).
      * It is remembered here and started on the next frame instead. */
     int          pending_kind;
+    bool         in_frame;      /* re-entrancy guard for host_frame */
 } host;
 
 static host g_host;
@@ -164,6 +168,36 @@ static void finish_save_text(host *h, const wchar_t *file) {
     }
 }
 
+/* Folder picker for the models directory. SHBrowseForFolderW is used instead of
+ * the file dialog because it works on every supported Windows build and returns
+ * a filesystem path we can hand straight to the app layer. */
+static bool pick_models_dir(host *h) {
+    if (h->dialog_open) return false;
+    h->dialog_open = true;
+    wchar_t display[MAX_PATH * 2] = {0};
+    BROWSEINFOW bi;
+    memset(&bi, 0, sizeof bi);
+    bi.hwndOwner = h->hwnd;
+    bi.pszDisplayName = display;
+    bi.lpszTitle = L"پوشه مدل‌ها / Models folder";
+    bi.ulFlags = BIF_RETURNONLYFSDIRS | BIF_NEWDIALOGSTYLE | BIF_NONEWFOLDERBUTTON;
+    LPITEMIDLIST id = SHBrowseForFolderW(&bi);
+    bool ok = false;
+    if (id) {
+        wchar_t path[MAX_PATH * 2] = {0};
+        if (SHGetPathFromIDListW(id, path)) {
+            char utf8[OSAI_MAX_PATH];
+            if (WideCharToMultiByte(CP_UTF8, 0, path, -1, utf8, sizeof utf8, NULL, NULL)) {
+                shell_set_models_dir(&h->shell, utf8);
+                ok = true;
+            }
+        }
+        CoTaskMemFree(id);
+    }
+    h->dialog_open = false;
+    return ok;
+}
+
 static bool start_dialog(host *h, int kind) {
     if (h->dialog_open) return false;
     h->dialog_open = true;
@@ -176,6 +210,10 @@ static bool start_dialog(host *h, int kind) {
     h->ofn.nMaxFile = MAX_PATH * 2;
     h->ofn.Flags = OFN_FILEMUSTEXIST | OFN_PATHMUSTEXIST | OFN_EXPLORER |
                    OFN_NOCHANGEDIR;
+    if (kind == REQ_PICK_MDIR) {
+        h->dialog_open = false;
+        return pick_models_dir(h);
+    }
     if (kind == REQ_SAVE_TEXT) {
         h->ofn.Flags = OFN_OVERWRITEPROMPT | OFN_PATHMUSTEXIST | OFN_NOCHANGEDIR;
         h->ofn.lpstrFilter =
@@ -263,20 +301,32 @@ static double now_seconds(void) {
 }
 
 static void host_frame(host *h) {
-    if (!h->running) return;
+    /* ShellExecute, the common dialogs and the tray menu all pump messages while
+     * they run. Without this guard a WM_TIMER delivered inside that nested loop
+     * drew a second frame with the same click still latched, and one press of
+     * "Folder" opened two Explorer windows. */
+    if (!h->running || h->in_frame) return;
+    h->in_frame = true;
     double t = now_seconds();
     float dt = (float)(t - h->last_tick);
     if (dt < 0) dt = 0;
     if (dt > 0.25f) dt = 0.25f;      /* a stalled window must not jump */
     h->last_tick = t;
 
-    h->in.n_chars = h->n_typed;
-    memcpy(h->in.chars, h->typed, sizeof h->typed);
-    h->in.wheel = (float)h->wheel;
-    h->in.released = !h->in.down;
+    /* Consume the edge-triggered events *before* drawing or opening anything:
+     * a click belongs to exactly one frame even if a dialog re-enters us. */
+    ui_input in = h->in;
+    in.n_chars = h->n_typed;
+    memcpy(in.chars, h->typed, sizeof h->typed);
+    in.wheel = (float)h->wheel;
+    in.released = !h->in.down;
+    h->n_typed = 0;
+    h->wheel = 0;
+    h->in.clicked = false;
+    h->in.key = 0;
     shell_live_tick(&h->shell, dt > 0 ? dt : 0.05);
     ui_set_time(&h->ui, (float)t);
-    shell_draw(&h->shell, &h->canvas, &h->ui, &h->in);
+    shell_draw(&h->shell, &h->canvas, &h->ui, &in);
     host_blit(h);
 
     /* The UI raises a request instead of calling a dialog itself, so the shell
@@ -285,7 +335,9 @@ static void host_frame(host *h) {
     int req = h->shell.request;
     if (req != REQ_NONE) {
         h->shell.request = REQ_NONE;
-        if (req == REQ_OPEN_FOLDER) osa_open_in_explorer(osa_path(OSAI_DIR_ROOT));
+        if (req == REQ_OPEN_FOLDER)
+            osa_open_in_explorer(h->shell.request_path[0] ? h->shell.request_path
+                                                          : osa_path(OSAI_DIR_ROOT));
         else if (req == REQ_OPEN_URL) osa_open_url(h->shell.request_url);
         else if (start_dialog(h, req)) {
             /* handled (or the user cancelled) */
@@ -300,10 +352,7 @@ static void host_frame(host *h) {
         h->pending_kind = REQ_NONE;
         start_dialog(h, k);
     }
-    h->n_typed = 0;
-    h->wheel = 0;
-    h->in.clicked = false;
-    h->in.key = 0;
+    h->in_frame = false;
 }
 
 /* ---- window proc -------------------------------------------------- */

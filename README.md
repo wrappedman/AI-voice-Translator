@@ -2,7 +2,7 @@
 
 **Offline multilingual speech recognition and translation for Windows — no bundled models.**
 
-version 1.3.0 · Windows 10 1903+ / 11 x64 · GPL-3.0-or-later
+version 1.3.1 · Windows 10 1903+ / 11 x64 · GPL-3.0-or-later
 
 خلاصهٔ فارسی: برنامه هیچ مدل ازپیش‌نصب‌شده‌ای همراه ندارد. در بخش «مدل‌ها» یک مدل
 گفتار Whisper، یک مدل ترجمه Qwen GGUF و یک مدل تشخیص زبان fastText را از منابع
@@ -15,13 +15,26 @@ version 1.3.0 · Windows 10 1903+ / 11 x64 · GPL-3.0-or-later
 ```
 dist/bin/OpenSpeechAI.exe          GUI executable, x86-64, static, worker embedded
 dist/bin/OpenSpeechWorker.exe      isolated neural inference worker
-dist/OpenSpeechAI-1.3.0-win64.zip  exe + worker + fonts/catalog/docs (no weights)
-dist/checksums-1.3.0.txt           SHA-256 of exe, worker and zip
+dist/OpenSpeechAI-1.3.1-win64.zip  exe + worker + fonts/catalog/docs (no weights)
+dist/checksums-1.3.1.txt           SHA-256 of exe, worker and zip
 ```
 
 ![Fresh-install Models screen](dist/screenshots/screen-04-models.png)
 
 ---
+
+## What changed in 1.3.1
+
+| Area | Behaviour |
+|---|---|
+| **Activation of translation / language models** | The child process was handed a **non-inheritable stdin**, so the worker saw EOF and died right after its ready line. Both pipes are now marked explicitly (child stdin + child stdout inheritable, parent ends private). A real worker round trip is covered by a test. |
+| **Real error messages** | "model did not become ready" hid the worker's own sentence. Failures now report the loader's message, the exit code and the tail of `data\Logs\worker.log`, with a Persian explanation for the three causes a user can act on (out of memory, missing file, failed integrity) and a pointer to the log. |
+| **Lower memory use** | The previous engine of a category is released *before* the new one loads, and a validated worker is not kept resident while idle — it is loaded on first use. Activating three models no longer needs all three in RAM at once. |
+| **Delete a model** | Every installed row has a **Delete** button. It is a two-step action (click, then "Delete?"), and it unloads the model, removes the database row and deletes the file plus any leftover download. |
+| **Models folder + Sync** | Settings has a models-folder card: pick any writable folder, then press **Sync**. Files already in that folder are identified by exact size + SHA-256 against the official catalogue and appear under *Installed*, inactive, ready to activate. Unrecognised files are named in the report and never registered. New downloads go to the chosen folder. |
+| **One window per click** | `ShellExecute` and the common dialogs pump messages; a timer frame re-entered the draw loop with the same click latched and opened **two** Explorer windows. Frames are now non-reentrant and consume input before drawing. The Models folder button also opens the *models* folder instead of the data root. |
+| **About page** | The developer section is now the **last** section, with a short description of the program and an aligned caption/value grid (name, email, repository); email and repository open on click. |
+| **Language list** | The worker enumerated only dictionary words, so the LID label list came back empty; it now reads words *and* labels. |
 
 ## What changed in 1.3.0
 
@@ -95,11 +108,14 @@ data\Audio\         copies of transcribed files
 data\Database\      SQLite transcripts/translations/model cards
 data\Logs\          fault/timing logs and worker.log (no speech text by default)
 data\Cache\         extracted inference worker
+data\Logs\worker.log  why a model load failed (app notes + worker stderr)
 data\settings.ini   language, theme, threads, last languages
 ```
 
 First run: open **Models**, download one ASR + one MT + one LID model, then
-activate each. The app remains gated until all three are active, and the header
+activate each. If you already have model files, set the folder in **Settings →
+Models folder** and press **Sync**: recognised files appear under *Installed*.
+Deleting a model from that list removes both the file and its database row. The app remains gated until all three are active, and the header
 shows which model is active in each category.
 
 If the folder is read-only (e.g. `C:\Program Files` without elevation) the app
@@ -144,7 +160,8 @@ tests only; the shipped app always uses `<exe folder>\data`.
 
 ## Validation status
 
-- Linux: `make tests` (72 checks) and `make snapshots` pass in this environment.
+- Linux: `make tests` (104 checks, including a real worker handshake and two
+  `detect` round trips against a synthetic fastText fixture) and `make snapshots` pass in this environment.
 - Windows: cross-build succeeds; `tools/verify_exe.py` checks PE subsystem,
   manifests, the embedded worker payload and load-bearing strings.
 - **Not performed here:** native Windows microphone/Media Foundation runtime and

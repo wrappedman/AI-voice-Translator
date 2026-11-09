@@ -278,7 +278,13 @@ $(WIN_BIN): $(WIN_OBJ)
 #  Tests, snapshots, distribution
 # ===========================================================================
 .PHONY: tests
-tests: unittest $(LINUX_BIN) $(WORKER_LINUX)
+# A tiny synthetic fastText file (two labels, 288 bytes) lets the suite run a
+# real worker handshake and a real detect round trip without any download.
+$(BUILD)/test-lid.bin: tools/make_test_lid.py
+	@mkdir -p $(dir $@)
+	$(PYTHON) tools/make_test_lid.py $@
+
+tests: unittest $(LINUX_BIN) $(WORKER_LINUX) $(BUILD)/test-lid.bin
 	@echo ""
 	@echo "== headless self-test =="
 	$(LINUX_BIN) --selftest

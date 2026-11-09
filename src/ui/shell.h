@@ -44,7 +44,8 @@ typedef enum shell_request {
     SHELL_REQ_PICK_DATASET,    /* open the training dataset picker     */
     SHELL_REQ_OPEN_FOLDER,     /* show the data folder in Explorer    */
     SHELL_REQ_SAVE_TRANSCRIPT, /* save the current transcript to a file */
-    SHELL_REQ_OPEN_URL         /* open request_url in the browser/mail client */
+    SHELL_REQ_OPEN_URL,        /* open request_url in the browser/mail client */
+    SHELL_REQ_PICK_MODELS_DIR  /* pick the folder that holds model files */
 } shell_request;
 
 typedef struct shell_state {
@@ -101,6 +102,7 @@ typedef struct shell_state {
     struct shell_job *job;               /* one cancellable background action */
     bool          restoring;
     bool          activating;            /* a model is being loaded right now */
+    bool          syncing;               /* the models folder is being scanned */
     bool          models_ready;
 
     /* training */
@@ -151,7 +153,14 @@ typedef struct shell_state {
      * itself never touches the filesystem dialog APIs. */
     shell_request request;
     char          request_url[512];      /* payload for SHELL_REQ_OPEN_URL */
-    char          request_path[OSAI_MAX_PATH];
+    char          request_path[OSAI_MAX_PATH]; /* folder for OPEN_FOLDER */
+
+    /* models screen: folder + sync + delete confirmation */
+    char          models_dir[OSAI_MAX_PATH];
+    char          delete_id[40];         /* row awaiting a second click */
+    osa_sync_result sync;                /* last sync report */
+    bool          sync_valid;
+    int           sync_done, sync_total; /* progress while syncing */
 
     /* ui bookkeeping */
     int           frame;
@@ -174,6 +183,13 @@ bool shell_load_waveform(shell_state *s, const char *path);
 bool shell_run_transcribe(shell_state *s);
 bool shell_select_audio(shell_state *s, const char *path);
 bool shell_activate_model(shell_state *s, const char *id);
+/* Deletes the model file and its database row (unload first). */
+bool shell_delete_model(shell_state *s, const char *id);
+/* Points the app at a folder of model files and persists the choice. */
+void shell_set_models_dir(shell_state *s, const char *path);
+void shell_refresh_models_dir(shell_state *s);
+/* Registers catalogue-matching files found in the models folder. */
+bool shell_sync_models(shell_state *s);
 void shell_job_tick(shell_state *s);
 void shell_cancel_jobs(shell_state *s);
 void shell_live_shutdown(shell_state *s);

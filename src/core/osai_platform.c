@@ -6,6 +6,7 @@
  * elsewhere. src/platform/win32/ holds only the Windows entry point and
  * resources (`main_win.c`, `app.rc`, manifest, icon), not the platform layer. */
 #include "osai_platform.h"
+#include <stdarg.h>
 
 #ifdef _WIN32
 #include <windows.h>
@@ -188,6 +189,14 @@ static void migrate_legacy_root(const char *base) {
         if (osa_file_exists(src)) move_entry(src, dst);
     }
     if (osa_dir_size(legacy) == 0) osa_dir_remove_recursive(legacy);
+}
+
+/* Test harness only: forget the cached root so a suite can point OSAI_DATA_DIR
+ * at a fresh temporary directory. The shipped app calls osa_paths_init once. */
+void osa_paths_reset(void) {
+    g_paths_ready = false;
+    for (int i = 0; i < OSAI_DIR_COUNT; i++) g_paths[i][0] = 0;
+    g_exe_dir[0] = 0;
 }
 
 bool osa_paths_init(void) {
@@ -955,6 +964,40 @@ bool osa_worker_path(char *out, size_t cap, osa_error *err) {
 
 /* Opens a link the About screen shows. Only http(s) and mailto are accepted, so
  * a model name or a path can never turn into a shell command. */
+void osa_worker_log_note(const char *fmt, ...) {
+    if (!osa_paths_init()) return;
+    char path[OSAI_MAX_PATH];
+    snprintf(path, sizeof path, "%sworker.log", osa_path(OSAI_DIR_LOGS));
+    char stamp[32]; osa_iso_time(osa_now_ms(), stamp);
+    char body[1024];
+    va_list ap; va_start(ap, fmt); vsnprintf(body, sizeof body, fmt, ap); va_end(ap);
+    char line[1200];
+    int n = snprintf(line, sizeof line, "[%s] app: %s\n", stamp, body);
+    if (n > 0) osa_file_append(path, line, (size_t)n);
+}
+
+bool osa_worker_log_tail(char *out, size_t cap) {
+    if (!out || !cap) return false;
+    out[0] = 0;
+    if (!osa_paths_init()) return false;
+    char path[OSAI_MAX_PATH];
+    snprintf(path, sizeof path, "%sworker.log", osa_path(OSAI_DIR_LOGS));
+    osa_buf b; osa_buf_init(&b);
+    bool ok = osa_file_read(path, &b);
+    if (ok && b.len) {
+        /* last non-empty line only: it is the sentence the user needs */
+        size_t end = b.len;
+        while (end && (b.data[end-1] == '\n' || b.data[end-1] == '\r')) end--;
+        size_t start = end;
+        while (start && b.data[start-1] != '\n') start--;
+        size_t n = end - start;
+        if (n >= cap) { start = end - (cap - 1); n = cap - 1; }
+        memcpy(out, b.data + start, n); out[n] = 0;
+    }
+    osa_buf_free(&b);
+    return ok && out[0];
+}
+
 bool osa_open_url(const char *url) {
     if (!url || !*url) return false;
     if (!osa_starts(url, "https://") && !osa_starts(url, "http://") &&

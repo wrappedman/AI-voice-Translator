@@ -229,6 +229,34 @@ char *osa_app_models_json(osa_app *app, osa_error *err);
  * can be re-activated later (the "never lose the previous version" rule). */
 bool osa_app_activate_model(osa_app *app, const char *id, osa_error *err);
 
+/* Deletes a model: unloads it when active, removes the database row and deletes
+ * the file (plus any leftover download). This is the only destructive model
+ * operation and the UI asks for confirmation before calling it. */
+bool osa_app_remove_model(osa_app *app, const char *id, osa_error *err);
+
+/* ---- models folder ------------------------------------------------ */
+
+/* Where installed model files are written. Defaults to <data>/Models and can be
+ * pointed at any writable folder (an external disk, a shared model library). */
+void osa_app_models_dir(osa_app *app, char *out, size_t cap);
+bool osa_app_set_models_dir(osa_app *app, const char *dir, osa_error *err);
+
+typedef struct osa_sync_result {
+    int scanned;                 /* candidate files looked at              */
+    int added;                   /* newly registered models                */
+    int existing;                /* already registered, nothing to do      */
+    int unknown;                 /* not in the verified catalogue          */
+    char unknown_names[400];     /* a few names, for an honest report      */
+} osa_sync_result;
+
+/* Identifies the files already present in the models folder by SHA-256 against
+ * the pinned catalogue and registers the matches as installed (inactive), so the
+ * user can activate them from the Models screen. Unknown files are reported, not
+ * registered: an unverified file can never become an engine. */
+bool osa_app_sync_models(osa_app *app, volatile int *cancel,
+                         void (*progress)(int64_t done, int64_t total, void *ud), void *ud,
+                         osa_sync_result *out, osa_error *err);
+
 /* Import a .osam (ASR) or .osmt (translation) container into the models dir,
  * hash it and register it. Returns the new id in `id_out`. */
 bool osa_app_import_model(osa_app *app, const char *path, char *id_out, size_t cap,

@@ -34,6 +34,10 @@ APP_REQUIRED = [
     ("cannot start the model worker", "the diagnosable spawn failure"),
     ("worker.log", "worker stderr logging"),
     ("OSAI_WORKER", "the embedded worker resource name"),
+    ("همگام‌سازی", "the models-folder sync action"),
+    ("پوشه مدل‌ها", "the models-folder setting"),
+    ("حذف شود؟", "the two-step delete confirmation"),
+    ("درباره سازنده", "the developer section"),
 ]
 FORBIDDEN = [
     "no AAC decoder on this platform",
@@ -94,7 +98,7 @@ def check(path: str, console: bool) -> int:
                              (b"permonitorv2", "DPI manifest")):
             if needle not in data:
                 fails.append("missing %s resource" % what)
-        stale = [v for v in ("1.0.0.0", "0.9.0.0", "1.1.0.0", "1.2.0.0")
+        stale = [v for v in ("1.0.0.0", "0.9.0.0", "1.1.0.0", "1.2.0.0", "1.3.0.0")
                  if v != ver and v.encode("utf-16-le") in data]
         for v in stale:
             fails.append("file properties still report version %s" % v)

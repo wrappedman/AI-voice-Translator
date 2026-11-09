@@ -153,6 +153,7 @@ bool shell_init(shell_state *s, osa_app *app) {
     if (!s) return false;
     memset(s, 0, sizeof *s); s->app = app; s->screen = SCREEN_TRANSCRIBE; s->ds_sel = -1;
     shell_load_prefs(s);
+    shell_refresh_models_dir(s);
     osa_strlcpy(s->tr_in, "از آشنایی با شما خوشحالم", sizeof s->tr_in);
     s->restoring = true; s->working = true;
     shell_start_job(s, SHELL_JOB_RESTORE, NULL);
@@ -276,6 +277,16 @@ bool shell_select_audio(shell_state *s,const char *path){
     osa_strlcpy(s->audio_path,path,sizeof s->audio_path);
     s->transcript[0]=s->translation[0]=s->correction[0]=s->transcript_id[0]=0;free(s->peaks);s->peaks=NULL;s->n_peaks=0;
     return shell_start_job(s,SHELL_JOB_LOAD_AUDIO,path);
+}
+bool shell_delete_model(shell_state *s,const char *id){return shell_start_job(s,SHELL_JOB_DELETE,id);}
+bool shell_sync_models(shell_state *s){s->sync_valid=false;s->sync_done=s->sync_total=0;return shell_start_job(s,SHELL_JOB_SYNC,NULL);}
+void shell_refresh_models_dir(shell_state *s){if(s&&s->app)osa_app_models_dir(s->app,s->models_dir,sizeof s->models_dir);}
+void shell_set_models_dir(shell_state *s,const char *path){
+    if(!s||!s->app||!path||!*path)return;
+    osa_error err;osa_err_ok(&err);
+    if(!osa_app_set_models_dir(s->app,path,&err)){shell_set_message(s,true,"%s",err.msg);return;}
+    shell_refresh_models_dir(s);
+    shell_set_message(s,false,tt(s->lang,"settings.dirset"),s->models_dir);
 }
 bool shell_activate_model(shell_state *s,const char *id){return shell_start_job(s,SHELL_JOB_ACTIVATE,id);}
 bool shell_load_transcript(shell_state *s, const char *id, const char *text,
@@ -955,6 +966,7 @@ typedef struct shell_job {
     osa_app_transcript tr; osa_app_translation mt; char *eval_json;
     float *peaks; int n_peaks; volatile int permille,cancel,done; bool ok; int rc;
     osa_error err; osa_thread th; volatile int64_t got,total;
+    osa_sync_result sync;
 } shell_job;
 static void job_progress(int64_t got,int64_t total,void *ud){shell_job*j=ud;j->got=got;j->total=total;if(total>0)j->permille=(int)(got*1000/total);}
 static void job_worker(void *ud){
@@ -967,6 +979,8 @@ static void job_worker(void *ud){
       case SHELL_JOB_DOWNLOAD:j->rc=osa_app_download_pack(j->app,j->arg,job_progress,j,&j->cancel,&j->err);j->ok=j->rc==0;break;
       case SHELL_JOB_ACTIVATE:j->ok=osa_app_activate_model(j->app,j->arg,&j->err);break;
       case SHELL_JOB_EVALUATE:j->eval_json=osa_app_evaluate(j->app,&j->err);j->ok=j->eval_json!=NULL;break;
+      case SHELL_JOB_DELETE:j->ok=osa_app_remove_model(j->app,j->arg,&j->err);break;
+      case SHELL_JOB_SYNC:j->ok=osa_app_sync_models(j->app,&j->cancel,job_progress,j,&j->sync,&j->err);break;
     }
     if(osa_atomic_load(&j->cancel))j->ok=false;
     __sync_synchronize(); j->done=1;
@@ -979,13 +993,17 @@ bool shell_start_job(shell_state*s,shell_job_kind kind,const char*arg){
     if(kind==SHELL_JOB_TRANSLATE){j->input=osa_strdup(s->tr_in);if(!j->input){free(j);return false;}}
     if(!osa_thread_start(&j->th,job_worker,j)){free(j->input);free(j);return false;}
     s->job=j;s->working=kind!=SHELL_JOB_DOWNLOAD;s->downloading=kind==SHELL_JOB_DOWNLOAD;
-    s->activating=kind==SHELL_JOB_ACTIVATE;s->message[0]=0;
+    s->activating=kind==SHELL_JOB_ACTIVATE;s->syncing=kind==SHELL_JOB_SYNC;s->message[0]=0;
     if(s->activating)shell_set_message(s,false,"%s",tt(s->lang,"models.activating"));
+    if(kind==SHELL_JOB_DELETE)shell_set_message(s,false,"%s",tt(s->lang,"models.deleting"));
+    if(kind==SHELL_JOB_SYNC){s->sync_done=s->sync_total=0;shell_set_message(s,false,"%s",tt(s->lang,"settings.synchint"));}
     if(kind==SHELL_JOB_DOWNLOAD){s->dl_progress=0;s->dl_got=s->dl_total=0;osa_strlcpy(s->dl_pack,arg,sizeof s->dl_pack);}return true;
 }
 void shell_job_tick(shell_state*s){
-    if(!s||!s->job)return;shell_job*j=s->job;if(j->kind==SHELL_JOB_DOWNLOAD){s->dl_progress=j->permille/1000.0;s->dl_got=j->got;s->dl_total=j->total;}if(!osa_atomic_load(&j->done))return;
-    osa_thread_join(&j->th);s->job=NULL;s->working=false;s->downloading=false;s->activating=false;s->restoring=false;s->models_ready=osa_app_ready(s->app);s->status_valid=false;
+    if(!s||!s->job)return;shell_job*j=s->job;
+    if(j->kind==SHELL_JOB_DOWNLOAD){s->dl_progress=j->permille/1000.0;s->dl_got=j->got;s->dl_total=j->total;}
+    if(j->kind==SHELL_JOB_SYNC){s->sync_done=(int)j->got;s->sync_total=(int)j->total;}if(!osa_atomic_load(&j->done))return;
+    osa_thread_join(&j->th);s->job=NULL;s->working=false;s->downloading=false;s->activating=false;s->syncing=false;s->restoring=false;s->models_ready=osa_app_ready(s->app);s->status_valid=false;
     if(j->ok){
       switch(j->kind){
         case SHELL_JOB_RESTORE:osa_app_get_languages(s->app,s->lang_src,sizeof s->lang_src,s->lang_dst,sizeof s->lang_dst);s->style=osa_app_style(s->app);if(!s->models_ready)s->screen=SCREEN_MODELS;break;
@@ -1003,11 +1021,43 @@ void shell_job_tick(shell_state*s){
             shell_set_message(s,false,tt(s->lang,"models.activated"),name);
             break;}
         case SHELL_JOB_EVALUATE:free(s->eval_json);s->eval_json=j->eval_json;j->eval_json=NULL;break;
+        case SHELL_JOB_DELETE:{
+            char name[128];osa_strlcpy(name,j->arg,sizeof name);
+            osa_pack_info pk[32];int npk=osa_app_packs(s->app,pk,32);
+            for(int i=0;i<npk;i++)if(osa_streq(pk[i].id,j->arg)){osa_strlcpy(name,pk[i].name,sizeof name);break;}
+            free(s->models_json);s->models_json=NULL;s->delete_id[0]=0;
+            osa_app_get_status(s->app,&s->status_cache);s->status_ms=osa_now_ms();s->status_valid=true;
+            osa_app_get_languages(s->app,s->lang_src,sizeof s->lang_src,s->lang_dst,sizeof s->lang_dst);
+            shell_set_message(s,false,tt(s->lang,"models.deleted"),name);
+            break;}
+        case SHELL_JOB_SYNC:{
+            s->sync=j->sync;s->sync_valid=true;
+            free(s->models_json);s->models_json=NULL;
+            if(j->sync.added)s->models_tab=0;
+            char a[16],b[16],c[16],na[48],nb[48],nc[48];
+            snprintf(a,sizeof a,"%d",j->sync.added);snprintf(b,sizeof b,"%d",j->sync.existing);snprintf(c,sizeof c,"%d",j->sync.unknown);
+            const char*dig=s->lang==UI_FA?"fa":"en";
+            text_localize_digits(a,dig,na,sizeof na);text_localize_digits(b,dig,nb,sizeof nb);text_localize_digits(c,dig,nc,sizeof nc);
+            if(!j->sync.added&&!j->sync.existing&&!j->sync.unknown)shell_set_message(s,false,"%s",tt(s->lang,"settings.syncnone"));
+            else shell_set_message(s,false,tt(s->lang,"settings.syncdone"),na,nb,nc);
+            break;}
       }
-    }else shell_set_message(s,true,"%s: %s",tt(s->lang,"msg.failed"),j->err.msg[0]?j->err.msg:tt(s->lang,"msg.cancelled"));
+    }else{
+        /* Keep the engine's own sentence (it is the only thing that explains a
+         failed load) but lead with a Persian/English explanation for the three
+         causes a user can actually act on. */
+        const char*raw=j->err.msg[0]?j->err.msg:tt(s->lang,"msg.cancelled");
+        const char*hint=NULL;
+        if(strstr(raw,"memory")||strstr(raw,"bad_alloc")||strstr(raw,"free RAM"))hint=tt(s->lang,"err.memory");
+        else if(strstr(raw,"cannot be opened")||strstr(raw,"missing"))hint=tt(s->lang,"err.modelfile");
+        else if(strstr(raw,"integrity")||strstr(raw,"wrong file format"))hint=tt(s->lang,"err.integrity");
+        const char *where=j->kind==SHELL_JOB_ACTIVATE?tt(s->lang,"models.loghint"):"";
+        if(hint)shell_set_message(s,true,"%s: %s (%s)%s%s",tt(s->lang,"msg.failed"),hint,raw,where?" — ":"",where);
+        else shell_set_message(s,true,"%s: %s%s%s",tt(s->lang,"msg.failed"),raw,where?" — ":"",where);
+    }
     s->dl_pack[0]=0;s->dl_progress=0;s->dl_got=s->dl_total=0;free(j->input);free(j->peaks);free(j->eval_json);free(j);
 }
-void shell_cancel_jobs(shell_state*s){if(!s)return;osa_app_cancel(s->app);if(s->job){shell_job*j=s->job;__sync_lock_test_and_set(&j->cancel,1);osa_thread_join(&j->th);free(j->input);free(j->peaks);free(j->eval_json);free(j);s->job=NULL;}s->working=s->downloading=s->activating=s->restoring=false;}
+void shell_cancel_jobs(shell_state*s){if(!s)return;osa_app_cancel(s->app);if(s->job){shell_job*j=s->job;__sync_lock_test_and_set(&j->cancel,1);osa_thread_join(&j->th);free(j->input);free(j->peaks);free(j->eval_json);free(j);s->job=NULL;}s->working=s->downloading=s->activating=s->syncing=s->restoring=false;}
 /* Legacy entry points now share the same job queue; installation never happens on the UI thread. */
 bool shell_download_start(shell_state*s,const char*id){return shell_start_job(s,SHELL_JOB_DOWNLOAD,id);}
 void shell_download_tick(shell_state*s){shell_job_tick(s);}

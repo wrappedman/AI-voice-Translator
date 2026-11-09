@@ -1003,6 +1003,8 @@ static void draw_models(shell_state *s, ui_context *u, osa_rect body) {
         float p = 16 * u->L.scale;
         float row_h = 62 * u->L.scale;
         float act_w = 104 * u->L.scale;
+        float del_w = 84 * u->L.scale;
+        float cluster = act_w + del_w + 8 * u->L.scale;
         float foot = 42 * u->L.scale;
         osa_rect rows = rectf(list.x + p, list.y + p, list.w - p * 2,
                               list.h - p * 2 - foot);
@@ -1021,8 +1023,8 @@ static void draw_models(shell_state *s, ui_context *u, osa_rect body) {
                      tint, 1);
 
             float cb = 58 * u->L.scale + 12 * u->L.scale;
-            float cx = u->L.rtl ? rr.x + act_w + 12 * u->L.scale : rr.x + cb;
-            float cw = rr.w - cb - act_w - 24 * u->L.scale;
+            float cx = u->L.rtl ? rr.x + cluster + 12 * u->L.scale : rr.x + cb;
+            float cw = rr.w - cb - cluster - 24 * u->L.scale;
             ui_label(u, rectf(cx, rr.y + 6 * u->L.scale, cw, 22 * u->L.scale),
                      g_models[i].name, UI_FS_BODY * u->L.scale, u->t.text,
                      u->L.rtl ? 2 : 0);
@@ -1036,13 +1038,35 @@ static void draw_models(shell_state *s, ui_context *u, osa_rect body) {
             ui_label(u, rectf(cx, rr.y + 26 * u->L.scale, cw, 17 * u->L.scale), meta,
                      UI_FS_TINY * u->L.scale, u->t.text_faint, u->L.rtl ? 2 : 0);
 
-            osa_rect ar = rectf(u->L.rtl ? rr.x : rr.x + rr.w - act_w,
-                                rr.y + (rr.h - 30 * u->L.scale) * 0.5f, act_w,
-                                30 * u->L.scale);
+            float ay = rr.y + (rr.h - 30 * u->L.scale) * 0.5f;
+            osa_rect ar = rectf(u->L.rtl ? rr.x + del_w + 8 * u->L.scale
+                                        : rr.x + rr.w - cluster,
+                                ay, act_w, 30 * u->L.scale);
+            osa_rect dr = rectf(u->L.rtl ? rr.x : rr.x + rr.w - del_w,
+                                ay, del_w, 30 * u->L.scale);
             if (g_models[i].active) {
                 ui_pill(u, ar, kl(s, "models.active"), u->t.accent, u->t.accent_soft);
             } else if (ui_button(u, 5100 + i, ar, kl(s, "btn.activate"), !s->job)) {
+                s->delete_id[0] = 0;
                 shell_activate_model(s,g_models[i].id);
+            }
+            /* Delete is a two-step action: the first click arms the row, the
+             * second removes the file and the database record. A single click
+             * must never destroy a multi-gigabyte download. */
+            bool armed = osa_streq(s->delete_id, g_models[i].id);
+            if (armed) {
+                c_fill_round(u->c, dr, u->L.radius_sm, col_alpha(u->t.danger, 0.14f));
+                c_stroke_round(u->c, dr, u->L.radius_sm, 1.0f, u->t.danger);
+                bool hit = ui_hit(u, dr);
+                ui_label(u, dr, kl(s, "models.deleteconfirm"), UI_FS_SMALL * u->L.scale,
+                         u->t.danger, 1);
+                if (hit && u->in.clicked && !u->consumed_click) {
+                    u->consumed_click = true;
+                    if (!shell_delete_model(s, g_models[i].id))
+                        shell_set_message(s, true, "%s", tt(s->lang, "msg.failed"));
+                }
+            } else if (!s->job && ui_button_ghost(u, 5150 + i, dr, kl(s, "btn.delete"))) {
+                osa_strlcpy(s->delete_id, g_models[i].id, sizeof s->delete_id);
             }
             c_hline(u->c, rr.x, rr.x + rr.w, rr.y + rr.h, 1, u->t.border_soft);
         }
@@ -1062,10 +1086,12 @@ static void draw_models(shell_state *s, ui_context *u, osa_rect body) {
         float px = u->L.rtl ? list.x + p : ofr.x + ob + 12 * u->L.scale;
         ui_label(u, rectf(px, fy + 6 * u->L.scale,
                           list.w - p * 2 - ob - 16 * u->L.scale, 24 * u->L.scale),
-                 osa_path(OSAI_DIR_MODELS), UI_FS_MONO * u->L.scale, u->t.text_faint,
-                 u->L.rtl ? 2 : 0);
-        if (ui_button_ghost(u, 5004, ofr, kl(s, "btn.openfolder")))
+                 s->models_dir[0] ? s->models_dir : osa_path(OSAI_DIR_MODELS),
+                 UI_FS_MONO * u->L.scale, u->t.text_faint, u->L.rtl ? 2 : 0);
+        if (ui_button_ghost(u, 5004, ofr, kl(s, "btn.openfolder"))) {
+            osa_app_models_dir(s->app, s->request_path, sizeof s->request_path);
             s->request = SHELL_REQ_OPEN_FOLDER;
+        }
         return;
     }
 
@@ -1172,17 +1198,20 @@ static void draw_settings(shell_state *s, ui_context *u, osa_rect body) {
      * space that reads as a missing control. */
     float bottom_h = 178 * u->L.scale;
     float half_h = 352 * u->L.scale;
-    float total_h = half_h + gap + bottom_h;
+    float folder_h = 150 * u->L.scale;
+    float total_h = half_h + gap + bottom_h + gap + folder_h;
     if (total_h > inner.h) {
         float f = inner.h / total_h;
         half_h *= f;
         bottom_h *= f;
+        folder_h *= f;
     }
 
     /* Leading column: appearance. Trailing: translation. Mirrored in RTL. */
     osa_rect a = rectf(u->L.rtl ? inner.x + col_w + gap : inner.x, inner.y, col_w, half_h);
     osa_rect b = rectf(u->L.rtl ? inner.x : inner.x + col_w + gap, inner.y, col_w, half_h);
     osa_rect c = rectf(inner.x, inner.y + half_h + gap, inner.w, bottom_h);
+    osa_rect d = rectf(inner.x, c.y + c.h + gap, inner.w, folder_h);
 
     /* ================= appearance ================= */
     settings_group(u, a, kl(s, "settings.appearance"));
@@ -1341,8 +1370,69 @@ static void draw_settings(shell_state *s, ui_context *u, osa_rect body) {
              UI_FS_MONO * u->L.scale, u->t.text_dim, u->L.rtl ? 2 : 0);
     osa_rect open_r = rectf(u->L.rtl ? c.x + p : c.x + c.w - p - 124 * u->L.scale,
                             fy + 20 * u->L.scale, 124 * u->L.scale, 30 * u->L.scale);
-    if (ui_button(u, 8300, open_r, kl(s, "btn.openfolder"), false))
+    if (ui_button(u, 8300, open_r, kl(s, "btn.openfolder"), false)) {
+        osa_strlcpy(s->request_path, osa_path(OSAI_DIR_ROOT), sizeof s->request_path);
         s->request = SHELL_REQ_OPEN_FOLDER;
+    }
+
+    /* ================= models folder =================
+     * Where downloads land, and where Sync looks for files the user already
+     * has. Choosing a folder never moves or deletes anything by itself. */
+    settings_group(u, d, kl(s, "settings.modelsfolder"));
+    {
+        float fy2 = d.y + 46 * u->L.scale;
+        ui_label(u, rectf(d.x + p, fy2, d.w - p * 2, 18 * u->L.scale),
+                 kl(s, "settings.modelsfolderhint"), UI_FS_TINY * u->L.scale,
+                 u->t.text_faint, u->L.rtl ? 2 : 0);
+        float btns = 236 * u->L.scale;
+        osa_rect path2 = rectf(u->L.rtl ? d.x + p + btns + 10 * u->L.scale : d.x + p,
+                               fy2 + 22 * u->L.scale,
+                               d.w - p * 2 - btns - 10 * u->L.scale, 30 * u->L.scale);
+        c_fill_round(u->c, path2, u->L.radius_sm, u->t.panel_alt);
+        c_stroke_round(u->c, path2, u->L.radius_sm, 1.0f, u->t.border_soft);
+        if (!s->models_dir[0]) shell_refresh_models_dir(s);
+        ui_label(u, rectf(path2.x + 10 * u->L.scale, path2.y,
+                          path2.w - 20 * u->L.scale, path2.h), s->models_dir,
+                 UI_FS_MONO * u->L.scale, u->t.text_dim, u->L.rtl ? 2 : 0);
+        float bw = 112 * u->L.scale;
+        osa_rect choose = rectf(u->L.rtl ? d.x + p + bw + 12 * u->L.scale
+                                        : d.x + d.w - p - btns,
+                               fy2 + 22 * u->L.scale, bw, 30 * u->L.scale);
+        osa_rect syncb = rectf(u->L.rtl ? d.x + p : d.x + d.w - p - bw,
+                              fy2 + 22 * u->L.scale, bw, 30 * u->L.scale);
+        if (ui_button(u, 8400, choose, kl(s, "settings.choosefolder"), false))
+            s->request = SHELL_REQ_PICK_MODELS_DIR;
+        bool syncing = s->syncing;
+        if (syncing) {
+            char raw[64], loc[128], label[192];
+            snprintf(raw, sizeof raw, "%d / %d", s->sync_done, s->sync_total);
+            text_localize_digits(raw, s->lang == UI_FA ? "fa" : "en", loc, sizeof loc);
+            snprintf(label, sizeof label, tt(s->lang, "settings.syncing"), loc);
+            c_fill_round(u->c, syncb, u->L.radius_sm, u->t.panel_alt);
+            ui_label(u, syncb, label, UI_FS_TINY * u->L.scale, u->t.accent, 1);
+        } else if (ui_button(u, 8401, syncb, kl(s, "settings.sync"), !s->job)) {
+            if (!shell_sync_models(s))
+                shell_set_message(s, true, "%s", tt(s->lang, "msg.failed"));
+        }
+        float hy = fy2 + 60 * u->L.scale;
+        const char *report = kl(s, "settings.synchint");
+        char done[420];
+        if (s->sync_valid) {
+            char a[16], b[16], c2[16], na[48], nb[48], nc[48];
+            snprintf(a, sizeof a, "%d", s->sync.added);
+            snprintf(b, sizeof b, "%d", s->sync.existing);
+            snprintf(c2, sizeof c2, "%d", s->sync.unknown);
+            const char *dig = s->lang == UI_FA ? "fa" : "en";
+            text_localize_digits(a, dig, na, sizeof na);
+            text_localize_digits(b, dig, nb, sizeof nb);
+            text_localize_digits(c2, dig, nc, sizeof nc);
+            snprintf(done, sizeof done, tt(s->lang, "settings.syncdone"), na, nb, nc);
+            report = done;
+        }
+        ui_label(u, rectf(d.x + p, hy, d.w - p * 2, 34 * u->L.scale), report,
+                 UI_FS_TINY * u->L.scale,
+                 s->sync_valid ? u->t.text_dim : u->t.text_faint, u->L.rtl ? 2 : 0);
+    }
 }
 
 /* ---- About -------------------------------------------------------- */
@@ -1406,7 +1496,7 @@ static void draw_about(shell_state *s, ui_context *u, osa_rect body) {
     float top = hero.y + hero_h + 14 * u->L.scale;
     float col_w = (inner.w - 14 * u->L.scale) * 0.5f;
     float col_h = inner.y + inner.h - top;
-    float want_h = 118 * u->L.scale + 5 * 34 * u->L.scale;
+    float want_h = 240 * u->L.scale;
     if (col_h > want_h) col_h = want_h;
     osa_rect a = rectf(u->L.rtl ? inner.x + col_w + 14 * u->L.scale : inner.x, top, col_w, col_h);
     osa_rect b = rectf(u->L.rtl ? inner.x : inner.x + col_w + 14 * u->L.scale, top, col_w, col_h);
@@ -1464,48 +1554,12 @@ static void draw_about(shell_state *s, ui_context *u, osa_rect body) {
         y += 34 * u->L.scale;
     }
 
-    /* ---- developer: who built this, and how to reach them ---- */
-    {
-        float dy = top + col_h + 12 * u->L.scale;
-        float dh = 104 * u->L.scale;
-        osa_rect dev = rectf(inner.x, dy, inner.w, dh);
-        ui_card(u, dev);
-        ui_label(u, rectf(dev.x + p, dev.y + 10 * u->L.scale, dev.w - p * 2, 22 * u->L.scale),
-                 kl(s, "about.developer"), UI_FS_H2 * u->L.scale, u->t.text, u->L.rtl ? 2 : 0);
-        c_hline(u->c, dev.x + p, dev.x + dev.w - p, dev.y + 38 * u->L.scale, 1, u->t.border_soft);
-        float lx = dev.x + p, rw = dev.w - p * 2;
-        ui_label(u, rectf(lx, dev.y + 46 * u->L.scale, rw * 0.34f, 20 * u->L.scale),
-                 "behnam ehsani", UI_FS_BODY * u->L.scale, u->t.text, u->L.rtl ? 2 : 0);
-        osa_rect mail = rectf(u->L.rtl ? lx + rw * 0.36f : lx + rw * 0.30f,
-                              dev.y + 44 * u->L.scale, rw * 0.30f, 24 * u->L.scale);
-        bool mh = ui_hit(u, mail);
-        ui_label(u, mail, "inbox.ehsani@gmail.com", UI_FS_SMALL * u->L.scale,
-                 mh ? u->t.accent2 : u->t.accent, 1);
-        if (mh) c_hline(u->c, mail.x + 6 * u->L.scale, mail.x + mail.w - 6 * u->L.scale,
-                        mail.y + mail.h - 3 * u->L.scale, 1, u->t.accent);
-        if (mh && u->in.clicked && !u->consumed_click) {
-            u->consumed_click = true;
-            osa_strlcpy(s->request_url, "mailto:inbox.ehsani@gmail.com", sizeof s->request_url);
-            s->request = SHELL_REQ_OPEN_URL;
-        }
-        osa_rect repo = rectf(lx, dev.y + 70 * u->L.scale, rw, 24 * u->L.scale);
-        bool rh = ui_hit(u, repo);
-        ui_label(u, repo, "https://github.com/wrappedman/AI-voice-Translator",
-                 UI_FS_SMALL * u->L.scale, rh ? u->t.accent2 : u->t.accent, u->L.rtl ? 2 : 0);
-        if (rh && u->in.clicked && !u->consumed_click) {
-            u->consumed_click = true;
-            osa_strlcpy(s->request_url, "https://github.com/wrappedman/AI-voice-Translator",
-                        sizeof s->request_url);
-            s->request = SHELL_REQ_OPEN_URL;
-        }
-    }
-
     /* ---- licence footer: shipped components, with their obligations ----
      * Each row is a Persian caption plus the licence identifier as its own
      * LTR value. Mixing Latin and Persian in one paragraph reorders the Latin
      * run on its punctuation ("GPL-3.0-or-later" came out reversed), so the two
      * languages never share a string here. */
-    float fy = top + col_h + 12 * u->L.scale + 104 * u->L.scale + 12 * u->L.scale;
+    float fy = top + col_h + 12 * u->L.scale;
     float rows_h = 3 * 22 * u->L.scale;
     float fh = 42 * u->L.scale + rows_h + 26 * u->L.scale;
     if (inner.y + inner.h - fy < fh) fh = inner.y + inner.h - fy;
@@ -1537,6 +1591,69 @@ static void draw_about(shell_state *s, ui_context *u, osa_rect body) {
         ui_label(u, rectf(foot.x + p, ry + 2 * u->L.scale, foot.w - p * 2,
                           18 * u->L.scale), kl(s, "about.lic.offline"),
                  UI_FS_TINY * u->L.scale, u->t.text_faint, u->L.rtl ? 2 : 0);
+    }
+
+    /* ---- developer: the last section on the page ----
+     * A short description of the program, then a caption/value grid so the
+     * name, the address and the repository line up instead of floating at
+     * three different offsets. Email and repository open on click. */
+    {
+        float dy = fy + fh + 12 * u->L.scale;
+        float dh = inner.y + inner.h - dy;
+        float want = 196 * u->L.scale;
+        if (dh > want) dh = want;
+        if (dh >= 120 * u->L.scale) {
+            osa_rect dev = rectf(inner.x, dy, inner.w, dh);
+            ui_card(u, dev);
+            ui_label(u, rectf(dev.x + p, dev.y + 12 * u->L.scale, dev.w - p * 2, 22 * u->L.scale),
+                     kl(s, "about.developer"), UI_FS_H2 * u->L.scale, u->t.text,
+                     u->L.rtl ? 2 : 0);
+            c_hline(u->c, dev.x + p, dev.x + dev.w - p, dev.y + 40 * u->L.scale, 1,
+                    u->t.border_soft);
+            float rw = dev.w - p * 2;
+            ui_label_wrap(u, rectf(dev.x + p, dev.y + 48 * u->L.scale, rw, 40 * u->L.scale),
+                          kl(s, "about.appdesc"), UI_FS_SMALL * u->L.scale, u->t.text_dim);
+            ui_label_wrap(u, rectf(dev.x + p, dev.y + 88 * u->L.scale, rw, 22 * u->L.scale),
+                          kl(s, "about.appdesc2"), UI_FS_TINY * u->L.scale, u->t.text_faint);
+
+            /* caption column, then the value column, both read in the UI
+             * direction; the values themselves stay LTR (address, URL). */
+            float cap_w = 108 * u->L.scale, vgap = 12 * u->L.scale;
+            float gy = dev.y + 118 * u->L.scale;
+            struct { const char *cap, *val, *url; } grid[3] = {
+                { "about.devname",  "behnam ehsani", NULL },
+                { "about.devemail", "inbox.ehsani@gmail.com", "mailto:inbox.ehsani@gmail.com" },
+                { "about.devrepo",  "github.com/wrappedman/AI-voice-Translator",
+                  "https://github.com/wrappedman/AI-voice-Translator" },
+            };
+            for (int i = 0; i < 3; i++) {
+                float ry2 = gy + i * 24 * u->L.scale;
+                if (ry2 + 22 * u->L.scale > dev.y + dev.h - 6 * u->L.scale) break;
+                float capx = u->L.rtl ? dev.x + dev.w - p - cap_w : dev.x + p;
+                float valx = u->L.rtl ? dev.x + p : dev.x + p + cap_w + vgap;
+                float valw = rw - cap_w - vgap;
+                ui_label(u, rectf(capx, ry2, cap_w, 20 * u->L.scale), kl(s, grid[i].cap),
+                         UI_FS_TINY * u->L.scale, u->t.text_faint, u->L.rtl ? 2 : 0);
+                osa_rect vr = rectf(valx, ry2, valw, 20 * u->L.scale);
+                if (grid[i].url) {
+                    bool hit = ui_hit(u, vr);
+                    ui_label(u, vr, grid[i].val, UI_FS_SMALL * u->L.scale,
+                             hit ? u->t.accent2 : u->t.accent, u->L.rtl ? 2 : 0);
+                    if (hit) {
+                        c_hline(u->c, vr.x, vr.x + vr.w * 0.42f, vr.y + vr.h - 2 * u->L.scale,
+                                1, u->t.accent);
+                        if (u->in.clicked && !u->consumed_click) {
+                            u->consumed_click = true;
+                            osa_strlcpy(s->request_url, grid[i].url, sizeof s->request_url);
+                            s->request = SHELL_REQ_OPEN_URL;
+                        }
+                    }
+                } else {
+                    ui_label(u, vr, grid[i].val, UI_FS_SMALL * u->L.scale, u->t.text,
+                             u->L.rtl ? 2 : 0);
+                }
+            }
+        }
     }
 }
 

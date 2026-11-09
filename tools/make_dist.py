@@ -65,6 +65,11 @@ Put the folder somewhere writable
 
 First run
     The interface opens in Persian with the light theme.
+    Settings -> Models folder chooses where model files live; Sync registers the
+    verified files already in that folder. Delete on an installed row removes
+    both the file and its database record.
+    If a model fails to activate, the message quotes the real reason and
+    data\\Logs\\worker.log has the full trace.
     The application starts with NO installed models. Open Models, download
     one speech model (Whisper), one translation model (Qwen GGUF) and one
     language-identification model (fastText LID 176), then activate each.

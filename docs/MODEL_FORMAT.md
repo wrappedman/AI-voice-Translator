@@ -1,4 +1,4 @@
-# Model formats and verification (1.3.0)
+# Model formats and verification (1.3.1)
 
 OpenSpeech AI no longer ships or accepts the old exemplar `.osam` / phrasebook
 `.osmt` containers as active models. The supported artifacts are standard
@@ -39,6 +39,11 @@ The runtime catalog in `src/app/osai_app.c` and the release manifest
    file whose hash matches a catalogue pin, but no UI path reaches it.
 6. Reinstalling an already-present verified file registers it without
    overwriting an active/loaded model file.
+7. **Sync** applies the same rule to files the user already has: the configured
+   models folder is scanned, candidates are matched by exact size and SHA-256, and
+   only matches are registered (inactive). Unknown files are reported by name.
+8. **Delete** removes the database row and the file itself, after unloading the
+   engine. It is the only destructive model operation and needs two clicks.
 
 ## Activation
 

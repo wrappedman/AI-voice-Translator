@@ -12,5 +12,8 @@ osa_process *osa_process_start(const char *const *argv, osa_error *err);
 bool osa_process_line(osa_process *p, int timeout_ms, volatile int *cancel,
                       char **line, osa_error *err);
 bool osa_process_write(osa_process *p, const char *line, osa_error *err);
+/* True when the child has already terminated; *code receives its exit status
+ * (signal deaths report 128+signal). Used to explain a failed model load. */
+bool osa_process_exited(osa_process *p, int *code);
 void osa_process_stop(osa_process *p);
 #endif

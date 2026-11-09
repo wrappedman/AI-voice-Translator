@@ -56,7 +56,12 @@ static DWORD WINAPI reader(LPVOID v) {
     return 0;
 }
 static wchar_t *wide(const char *s){int n=MultiByteToWideChar(CP_UTF8,0,s,-1,NULL,0);wchar_t*w=calloc(n,sizeof(*w));if(w)MultiByteToWideChar(CP_UTF8,0,s,-1,w,n);return w;}
-static void pipes(HANDLE *r,HANDLE *w,SECURITY_ATTRIBUTES *sa){if(!CreatePipe(r,w,sa,0)){*r=*w=NULL;return;}SetHandleInformation(*r,HANDLE_FLAG_INHERIT,FALSE);}
+/* Both ends start inheritable; the caller then marks exactly the two handles
+ * the child owns (its stdin read end and its stdout write end) inheritable and
+ * hides the parent's ends. Clearing inheritance on "the read end" for both
+ * pipes handed the child an invalid stdin: it saw EOF immediately and exited
+ * right after its ready line, so every request after activation failed. */
+static void pipes(HANDLE *r,HANDLE *w,SECURITY_ATTRIBUTES *sa){if(!CreatePipe(r,w,sa,0)){*r=*w=NULL;return;}}
 /* The GUI subsystem has no console, so GetStdHandle(STD_ERROR_HANDLE) is NULL
  * and passing it with STARTF_USESTDHANDLES made CreateProcessW fail outright on
  * some machines. The child always gets a real, inheritable stderr: its own log
@@ -77,8 +82,12 @@ osa_process *osa_process_start(const char *const *argv,osa_error *err){
     osa_process*p=calloc(1,sizeof(*p));if(!p){osa_err_set(err,"out of memory");return NULL;}
     InitializeCriticalSection(&p->lock);InitializeConditionVariable(&p->cv);p->rd=p->wr=NULL;
     SECURITY_ATTRIBUTES sa={sizeof(sa),NULL,TRUE};HANDLE cr=NULL,cw=NULL,sr=NULL,sw=NULL;
-    pipes(&cr,&cw,&sa); if(cr)SetHandleInformation(cw,HANDLE_FLAG_INHERIT,TRUE);
-    pipes(&sr,&sw,&sa); if(sw)SetHandleInformation(sw,HANDLE_FLAG_INHERIT,TRUE);
+    pipes(&cr,&cw,&sa);
+    if(cr)SetHandleInformation(cr,HANDLE_FLAG_INHERIT,TRUE);   /* child stdin  */
+    if(cw)SetHandleInformation(cw,HANDLE_FLAG_INHERIT,FALSE);  /* parent only  */
+    pipes(&sr,&sw,&sa);
+    if(sr)SetHandleInformation(sr,HANDLE_FLAG_INHERIT,FALSE);  /* parent only  */
+    if(sw)SetHandleInformation(sw,HANDLE_FLAG_INHERIT,TRUE);   /* child stdout */
     HANDLE elog=worker_stderr();
     wchar_t cmd[32768];cmd[0]=0;size_t used=0;
     for(int i=0;argv[i];i++){wchar_t*w=wide(argv[i]);if(!w)goto fail;
@@ -125,6 +134,11 @@ bool osa_process_line(osa_process*p,int timeout,volatile int*cancel,char**out,os
     }
     LeaveCriticalSection(&p->lock);osa_err_set(err,"model worker stopped, timed out or returned invalid output");return false;
 }
+bool osa_process_exited(osa_process*p,int*code){
+    if(code)*code=-1;if(!p||!p->child)return false;
+    if(WaitForSingleObject(p->child,0)!=WAIT_OBJECT_0)return false;
+    DWORD c=0;GetExitCodeProcess(p->child,&c);if(code)*code=(int)c;return true;
+}
 void osa_process_stop(osa_process*p){if(!p)return;if(p->child){TerminateProcess(p->child,1);WaitForSingleObject(p->child,5000);CloseHandle(p->child);}if(p->wr)CloseHandle(p->wr);if(p->rd)CloseHandle(p->rd);if(p->thread){WaitForSingleObject(p->thread,5000);CloseHandle(p->thread);}DeleteCriticalSection(&p->lock);free(p->line);free(p);}
 #else
 osa_process *osa_process_start(const char *const *argv,osa_error *err){
@@ -144,6 +158,12 @@ bool osa_process_line(osa_process*p,int timeout,volatile int*cancel,char**out,os
         struct pollfd fd={p->rd,POLLIN,0};int rc=poll(&fd,1,50);waited+=50;if(rc<0)break;if(rc==0)continue;
         char b[4096];ssize_t n=read(p->rd,b,sizeof(b));if(n<=0){p->done=1;break;}if(p->len+n>1048576||!reserve(p,p->len+n+1))break;memcpy(p->line+p->len,b,n);p->len+=n;p->line[p->len]=0;
     }osa_err_set(err,"model worker stopped, timed out or returned invalid output");return false;
+}
+bool osa_process_exited(osa_process*p,int*code){
+    if(code)*code=-1;if(!p||p->pid<=0)return false;int st=0;
+    if(waitpid(p->pid,&st,WNOHANG)!=p->pid)return false;
+    if(code)*code=WIFEXITED(st)?WEXITSTATUS(st):(128+(WIFSIGNALED(st)?WTERMSIG(st):0));
+    p->pid=-1;return true;
 }
 void osa_process_stop(osa_process*p){if(!p)return;if(p->wr>=0)close(p->wr);if(p->rd>=0)close(p->rd);if(p->pid>0){kill(p->pid,SIGTERM);for(int i=0;i<50;i++){if(waitpid(p->pid,NULL,WNOHANG)==p->pid)return;usleep(10000);}kill(p->pid,SIGKILL);waitpid(p->pid,NULL,0);}free(p->line);free(p);}
 #endif
