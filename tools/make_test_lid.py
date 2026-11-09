@@ -9,7 +9,10 @@ the vendored fastText loads it exactly like an official lid.176 file.
 
 Nothing here is shipped: the file is written into build/ and never packaged.
 
-Usage: make_test_lid.py <output.bin>
+Usage: make_test_lid.py <output.bin> [--flores]
+
+--flores writes GlotLID/FLORES-style labels ("__label__eng_Latn"), so the tests
+also cover the normalisation back to the two-letter codes the app uses.
 """
 import struct
 import sys
@@ -19,6 +22,7 @@ VERSION = 12
 
 WORDS = ["hello", "world", "سلام", "خداحافظ"]
 LABELS = ["__label__en", "__label__fa"]
+FLORES_LABELS = ["__label__eng_Latn", "__label__pes_Arab"]
 DIM = 2
 
 
@@ -28,9 +32,9 @@ def args_block() -> bytes:
     return struct.pack("<12id", DIM, 5, 1, 1, 5, 1, 3, 3, 0, 0, 0, 100, 0.0001)
 
 
-def dict_block() -> bytes:
-    entries = [(w, 10, 0) for w in WORDS] + [(l, 10, 1) for l in LABELS]
-    out = struct.pack("<iii qq", len(entries), len(WORDS), len(LABELS), 40, -1)
+def dict_block(labels) -> bytes:
+    entries = [(w, 10, 0) for w in WORDS] + [(l, 10, 1) for l in labels]
+    out = struct.pack("<iii qq", len(entries), len(WORDS), len(labels), 40, -1)
     for word, count, kind in entries:
         out += word.encode("utf-8") + b"\0" + struct.pack("<qb", count, kind)
     return out
@@ -43,7 +47,7 @@ def matrix_block(rows: list) -> bytes:
     return out
 
 
-def build() -> bytes:
+def build(flores: bool = False) -> bytes:
     # English words point along x, Persian words along y; the output rows pick
     # the matching label, so predictions are deterministic.
     inputs = [[1.0, 0.0], [1.0, 0.0], [0.0, 1.0], [0.0, 1.0]]
@@ -51,7 +55,7 @@ def build() -> bytes:
     return (
         struct.pack("<ii", MAGIC, VERSION)
         + args_block()
-        + dict_block()
+        + dict_block(FLORES_LABELS if flores else LABELS)
         + b"\0"                      # quant_input = false
         + matrix_block(inputs)
         + b"\0"                      # qout = false
@@ -60,12 +64,15 @@ def build() -> bytes:
 
 
 def main() -> int:
-    if len(sys.argv) != 2:
+    if len(sys.argv) < 2:
         print(__doc__)
         return 2
+    flores = "--flores" in sys.argv[2:]
+    data = build(flores)
     with open(sys.argv[1], "wb") as f:
-        f.write(build())
-    print("test fixture: %s (%d bytes, 2 labels)" % (sys.argv[1], len(build())))
+        f.write(data)
+    print("test fixture: %s (%d bytes, 2 labels%s)"
+          % (sys.argv[1], len(data), ", FLORES style" if flores else ""))
     return 0
 
 

@@ -284,7 +284,11 @@ $(BUILD)/test-lid.bin: tools/make_test_lid.py
 	@mkdir -p $(dir $@)
 	$(PYTHON) tools/make_test_lid.py $@
 
-tests: unittest $(LINUX_BIN) $(WORKER_LINUX) $(BUILD)/test-lid.bin
+$(BUILD)/test-lid-flores.bin: tools/make_test_lid.py
+	@mkdir -p $(dir $@)
+	$(PYTHON) tools/make_test_lid.py $@ --flores
+
+tests: unittest $(LINUX_BIN) $(WORKER_LINUX) $(BUILD)/test-lid.bin $(BUILD)/test-lid-flores.bin
 	@echo ""
 	@echo "== headless self-test =="
 	$(LINUX_BIN) --selftest

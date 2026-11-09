@@ -1,4 +1,10 @@
-# OpenSpeech AI — Architecture (1.3.1)
+# OpenSpeech AI — Architecture (1.4.0)
+
+<!-- 1.4.0: the language worker opens fastText models through _wfopen +
+stdio_filebuf on Windows (non-ASCII paths), normalises ISO-639-3+script labels
+(GlotLID/FLORES) to ISO-1, and activation self-heals stale model paths after
+verifying size+SHA-256. PACKS carries min_ram_mb per model, surfaced in the UI
+and used by the activation memory check. -->
 
 ## Product contract
 

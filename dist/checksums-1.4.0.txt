@@ -1,0 +1,3 @@
+9e050f5a7754276a8ba7385bde6b2592cba61bf579d32c0f0bad24d981d87f39  bin/OpenSpeechAI.exe
+318a8b18d577ed879fad30553f8ef1002124d1cbaebf74d2aed4a55ec7ffb912  bin/OpenSpeechWorker.exe
+2e4eb1eb5b407b4467fda19c271e23a421a85014d6314d6c047ec59e45824ab4  OpenSpeechAI-1.4.0-win64.zip

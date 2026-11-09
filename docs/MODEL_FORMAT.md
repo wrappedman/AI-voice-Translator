@@ -1,4 +1,4 @@
-# Model formats and verification (1.3.1)
+# Model formats and verification (1.4.0)
 
 OpenSpeech AI no longer ships or accepts the old exemplar `.osam` / phrasebook
 `.osmt` containers as active models. The supported artifacts are standard
@@ -6,9 +6,9 @@ upstream inference files, downloaded by the user and verified before use.
 
 | Category | Artifact | Container | Engine |
 |---|---|---|---|
-| Speech (`asr`) | `ggml-medium-q5_0.bin`, `ggml-medium-q8_0.bin`, `ggml-large-v3-turbo-q5_0.bin`, `ggml-large-v3-turbo-q8_0.bin`, `ggml-large-v3-q5_0.bin` | whisper.cpp ggml | `whisper_bridge.cpp` |
-| Translation (`mt`) | `qwen2.5-1.5b-instruct-q4_k_m.gguf`, `qwen2.5-3b-instruct-{q4_k_m,q6_k,q8_0}.gguf`, `qwen2.5-7b-instruct-q3_k_m.gguf` | GGUF (single file) | `OpenSpeechWorker` / llama.cpp |
-| Language ID (`lang`) | `lid.176.bin` (125 MiB) and `lid.176.ftz` (0.89 MiB, quantized) | fastText supervised | `OpenSpeechWorker` / fastText |
+| Speech (`asr`) | `ggml-{tiny,base,small}-q5_1.bin`, `ggml-medium-{q5_0,q8_0}.bin`, `ggml-large-v3-turbo-{q5_0,q8_0}.bin`, `ggml-large-v3-q5_0.bin` | whisper.cpp ggml | `whisper_bridge.cpp` |
+| Translation (`mt`) | `qwen2.5-0.5b-instruct-{q4_k_m,q8_0}.gguf`, `qwen2.5-1.5b-instruct-q4_k_m.gguf`, `qwen2.5-3b-instruct-{q4_k_m,q6_k,q8_0}.gguf`, `qwen2.5-7b-instruct-q3_k_m.gguf` | GGUF (single file) | `OpenSpeechWorker` / llama.cpp |
+| Language ID (`lang`) | `lid.176.{bin,ftz}` (fastText, 176 languages) and GlotLID v4 `model_v4_small.{ftz,bin}`, `model_v4.ftz`, `model.bin` (2000+ varieties) | fastText supervised | `OpenSpeechWorker` / fastText |
 
 Multi-file GGUF splits (Qwen2.5 7B Q4_K_M and above) are deliberately not listed:
 the downloader fetches one pinned file, so a split model could never be complete.
@@ -21,10 +21,15 @@ Every downloadable entry records:
 - exact `size_bytes`;
 - lowercase 64-character `sha256`;
 - pinned HTTPS `url` (revision-specific where the host supports it);
+- `min_ram_mb`: approximate resident memory while the model runs; shown in the
+  download list («رم لازم»), used for the «سبک» badge (≤ ~1 GB) and by the
+  activation memory warning;
 - `status: available`, `verified: sha256`.
 
-The runtime catalog in `src/app/osai_app.c` and the release manifest
-`tools/catalog/catalog.json` are cross-checked by `tools/catalog/check.py`.
+The runtime catalog in `src/app/osai_app.c` is the source of truth;
+`tools/catalog/generate.py` regenerates the release manifest
+`tools/catalog/catalog.json` from it, and `tools/catalog/check.py` cross-checks
+ids, URLs, hashes, sizes and RAM figures between the two.
 
 ## Install rules
 
@@ -65,9 +70,15 @@ per `kind`. Failure leaves the previous active model intact.
   the installed model row and read back by the UI. This is an
   application capability list, not a claim that GGUF metadata enumerates
   translation directions. Unsupported targets are rejected before inference.
-- **LID:** fastText LID 176 returns a label used for auto-detect. If the
-  detected language is outside the MT set, translation fails with a readable
-  message instead of silently producing garbage.
+- **LID:** fastText LID 176 and GlotLID v4 return a label used for auto-detect.
+  GlotLID/FLORES labels are ISO-639-3 + script (`pes_Arab`, `eng_Latn`); the
+  worker normalises them to the two-letter codes Whisper and Qwen use
+  (`fa`, `en`, …) in both `detect` results and the `ready.languages` list, and
+  keeps the original label when no honest ISO-1 mapping exists. If the detected
+  language is outside the MT set, translation fails with a readable message
+  instead of silently producing garbage. On Windows the model file is opened
+  with `_wfopen` and streamed to fastText, so non-ASCII (e.g. Persian) folder
+  names work regardless of the ANSI code page.
 
 ## Text limits and failure behaviour
 

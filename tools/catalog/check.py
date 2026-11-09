@@ -75,6 +75,11 @@ def main() -> int:
         size = m.get("size_bytes")
         if not isinstance(size, int) or size <= 0:
             fail(errors, "%s requires an exact positive size_bytes" % tag)
+        ram = m.get("min_ram_mb")
+        if not isinstance(ram, int) or not (64 <= ram <= 65536):
+            fail(errors, "%s requires a plausible min_ram_mb (64..65536)" % tag)
+        elif ",%d,%d}," % (size, ram) not in app_src:
+            fail(errors, "%s min_ram_mb=%d does not match the PACKS row" % (tag, ram))
         url = m.get("url") or ""
         if not url.startswith("https://"):
             fail(errors, "%s must have an https:// download URL" % tag)

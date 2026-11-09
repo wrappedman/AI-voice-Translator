@@ -69,7 +69,7 @@ typedef struct shell_state {
     double        transcript_ms;
     int           transcript_words;
     bool          working;
-    char          message[512];
+    char          message[1024];
     bool          message_is_error;
     int64_t       message_at_ms;      /* when it was raised (auto-dismiss)   */
     int64_t       message_life_ms;    /* 0 = use the default for its kind    */

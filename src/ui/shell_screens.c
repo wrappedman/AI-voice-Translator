@@ -884,17 +884,34 @@ static void draw_pack_row(shell_state *s, ui_context *u, osa_rect r, const osa_p
     ui_label(u, rectf(tx, r.y + 6 * u->L.scale, tw, 20 * u->L.scale), p->name,
              UI_FS_BODY * u->L.scale, u->t.text, u->L.rtl ? 2 : 0);
 
-    char sz[32], meta[256];
+    /* Size, licence and the memory the model needs while it runs: the three
+     * numbers that decide whether a machine can use it at all. */
+    char sz[32], meta[320], ram_raw[32], ram_loc[64], ram[160];
     ui_fmt_bytes(p->size_mb * 1024.0 * 1024.0, sz, sizeof sz);
+    bool fa = s->lang == UI_FA;
+    if (p->min_ram_mb >= 1000) snprintf(ram_raw, sizeof ram_raw, "%.1f", p->min_ram_mb / 1024.0);
+    else snprintf(ram_raw, sizeof ram_raw, "%d", p->min_ram_mb);
+    text_localize_digits(ram_raw, fa ? "fa" : "en", ram_loc, sizeof ram_loc);
+    /* The unit is written in the UI language: a Latin "MB" inside a Persian
+     * phrase makes the bidi run reorder around the colon. */
+    snprintf(ram, sizeof ram, "%s %s%s", tt(s->lang, "models.ram"), ram_loc,
+             p->min_ram_mb >= 1000 ? (fa ? " گیگابایت" : " GB") : (fa ? " مگابایت" : " MB"));
     snprintf(meta, sizeof meta, "%s  ·  %s  ·  %s", p->language[0] ? p->language : "—",
              sz, p->license[0] ? p->license : "—");
     ui_label(u, rectf(tx, r.y + 25 * u->L.scale, tw, 17 * u->L.scale), meta,
              UI_FS_TINY * u->L.scale, u->t.text_faint, u->L.rtl ? 2 : 0);
+    if (p->min_ram_mb > 0 && p->min_ram_mb <= 1000) {
+        float lw = 46 * u->L.scale;
+        osa_rect light = rectf(u->L.rtl ? badge.x - lw - 6 * u->L.scale : badge.x + badge.w + 6 * u->L.scale,
+                               badge.y, lw, 22 * u->L.scale);
+        ui_pill(u, light, kl(s, "models.light"), u->t.success, u->t.success_soft);
+    }
 
     /* The third line is what the row is for, so it explains the action instead
      * of repeating the pack's marketing copy. */
-    const char *line3 = p->installed ? kl(s, "models.installed_inactive")
-                       : kl(s, "models.hintdownload");
+    char line3[320];
+    if (p->installed) osa_strlcpy(line3, kl(s, "models.installed_inactive"), sizeof line3);
+    else snprintf(line3, sizeof line3, "%s  ·  %s", ram, kl(s, "models.hintdownload"));
     ui_label(u, rectf(tx, r.y + 42 * u->L.scale, tw, 16 * u->L.scale), line3,
              UI_FS_TINY * u->L.scale, col_alpha(u->t.text_faint, 0.85f),
              u->L.rtl ? 2 : 0);

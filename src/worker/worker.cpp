@@ -6,6 +6,7 @@
 #include <llama.h>
 #include <fasttext.h>
 #include <algorithm>
+#include <cstring>
 #include <cstdio>
 #include <cstdlib>
 #include <iostream>
@@ -16,6 +17,7 @@
 #ifdef _WIN32
 #include <io.h>
 #include <fcntl.h>
+#include <windows.h>
 #endif
 using json = nlohmann::json;
 
@@ -24,12 +26,117 @@ static void fail(const std::string &s) { send({{"ok",false},{"error",s}}); }
 static void silent(ggml_log_level, const char *, void *) {}
 static void ftsilent(std::ostream &) {} // fastText has no global logger; load diagnostics are caught below.
 
+/* GlotLID and the FLORES-style fastText models label a language as
+ * "pes_Arab" / "eng_Latn" (ISO 639-3 + script). The rest of the app works with
+ * the two-letter codes Whisper and the translator use, so normalise here and
+ * keep the original label when there is no honest mapping. */
+static std::string normalise_label(std::string code) {
+    const auto under=code.find('_');
+    if(under!=std::string::npos) code=code.substr(0,under);
+    if(code.size()==2) return code;
+    static const struct { const char *iso3, *iso1; } map[] = {
+        {"eng","en"},{"pes","fa"},{"fas","fa"},{"prs","fa"},{"arb","ar"},{"ara","ar"},
+        {"arz","ar"},{"zho","zh"},{"cmn","zh"},{"fra","fr"},{"fre","fr"},{"deu","de"},
+        {"ger","de"},{"spa","es"},{"por","pt"},{"rus","ru"},{"jpn","ja"},{"kor","ko"},
+        {"vie","vi"},{"tha","th"},{"ind","id"},{"tur","tr"},{"hin","hi"},{"nld","nl"},
+        {"dut","nl"},{"pol","pl"},{"ukr","uk"},{"ita","it"},{"heb","he"},{"ell","el"},
+        {"gre","el"},{"swe","sv"},{"nor","no"},{"nob","no"},{"dan","da"},{"fin","fi"},
+        {"ces","cs"},{"cze","cs"},{"slk","sk"},{"slo","sk"},{"hun","hu"},{"ron","ro"},
+        {"rum","ro"},{"bul","bg"},{"hrv","hr"},{"srp","sr"},{"bos","bs"},{"slv","sl"},
+        {"lit","lt"},{"lav","lv"},{"est","et"},{"isl","is"},{"gle","ga"},{"cym","cy"},
+        {"eus","eu"},{"cat","ca"},{"glg","gl"},{"mkd","mk"},{"sqi","sq"},{"alb","sq"},
+        {"hye","hy"},{"arm","hy"},{"kat","ka"},{"geo","ka"},{"aze","az"},{"azj","az"},
+        {"azb","az"},{"kaz","kk"},{"uzb","uz"},{"uzn","uz"},{"kir","ky"},{"tgk","tg"},
+        {"tuk","tk"},{"khk","mn"},{"mon","mn"},{"urd","ur"},{"pan","pa"},
+        {"ben","bn"},{"tam","ta"},{"tel","te"},{"kan","kn"},{"mal","ml"},{"mar","mr"},
+        {"guj","gu"},{"sin","si"},{"nep","ne"},{"npi","ne"},{"mya","my"},{"bur","my"},
+        {"khm","km"},{"lao","lo"},{"msa","ms"},{"may","ms"},{"zsm","ms"},{"fil","tl"},
+        {"haw","haw"},{"swa","sw"},{"swh","sw"},{"hau","ha"},{"yor","yo"},{"ibo","ig"},
+        {"amh","am"},{"som","so"},{"zul","zu"},{"xho","xh"},{"afr","af"},{"kur","ku"},
+        {"kmr","ku"},{"ckb","ku"},{"pus","ps"},{"uig","ug"},{"bod","bo"},{"tib","bo"},
+    };
+    for(const auto &e:map) if(code==e.iso3) return e.iso1;
+    return code;
+}
+
+#ifdef _WIN32
+/* A read-only std::streambuf backed by a FILE* opened with the wide API.
+ * Portable across libc++ (zig/mingw) and libstdc++: no <ext/stdio_filebuf.h>. */
+class wide_filebuf : public std::streambuf {
+    FILE *f_;
+    std::vector<char> buf_;
+public:
+    explicit wide_filebuf(FILE *f) : f_(f), buf_(64 * 1024) {
+        setg(buf_.data(), buf_.data(), buf_.data());
+    }
+    ~wide_filebuf() override { if (f_) std::fclose(f_); }
+protected:
+    int_type underflow() override {
+        if (gptr() < egptr()) return traits_type::to_int_type(*gptr());
+        size_t n = std::fread(buf_.data(), 1, buf_.size(), f_);
+        if (n == 0) return traits_type::eof();
+        setg(buf_.data(), buf_.data(), buf_.data() + n);
+        return traits_type::to_int_type(*gptr());
+    }
+    std::streamsize xsgetn(char *dst, std::streamsize count) override {
+        std::streamsize done = 0;
+        while (done < count) {
+            if (gptr() == egptr()) {
+                if (underflow() == traits_type::eof()) break;
+            }
+            std::streamsize take = std::min(count - done,
+                (std::streamsize)(egptr() - gptr()));
+            std::memcpy(dst + done, gptr(), (size_t)take);
+            gbump((int)take);
+            done += take;
+        }
+        return done;
+    }
+    pos_type seekoff(off_type off, std::ios_base::seekdir dir,
+                     std::ios_base::openmode which) override {
+        if (!(which & std::ios_base::in)) return pos_type(off_type(-1));
+        int whence = dir == std::ios_base::beg ? SEEK_SET
+                   : dir == std::ios_base::cur ? SEEK_CUR : SEEK_END;
+        if (dir == std::ios_base::cur) off -= (std::streamoff)(egptr() - gptr());
+        if (_fseeki64(f_, off, whence) != 0) return pos_type(off_type(-1));
+        setg(buf_.data(), buf_.data(), buf_.data());
+        return pos_type(_ftelli64(f_));
+    }
+    pos_type seekpos(pos_type pos, std::ios_base::openmode which) override {
+        return seekoff(off_type(pos), std::ios_base::beg, which);
+    }
+};
+
+/* fastText opens a model with a narrow std::ifstream. A user folder with Persian
+ * (or any non-ASCII) letters then fails inside the worker even though the app
+ * itself verified the file. Open the handle ourselves with the wide API and hand
+ * fastText a stream, so the path never goes through the ANSI code page. */
+static std::wstring utf8_wide(const std::string &s) {
+    if(s.empty()) return std::wstring();
+    int n=MultiByteToWideChar(CP_UTF8,0,s.c_str(),(int)s.size(),nullptr,0);
+    std::wstring w((size_t)n,L'\0');
+    MultiByteToWideChar(CP_UTF8,0,s.c_str(),(int)s.size(),&w[0],n);
+    return w;
+}
+#endif
+
 struct LanguageModel {
     fasttext::FastText ft;
     std::vector<std::string> labels;
     void load(const std::string &path) {
         std::fprintf(stderr, "fastText: loading %s\n", path.c_str());
+#ifdef _WIN32
+        FILE *fp=_wfopen(utf8_wide(path).c_str(),L"rb");
+        if(!fp) throw std::runtime_error("cannot open the language model file: "+path);
+        {
+            wide_filebuf buf(fp);          /* owns fp, closes it on scope exit */
+            std::istream in(&buf);
+            in.exceptions(std::ios::badbit);
+            ft.loadModel(in);
+        }
+#else
         ft.loadModel(path);
+#endif
         std::fprintf(stderr, "fastText: loaded, %d labels\n", (int)ft.getDictionary()->nlabels());
         auto dict=ft.getDictionary();
         if (dict->nlabels() < 2) throw std::runtime_error("not a language-identification model");
@@ -41,7 +148,7 @@ struct LanguageModel {
                 std::string s=dict->getWord(i);
                 const std::string prefix="__label__";
                 if (s.rfind(prefix,0)==0) s=s.substr(prefix.size());
-                labels.push_back(s);
+                labels.push_back(normalise_label(s));
             }
         }
         std::sort(labels.begin(),labels.end());
@@ -58,6 +165,7 @@ struct LanguageModel {
         if (pred.empty()) throw std::runtime_error("no language prediction");
         std::string code=pred[0].second;
         if (code.rfind("__label__",0)==0) code=code.substr(9);
+        code=normalise_label(code);
         send({{"ok",true},{"language",code},{"confidence",std::clamp(float(pred[0].first),0.f,1.f)}});
     }
 };

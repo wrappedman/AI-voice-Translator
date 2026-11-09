@@ -187,6 +187,7 @@ typedef struct osa_pack_info {
     char sha256[72];
     char notes[256];
     double size_mb;
+    int min_ram_mb;         /* approximate memory the model needs while running */
     bool installed;
     /* Every catalog row is a real, integrity-checked download. */
     bool installable;

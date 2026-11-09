@@ -20,65 +20,100 @@ typedef struct pack_def {
     const char *id, *name, *kind, *languages, *license, *url, *sha256, *notes, *ext;
     const char *langs;          /* capability list for translation models */
     int64_t bytes;
+    int min_ram_mb;             /* approximate resident memory while running */
 } pack_def;
 /* Conservative, documented subset of the languages Qwen2.5 Instruct covers.
  * The list belongs to the model, not to the application: the active pack's own
  * capability list is what the pickers and the gate use. */
 static const char QWEN_LANGS[]="en;fa;ar;zh;fr;es;pt;de;it;ru;ja;ko;vi;th;id;tr;hi;he;nl;pl;uk";
 static const pack_def PACKS[] = {
- /* ---- speech: whisper.cpp ggml containers, MIT, multilingual ---- */
+ /* ---- speech: whisper.cpp ggml, MIT, multilingual (light first) ---- */
+ {"whisper-tiny-q5","Whisper Tiny Q5_1","asr","multilingual","MIT",
+  "https://huggingface.co/ggerganov/whisper.cpp/resolve/5359861c739e955e79d9a303bcbc70fb988958b1/ggml-tiny-q5_1.bin",
+  "818710568da3ca15689e31a743197b520007872ff9576237bda97bd1b469c3d7",
+  "39M parameters; runs on very light PCs; lowest accuracy, good for a quick test.","bin",NULL,32152673,500},
+ {"whisper-base-q5","Whisper Base Q5_1","asr","multilingual","MIT",
+  "https://huggingface.co/ggerganov/whisper.cpp/resolve/5359861c739e955e79d9a303bcbc70fb988958b1/ggml-base-q5_1.bin",
+  "422f1ae452ade6f30a004d7e5c6a43195e4433bc370bf23fac9cc591f01a8898",
+  "74M parameters; light and fast; usable for clear speech.","bin",NULL,59707625,600},
+ {"whisper-small-q5","Whisper Small Q5_1","asr","multilingual","MIT",
+  "https://huggingface.co/ggerganov/whisper.cpp/resolve/5359861c739e955e79d9a303bcbc70fb988958b1/ggml-small-q5_1.bin",
+  "ae85e4a935d7a567bd102fe55afc16bb595bdb618e11b2fc7591bc08120411bb",
+  "244M parameters; good balance for 4 GB machines.","bin",NULL,190085487,1000},
  {"whisper-medium-q5","Whisper Medium Q5_0","asr","multilingual","MIT",
-  "https://huggingface.co/ggerganov/whisper.cpp/resolve/f281eb45af861ab5e5297d23694b7d46e090c02c/ggml-medium-q5_0.bin",
+  "https://huggingface.co/ggerganov/whisper.cpp/resolve/5359861c739e955e79d9a303bcbc70fb988958b1/ggml-medium-q5_0.bin",
   "19fea4b380c3a618ec4723c3eef2eb785ffba0d0538cf43f8f235e7b3b34220f",
-  "769M parameters; balanced quality/memory; ~4 GB RAM.","bin",NULL,539212467},
+  "769M parameters; balanced quality/memory.","bin",NULL,539212467,1500},
  {"whisper-turbo-q5","Whisper Large v3 Turbo Q5_0","asr","multilingual","MIT",
-  "https://huggingface.co/ggerganov/whisper.cpp/resolve/98aa99a0a9db05ae2342309f5096248665f7cba3/ggml-large-v3-turbo-q5_0.bin",
+  "https://huggingface.co/ggerganov/whisper.cpp/resolve/5359861c739e955e79d9a303bcbc70fb988958b1/ggml-large-v3-turbo-q5_0.bin",
   "394221709cd5ad1f40c46e6031ca61bce88931e6e088c188294c6d5a55ffa7e2",
-  "809M parameters; fast decoder, high accuracy; ~4 GB RAM.","bin",NULL,574041195},
+  "809M parameters; fast decoder, high accuracy.","bin",NULL,574041195,1600},
  {"whisper-medium-q8","Whisper Medium Q8_0","asr","multilingual","MIT",
   "https://huggingface.co/ggerganov/whisper.cpp/resolve/5359861c739e955e79d9a303bcbc70fb988958b1/ggml-medium-q8_0.bin",
   "42a1ffcbe4167d224232443396968db4d02d4e8e87e213d3ee2e03095dea6502",
-  "769M parameters at 8-bit; closer to the original weights; ~6 GB RAM.","bin",NULL,823369779},
+  "769M parameters at 8-bit; closer to the original weights.","bin",NULL,823369779,2000},
  {"whisper-turbo-q8","Whisper Large v3 Turbo Q8_0","asr","multilingual","MIT",
   "https://huggingface.co/ggerganov/whisper.cpp/resolve/5359861c739e955e79d9a303bcbc70fb988958b1/ggml-large-v3-turbo-q8_0.bin",
   "317eb69c11673c9de1e1f0d459b253999804ec71ac4c23c17ecf5fbe24e259a1",
-  "809M parameters at 8-bit; best turbo quality; ~6 GB RAM.","bin",NULL,874188075},
+  "809M parameters at 8-bit; best turbo quality.","bin",NULL,874188075,2200},
  {"whisper-large-v3-q5","Whisper Large v3 Q5_0","asr","multilingual","MIT",
   "https://huggingface.co/ggerganov/whisper.cpp/resolve/5359861c739e955e79d9a303bcbc70fb988958b1/ggml-large-v3-q5_0.bin",
   "d75795ecff3f83b5faa89d1900604ad8c780abd5739fae406de19f23ecd98ad1",
-  "1550M parameters; highest accuracy, slower; ~8 GB RAM.","bin",NULL,1081140203},
-
- /* ---- translation: official Qwen GGUF, Apache-2.0, multilingual ---- */
+  "1550M parameters; highest accuracy, slower.","bin",NULL,1081140203,3000},
+ /* ---- translation: official Qwen GGUF, Apache-2.0 (light first) ---- */
+ {"qwen25-0.5b-q4km","Qwen2.5 0.5B Instruct Q4_K_M","mt","multilingual","Apache-2.0",
+  "https://huggingface.co/Qwen/Qwen2.5-0.5B-Instruct-GGUF/resolve/9217f5db79a29953eb74d5343926648285ec7e67/qwen2.5-0.5b-instruct-q4_k_m.gguf",
+  "74a4da8c9fdbcd15bd1f6d01d621410d31c6fc00986f5eb687824e7b93d7a9db",
+  "0.5B; the lightest translator, runs on 2 GB machines; simple wording.","gguf",QWEN_LANGS,491400032,1000},
+ {"qwen25-0.5b-q8","Qwen2.5 0.5B Instruct Q8_0","mt","multilingual","Apache-2.0",
+  "https://huggingface.co/Qwen/Qwen2.5-0.5B-Instruct-GGUF/resolve/9217f5db79a29953eb74d5343926648285ec7e67/qwen2.5-0.5b-instruct-q8_0.gguf",
+  "ca59ca7f13d0e15a8cfa77bd17e65d24f6844b554a7b6c12e07a5f89ff76844e",
+  "0.5B at 8-bit; still light, cleaner output than Q4.","gguf",QWEN_LANGS,675710816,1200},
  {"qwen25-1.5b-q4km","Qwen2.5 1.5B Instruct Q4_K_M","mt","multilingual","Apache-2.0",
   "https://huggingface.co/Qwen/Qwen2.5-1.5B-Instruct-GGUF/resolve/main/qwen2.5-1.5b-instruct-q4_k_m.gguf",
   "6a1a2eb6d15622bf3c96857206351ba97e1af16c30d7a74ee38970e434e9407e",
-  "1.5B neural translator for low-memory PCs; ~4 GB RAM.","gguf",QWEN_LANGS,1117320736},
+  "1.5B neural translator for low-memory PCs.","gguf",QWEN_LANGS,1117320736,1800},
  {"qwen25-3b-q4km","Qwen2.5 3B Instruct Q4_K_M","mt","multilingual","Apache-2.0",
   "https://huggingface.co/Qwen/Qwen2.5-3B-Instruct-GGUF/resolve/cc1e68eea5f05f88f41a6de1fc73110178f23715/qwen2.5-3b-instruct-q4_k_m.gguf",
   "626b4a6678b86442240e33df819e00132d3ba7dddfe1cdc4fbb18e0a9615c62d",
-  "3.09B neural translator; balanced quality/memory; ~8 GB RAM.","gguf",QWEN_LANGS,2104932768},
+  "3.09B neural translator; balanced quality/memory.","gguf",QWEN_LANGS,2104932768,2800},
  {"qwen25-3b-q6k","Qwen2.5 3B Instruct Q6_K","mt","multilingual","Apache-2.0",
   "https://huggingface.co/Qwen/Qwen2.5-3B-Instruct-GGUF/resolve/main/qwen2.5-3b-instruct-q6_k.gguf",
   "12da1a5d3fa6905111d8798b00ed49e0f6425441598c8c41bb37a2c36d49d0f3",
-  "3.09B at 6-bit; noticeably fewer quantization artefacts; ~8 GB RAM.","gguf",QWEN_LANGS,2793410976},
+  "3.09B at 6-bit; noticeably fewer quantization artefacts.","gguf",QWEN_LANGS,2793410976,3500},
  {"qwen25-3b-q8","Qwen2.5 3B Instruct Q8_0","mt","multilingual","Apache-2.0",
   "https://huggingface.co/Qwen/Qwen2.5-3B-Instruct-GGUF/resolve/main/qwen2.5-3b-instruct-q8_0.gguf",
   "6dcc22694c8654b045ec40bbe350212b88893fd9010e8474bae5b19a43578ba1",
-  "3.09B at 8-bit; near-original quality; ~10 GB RAM.","gguf",QWEN_LANGS,3616088480},
+  "3.09B at 8-bit; near-original quality.","gguf",QWEN_LANGS,3616088480,4300},
  {"qwen25-7b-q3km","Qwen2.5 7B Instruct Q3_K_M","mt","multilingual","Apache-2.0",
   "https://huggingface.co/Qwen/Qwen2.5-7B-Instruct-GGUF/resolve/main/qwen2.5-7b-instruct-q3_k_m.gguf",
   "a96b16179dc6cc9afdf0cf7a96a80c199cbd00b9be207c3465be21cb721cca5e",
-  "7.6B neural translator; strongest wording, slower; ~12 GB RAM.","gguf",QWEN_LANGS,3808391072},
-
- /* ---- language identification: official fastText, CC-BY-SA-3.0 ---- */
- {"fasttext-lid176","fastText LID 176 (full)","lang","multilingual","CC-BY-SA-3.0",
-  "https://dl.fbaipublicfiles.com/fasttext/supervised-models/lid.176.bin",
-  "7e69ec5451bc261cc7844e49e4792a85d7f09c06789ec800fc4a44aec362764e",
-  "176 languages, full precision; most accurate; ~200 MB RAM.","bin",NULL,131266198},
+  "7.6B neural translator; strongest wording, slower.","gguf",QWEN_LANGS,3808391072,4800},
+ /* ---- language identification: fastText LID 176 and GlotLID v4 ---- */
  {"fasttext-lid176-ftz","fastText LID 176 (compressed)","lang","multilingual","CC-BY-SA-3.0",
   "https://dl.fbaipublicfiles.com/fasttext/supervised-models/lid.176.ftz",
   "8f3472cfe8738a7b6099e8e999c3cbfae0dcd15696aac7d7738a8039db603e83",
-  "Same 176 languages, quantized; tiny download, slightly lower accuracy.","ftz",NULL,938013}
+  "176 languages, quantized; under 1 MB, the lightest option.","ftz",NULL,938013,300},
+ {"fasttext-lid176","fastText LID 176 (full)","lang","multilingual","CC-BY-SA-3.0",
+  "https://dl.fbaipublicfiles.com/fasttext/supervised-models/lid.176.bin",
+  "7e69ec5451bc261cc7844e49e4792a85d7f09c06789ec800fc4a44aec362764e",
+  "176 languages, full precision; needs about 1.4 GB while loading.","bin",NULL,131266198,1400},
+ {"glotlid-small-ftz","GlotLID v4 small (compressed)","lang","multilingual","Apache-2.0+notices",
+  "https://huggingface.co/cis-lmu/glotlid/resolve/e9592e0a9bc3b6f2a946de94faaa188d1dd6f522/model_v4_small.ftz",
+  "27fa708eac9680a14e51ead8feb48e7d1b29db9af3d4f9038f50aa0781cd1d85",
+  "2000+ language varieties, compact model; light and much wider coverage.","ftz",NULL,35345340,400},
+ {"glotlid-small","GlotLID v4 small (full)","lang","multilingual","Apache-2.0+notices",
+  "https://huggingface.co/cis-lmu/glotlid/resolve/e9592e0a9bc3b6f2a946de94faaa188d1dd6f522/model_v4_small.bin",
+  "7fdfc49052d42653a1b8db5fbb0754497d670a6a4fae32398692f8e5b3811bdd",
+  "2000+ varieties, full precision compact model; better accuracy than its .ftz.","bin",NULL,130969887,900},
+ {"glotlid-ftz","GlotLID v4 (compressed)","lang","multilingual","Apache-2.0+notices",
+  "https://huggingface.co/cis-lmu/glotlid/resolve/e9592e0a9bc3b6f2a946de94faaa188d1dd6f522/model_v4.ftz",
+  "42039e8e9d18a1f75ce334c8aa0b47e8de4b74b887538f0bc7780ab9ae52eab3",
+  "2000+ varieties, quantized full model; wide coverage at moderate memory.","ftz",NULL,101204412,700},
+ {"glotlid","GlotLID v4 (full)","lang","multilingual","Apache-2.0+notices",
+  "https://huggingface.co/cis-lmu/glotlid/resolve/e9592e0a9bc3b6f2a946de94faaa188d1dd6f522/model.bin",
+  "3b26297652e105cb63acde0fbf5aa228161528b519331e58a7c94ea9fe58474c",
+  "2000+ varieties, highest accuracy; needs several GB while loading.","bin",NULL,782808607,3000},
 };
 #define NPACKS ((int)(sizeof PACKS/sizeof PACKS[0]))
 
@@ -119,11 +154,8 @@ static char *worker_reply(osa_process*p,const char*request,volatile int*cancel,o
     bool ok=false;osa_json_get_bool(line,"ok",&ok);if(!ok){char msg[512];if(!osa_json_get_string(line,"error",msg,sizeof msg))osa_strlcpy(msg,"model worker failed",sizeof msg);osa_err_set(err,"%s",msg);free(line);return NULL;}return line;
 }
 /* Rough resident-memory estimate for a pack, used only to explain a failure. */
-static int estimate_ram_mb(const char*kind,int64_t bytes,const char*ext){
-    double mb=(double)bytes/1048576.0;
-    if(osa_streq(kind,"lang"))return osa_streq(ext,"ftz")?300:1500;
-    if(osa_streq(kind,"mt"))return (int)(mb*1.15)+500;   /* mmap + KV cache */
-    return (int)(mb*1.6)+400;                            /* whisper + state */
+static int estimate_ram_mb(const pack_def*p){
+    return p&&p->min_ram_mb>0?p->min_ram_mb:1024;
 }
 static int free_ram_mb(void){
     osa_sys_stats st;memset(&st,0,sizeof st);osa_sys_stats_sample(&st);
@@ -199,8 +231,54 @@ void osa_app_cancel(osa_app*a){if(a)osa_atomic_inc(&a->cancel);} void osa_app_re
 bool osa_app_ready(osa_app*a){if(!a)return false;locke(a);bool ok=a->asr&&a->mt_loaded&&a->lid_loaded;unlocke(a);return ok;}
 bool osa_app_refresh(osa_app*a,osa_error*err){(void)a;osa_err_ok(err);return true;}
 
+/* The recorded path can go stale: the user moves the models folder, restores a
+ * backup, or an older profile is migrated next to the exe. Instead of failing
+ * with "missing", look for the same pinned file in the places it can legitimately
+ * live, verify it, and repair the database row. */
+static bool relocate_model(osa_app*a,const pack_def*p,osa_model*m){
+    const char*bases[3];
+    bases[0]=a->models_dir;bases[1]=osa_path(OSAI_DIR_MODELS);bases[2]=osa_path(OSAI_DIR_DOWNLOADS);
+    for(int i=0;i<3;i++){
+        char cand[OSAI_MAX_PATH];
+        snprintf(cand,sizeof cand,"%s%s.%s",bases[i],p->id,p->ext);
+        if(osa_streq(cand,m->path)||!osa_file_exists(cand))continue;
+        if(osa_file_size(cand)!=p->bytes)continue;
+        char hex[65]={0};osa_sha256_file(cand,hex,NULL);
+        if(!osa_strieq(hex,p->sha256))continue;
+        osa_arena ar;osa_arena_init(&ar);
+        char*sql=osa_arena_printf(&ar,"UPDATE Models SET path='%s' WHERE id='%s'",
+                                  osa_sql_escape(&ar,cand),osa_sql_escape(&ar,p->id));
+        lockd(a);osa_sql_exec(a->db,sql,NULL);unlockd(a);osa_arena_free(&ar);
+        osa_worker_log_note("model %s was found at %s; database path repaired",p->id,cand);
+        osa_strlcpy(m->path,cand,sizeof m->path);
+        return true;
+    }
+    return false;
+}
 static bool activate(osa_app*a,const char*id,osa_error*err){
-    osa_model m;if(!get_model(a,id,&m,err))return false;const pack_def*p=find_pack(id);if(!p||!osa_streq(p->kind,m.kind)||!verify(m.path,p,err)){osa_err_set(err,"installed model is missing, unsupported or failed integrity verification");return false;}
+    osa_model m;if(!get_model(a,id,&m,err))return false;
+    const pack_def*p=find_pack(id);
+    if(!p){osa_err_set(err,"this model is not in the verified catalogue (id %s)",id);return false;}
+    if(!osa_streq(p->kind,m.kind)){osa_err_set(err,"model category mismatch for %s",id);return false;}
+    /* Say exactly which check failed, and where the file was expected. The old
+     * combined sentence made a moved file, a truncated download and an unknown
+     * id look identical. */
+    if(!osa_file_exists(m.path)&&!relocate_model(a,p,&m)){
+        osa_err_set(err,"the model file is missing: %s — run Sync in Settings, or download it again",m.path);
+        return false;
+    }
+    if(!verify(m.path,p,NULL)){
+        int64_t have_bytes=osa_file_size(m.path);char hex[65]={0};
+        osa_sha256_file(m.path,hex,NULL);
+        if(have_bytes!=p->bytes)
+            osa_err_set(err,"the model file has the wrong size (%lld bytes, expected %lld): %s",
+                        (long long)have_bytes,(long long)p->bytes,m.path);
+        else
+            osa_err_set(err,"the model file failed its SHA-256 check (integrity): %s",m.path);
+        osa_worker_log_note("verify failed for %s: size=%lld expected=%lld sha=%s",
+                            m.path,(long long)have_bytes,(long long)p->bytes,hex);
+        return false;
+    }
     if(osa_streq(m.kind,"asr")){char e[512]={0};wsp_ctx*n=wsp_load(m.path,e,sizeof e);if(!n){osa_err_set(err,"%s",e);return false;}wsp_set_cancel(n,&a->cancel);lockd(a);bool ok=osa_store_model_set_active(a->db,id,err);unlockd(a);if(!ok){wsp_free(n);return false;}locke(a);wsp_ctx*old=a->asr;a->asr=n;osa_strlcpy(a->asr_id,id,sizeof a->asr_id);osa_strlcpy(a->asr_name,m.name,sizeof a->asr_name);unlocke(a);wsp_free(old);return true;}
     /* Release the previous engine of this kind *before* loading the new one:
      * two resident translation models is exactly what a 8 GB PC cannot do. */
@@ -209,7 +287,7 @@ static bool activate(osa_app*a,const char*id,osa_error*err){
     if(osa_streq(m.kind,"mt")){a->mt=NULL;a->mt_loaded=false;}else{a->lid=NULL;a->lid_loaded=false;}
     unlocke(a);
     osa_process_stop(old);
-    int need=estimate_ram_mb(m.kind,m.size_bytes,p->ext),have=free_ram_mb();
+    int need=estimate_ram_mb(p),have=free_ram_mb();
     if(have>=0&&have<need/2)osa_worker_log_note("warning: ~%d MB free, this model needs ~%d MB",have,need);
     osa_process*n=start_worker(m.kind,m.path,&a->cancel,err);
     if(!n){
@@ -402,7 +480,7 @@ bool osa_app_delete_transcript(osa_app*a,const char*id,osa_error*err){if(!a||!id
 bool osa_app_add_correction(osa_app*a,const char*id,const char*corrected,osa_error*err){if(!a||!corrected)return false;osa_arena ar;osa_arena_init(&ar);char*original=osa_arena_strdup(&ar,"");if(id&&*id){char*sql=osa_arena_printf(&ar,"SELECT text FROM Transcriptions WHERE id='%s'",osa_sql_escape(&ar,id));lockd(a);osa_rs rs;if(osa_sql_query(a->db,sql,&rs,NULL)&&rs.nrows)original=osa_arena_strdup(&ar,osa_rs_val(&rs,0,"text"));osa_rs_free(&rs);unlockd(a);}lockd(a);bool ok=osa_store_correction_add(a->db,id,original,corrected,0,err);unlockd(a);osa_arena_free(&ar);return ok;}
 
 /* ---- verified downloads / installation, never automatic activation ---- */
-int osa_app_packs(osa_app*a,osa_pack_info*out,int max){if(!a||!out||max<=0)return 0;osa_rs rs;lockd(a);bool q=osa_store_model_list(a->db,&rs,NULL,NULL);int n=0;for(int i=0;i<NPACKS&&n<max;i++){const pack_def*p=PACKS+i;osa_pack_info*x=out+n++;memset(x,0,sizeof*x);osa_strlcpy(x->id,p->id,sizeof x->id);osa_strlcpy(x->name,p->name,sizeof x->name);osa_strlcpy(x->kind,p->kind,sizeof x->kind);osa_strlcpy(x->language,p->languages,sizeof x->language);osa_strlcpy(x->license,p->license,sizeof x->license);osa_strlcpy(x->url,p->url,sizeof x->url);osa_strlcpy(x->sha256,p->sha256,sizeof x->sha256);osa_strlcpy(x->notes,p->notes,sizeof x->notes);x->size_mb=(double)p->bytes/1048576.0;x->installable=true;if(q)for(int r=0;r<rs.nrows;r++)if(osa_streq(osa_rs_val(&rs,r,"id"),p->id))x->installed=true;}osa_rs_free(&rs);unlockd(a);return n;}
+int osa_app_packs(osa_app*a,osa_pack_info*out,int max){if(!a||!out||max<=0)return 0;osa_rs rs;lockd(a);bool q=osa_store_model_list(a->db,&rs,NULL,NULL);int n=0;for(int i=0;i<NPACKS&&n<max;i++){const pack_def*p=PACKS+i;osa_pack_info*x=out+n++;memset(x,0,sizeof*x);osa_strlcpy(x->id,p->id,sizeof x->id);osa_strlcpy(x->name,p->name,sizeof x->name);osa_strlcpy(x->kind,p->kind,sizeof x->kind);osa_strlcpy(x->language,p->languages,sizeof x->language);osa_strlcpy(x->license,p->license,sizeof x->license);osa_strlcpy(x->url,p->url,sizeof x->url);osa_strlcpy(x->sha256,p->sha256,sizeof x->sha256);osa_strlcpy(x->notes,p->notes,sizeof x->notes);x->size_mb=(double)p->bytes/1048576.0;x->min_ram_mb=p->min_ram_mb;x->installable=true;if(q)for(int r=0;r<rs.nrows;r++)if(osa_streq(osa_rs_val(&rs,r,"id"),p->id))x->installed=true;}osa_rs_free(&rs);unlockd(a);return n;}
 int osa_app_fetch_pack(const char*id,void(*progress)(int64_t,int64_t,void*),void*ud,volatile int*cancel,char*file_out,size_t cap,osa_error*err){const pack_def*p=find_pack(id);if(!p||!file_out||!cap){osa_err_set(err,"unknown model or invalid output buffer");return -1;}if(!osa_paths_init()){osa_err_set(err,"cannot initialize download directory");return -1;}char dst[OSAI_MAX_PATH];snprintf(dst,sizeof dst,"%s%s.%s",osa_path(OSAI_DIR_DOWNLOADS),p->id,p->ext);int64_t need=p->bytes*2+268435456;if(osa_disk_free(osa_path(OSAI_DIR_DOWNLOADS))<need){osa_err_set(err,"not enough free disk space for download plus installed copy");return -1;}int rc=osa_http_download(p->url,dst,true,progress,ud,cancel,err);if(rc)return rc;if(!verify(dst,p,err)){osa_file_remove(dst);return -1;}osa_strlcpy(file_out,dst,cap);return 0;}
 static bool install_verified(osa_app*a,const char*path,const pack_def*p,osa_error*err){
     if(!verify(path,p,err))return false;

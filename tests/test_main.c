@@ -70,18 +70,22 @@ static void test_catalog_and_gate(void){
     CHECK(!st.asr_ready&&!st.mt_ready&&!st.lid_ready);
     CHECK(!osa_app_ready(app));
     osa_pack_info packs[32]; int np=osa_app_packs(app,packs,32);
-    int asr=0,mt=0,lid=0; bool all_verified=true,no_tiny=true;
+    int asr=0,mt=0,lid=0,light_asr=0,light_mt=0,light_lid=0;
+    bool all_verified=true,ram_stated=true;
     for(int i=0;i<np;i++){
-        if(osa_streq(packs[i].kind,"asr"))asr++;
-        if(osa_streq(packs[i].kind,"mt"))mt++;
-        if(osa_streq(packs[i].kind,"lang"))lid++;
+        if(osa_streq(packs[i].kind,"asr")){asr++;if(packs[i].min_ram_mb<=1000)light_asr++;}
+        if(osa_streq(packs[i].kind,"mt")){mt++;if(packs[i].min_ram_mb<=1200)light_mt++;}
+        if(osa_streq(packs[i].kind,"lang")){lid++;if(packs[i].min_ram_mb<=1000)light_lid++;}
         if(!packs[i].url[0]||strlen(packs[i].sha256)!=64||packs[i].size_mb<=0)all_verified=false;
         if(!osa_starts(packs[i].url,"https://"))all_verified=false;
-        if(strstr(packs[i].id,"tiny")||strstr(packs[i].id,"base")||strstr(packs[i].id,"phrase"))no_tiny=false;
+        if(packs[i].min_ram_mb<=0||packs[i].min_ram_mb>16384)ram_stated=false;
         CHECK_MSG(!packs[i].installed,"catalog %s is not installed on fresh state",packs[i].id);
     }
-    CHECK_MSG(np>=6&&asr>=2&&mt>=2&&lid>=2,"catalog offers a choice in every category (asr=%d mt=%d lid=%d)",asr,mt,lid);
-    CHECK(all_verified); CHECK(no_tiny);
+    CHECK_MSG(np>=6&&asr>=2&&mt>=2&&lid>=4,"catalog offers a choice in every category (asr=%d mt=%d lid=%d)",asr,mt,lid);
+    CHECK_MSG(light_asr>=2&&light_mt>=1&&light_lid>=2,
+              "each category has light models for low-memory PCs (asr=%d mt=%d lid=%d)",
+              light_asr,light_mt,light_lid);
+    CHECK(all_verified); CHECK_MSG(ram_stated,"every pack states its RAM requirement");
     osa_app_translation tr; CHECK(!osa_app_translate(app,"سلام","fa",&tr,&err));
     osa_app_transcript ts; CHECK(!osa_app_transcribe_file(app,"/nonexistent.wav",&ts,&err));
     CHECK(!osa_app_install_builtin_pack(app,"anything",&err));
@@ -215,6 +219,27 @@ static void test_worker_protocol(void){
     osa_process_write(p,"{\"op\":\"shutdown\"}",&err);
     osa_process_stop(p);
 
+    /* GlotLID / FLORES labels ("pes_Arab") must arrive as the two-letter code
+     * the translator and Whisper use. */
+    if(osa_file_exists("build/test-lid-flores.bin")){
+        const char *fa[]={exe,"--kind","lang","--model","build/test-lid-flores.bin","--threads","1",NULL};
+        osa_process *f=osa_process_start(fa,&err);
+        CHECK_MSG(f!=NULL,"FLORES-label worker starts");
+        if(f){
+            line=NULL;
+            if(osa_process_line(f,20000,NULL,&line,&err)){
+                CHECK_MSG(strstr(line,"\"fa\"")!=NULL,"labels are normalised in the ready list");
+                free(line);line=NULL;
+            }
+            osa_process_write(f,"{\"op\":\"detect\",\"text\":\"سلام دنیا\"}",&err);
+            if(osa_process_line(f,20000,NULL,&line,&err)){
+                char code[16]={0};osa_json_get_string(line,"language",code,sizeof code);
+                CHECK_STR(code,"fa");free(line);line=NULL;
+            }else CHECK_MSG(false,"FLORES detect answered");
+            osa_process_stop(f);
+        }
+    }
+
     /* A bad file must report the loader's own sentence, not a generic one. */
     const char *bad[]={exe,"--kind","lang","--model","build/does-not-exist.bin","--threads","1",NULL};
     osa_process *q=osa_process_start(bad,&err);
@@ -298,6 +323,34 @@ static void test_worker_path(void){
  * child process with OSAI_DATA_DIR removed and a throwaway HOME that holds an
  * old-style profile, so both the new location and the one-time move are proved
  * rather than asserted in a comment. */
+static void test_activation_diagnostics(void){
+    suite("activation diagnostics");
+    use_temp_root("actdiag");
+    osa_error err;osa_err_ok(&err);
+    osa_app *app=osa_app_create(&err);
+    CHECK(app!=NULL);
+    if(app){
+        char dbp[600];snprintf(dbp,sizeof dbp,"%sopenspeech.db",osa_path(OSAI_DIR_DB));
+        osa_db *db=osa_db_open(dbp,&err);
+        if(db){
+            osa_model m;memset(&m,0,sizeof m);
+            osa_strlcpy(m.id,"fasttext-lid176-ftz",sizeof m.id);
+            osa_strlcpy(m.name,"fastText LID 176 (compressed)",sizeof m.name);
+            osa_strlcpy(m.kind,"lang",sizeof m.kind);osa_strlcpy(m.engine,"fastText",sizeof m.engine);
+            osa_strlcpy(m.status,"installed",sizeof m.status);
+            osa_strlcpy(m.path,"/nonexistent/lid.176.ftz",sizeof m.path);
+            m.size_bytes=938013;
+            CHECK(osa_store_model_add(db,&m,&err));osa_db_close(db);
+        }
+        CHECK(!osa_app_activate_model(app,"fasttext-lid176-ftz",&err));
+        CHECK_MSG(strstr(err.msg,"missing")!=NULL,"the failure says the file is missing: %s",err.msg);
+        CHECK_MSG(strstr(err.msg,"/nonexistent/lid.176.ftz")!=NULL,"the failure names the path");
+        CHECK_MSG(strstr(err.msg,"Sync")!=NULL,"the failure tells the user how to repair it");
+        osa_app_destroy(app);
+    }
+    clean_root();
+}
+
 static void test_portable_data_dir(void){
     suite("portable data folder + profile migration");
     const char *host="build/openspeech";
@@ -385,6 +438,7 @@ int main(void){
     test_worker_path();
     test_worker_protocol();
     test_models_folder_and_sync();
+    test_activation_diagnostics();
     test_portable_data_dir();
     test_optional_real_models();
     printf("\n%d passed, %d failed\n",g_pass,g_fail);

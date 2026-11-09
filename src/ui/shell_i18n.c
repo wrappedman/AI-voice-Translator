@@ -301,6 +301,8 @@ static const char *const UI_STRINGS[][3] = {
     {"err.memory", "حافظهٔ آزاد کافی نیست؛ مدل کوچک‌تری انتخاب کنید یا برنامه‌های دیگر را ببندید.", "Not enough free memory: choose a smaller model or close other programs."},
     {"err.modelfile", "فایل مدل باز نشد؛ ممکن است جابه‌جا یا حذف شده باشد. پوشهٔ مدل‌ها را در تنظیمات بررسی و همگام‌سازی کنید.", "The model file could not be opened; it may have been moved or deleted. Check the models folder in Settings and run Sync."},
     {"err.integrity", "فایل مدل سالم نیست؛ آن را حذف و دوباره دریافت کنید.", "The model file failed its integrity check; delete it and download it again."},
+    {"models.ram", "رم لازم:", "RAM needed:"},
+    {"models.light", "سبک", "light"},
     {"models.loghint", "جزئیات در data\\Logs\\worker.log", "details in data\\Logs\\worker.log"},
     {"models.asrlabel", "مدل گفتار فعال", "Active speech model"},
     {"models.threekinds", "سه مدل لازم است: گفتار، ترجمه، تشخیص زبان", "Three models are required: speech, translation, language ID"},

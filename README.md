@@ -2,10 +2,10 @@
 
 **Offline multilingual speech recognition and translation for Windows — no bundled models.**
 
-version 1.3.1 · Windows 10 1903+ / 11 x64 · GPL-3.0-or-later
+version 1.4.0 · Windows 10 1903+ / 11 x64 · GPL-3.0-or-later
 
 خلاصهٔ فارسی: برنامه هیچ مدل ازپیش‌نصب‌شده‌ای همراه ندارد. در بخش «مدل‌ها» یک مدل
-گفتار Whisper، یک مدل ترجمه Qwen GGUF و یک مدل تشخیص زبان fastText را از منابع
+گفتار Whisper، یک مدل ترجمه Qwen GGUF و یک مدل تشخیص زبان (fastText یا GlotLID) را از منابع
 رسمی دانلود و **فعال** می‌کنید. تا وقتی هر سه دسته مدل فعال نداشته باشند، رونویسی،
 ترجمه و ترجمهٔ زنده غیرفعال می‌مانند. همهٔ داده‌ها در پوشهٔ `data` کنار فایل اجرایی
 ذخیره می‌شوند و برنامه هیچ چیزی در AppData نمی‌سازد. رابط کاربری با زبان فارسی و
@@ -15,26 +15,25 @@ version 1.3.1 · Windows 10 1903+ / 11 x64 · GPL-3.0-or-later
 ```
 dist/bin/OpenSpeechAI.exe          GUI executable, x86-64, static, worker embedded
 dist/bin/OpenSpeechWorker.exe      isolated neural inference worker
-dist/OpenSpeechAI-1.3.1-win64.zip  exe + worker + fonts/catalog/docs (no weights)
-dist/checksums-1.3.1.txt           SHA-256 of exe, worker and zip
+dist/OpenSpeechAI-1.4.0-win64.zip  exe + worker + fonts/catalog/docs (no weights)
+dist/checksums-1.4.0.txt           SHA-256 of exe, worker and zip
 ```
 
 ![Fresh-install Models screen](dist/screenshots/screen-04-models.png)
 
 ---
 
-## What changed in 1.3.1
+## What changed in 1.4.0
 
 | Area | Behaviour |
 |---|---|
-| **Activation of translation / language models** | The child process was handed a **non-inheritable stdin**, so the worker saw EOF and died right after its ready line. Both pipes are now marked explicitly (child stdin + child stdout inheritable, parent ends private). A real worker round trip is covered by a test. |
-| **Real error messages** | "model did not become ready" hid the worker's own sentence. Failures now report the loader's message, the exit code and the tail of `data\Logs\worker.log`, with a Persian explanation for the three causes a user can act on (out of memory, missing file, failed integrity) and a pointer to the log. |
-| **Lower memory use** | The previous engine of a category is released *before* the new one loads, and a validated worker is not kept resident while idle — it is loaded on first use. Activating three models no longer needs all three in RAM at once. |
-| **Delete a model** | Every installed row has a **Delete** button. It is a two-step action (click, then "Delete?"), and it unloads the model, removes the database row and deletes the file plus any leftover download. |
-| **Models folder + Sync** | Settings has a models-folder card: pick any writable folder, then press **Sync**. Files already in that folder are identified by exact size + SHA-256 against the official catalogue and appear under *Installed*, inactive, ready to activate. Unrecognised files are named in the report and never registered. New downloads go to the chosen folder. |
-| **One window per click** | `ShellExecute` and the common dialogs pump messages; a timer frame re-entered the draw loop with the same click latched and opened **two** Explorer windows. Frames are now non-reentrant and consume input before drawing. The Models folder button also opens the *models* folder instead of the data root. |
-| **About page** | The developer section is now the **last** section, with a short description of the program and an aligned caption/value grid (name, email, repository); email and repository open on click. |
-| **Language list** | The worker enumerated only dictionary words, so the LID label list came back empty; it now reads words *and* labels. |
+| **Language-model activation on non-ASCII paths** | fastText opened its model with a narrow `std::ifstream`, so a Persian (or any non-ASCII) folder name failed *inside the worker* after the app had already verified the file. On Windows the worker now opens the file itself with the wide API (`_wfopen`) and streams it to fastText, so the path never passes through the ANSI code page. |
+| **Self-healing model paths** | If the recorded path of an installed model is gone (folder moved, backup restored, profile migrated), activation searches the models folder, `data\Models` and the downloads folder for the same catalogue file, verifies size + SHA-256, repairs the database row and continues. |
+| **Precise activation errors** | "file could not be opened" used to cover five different causes. Activation now distinguishes: unknown id, category mismatch, **missing file (with the expected path and a Sync hint)**, wrong size (actual vs expected bytes) and failed SHA-256 — and the failure toast wraps to up to four lines so the reason and path stay readable. |
+| **RAM per model + light badges** | Every catalogue row states the approximate memory the model needs while running («رم لازم»), and models that fit in about 1 GB carry a «سبک» (light) badge. The activation memory check uses the same per-model figure. |
+| **Lighter models** | Whisper Tiny Q5_1 (31 MB), Base Q5_1 (57 MB) and Small Q5_1 (181 MB) for speech; Qwen2.5 0.5B Q4/Q8 (469/644 MB) for translation — usable on 2–4 GB machines. |
+| **Six language-identification models** | fastText LID 176 full/.ftz plus **GlotLID v4**: small .ftz (34 MB), small full (125 MB), full .ftz (97 MB) and full (747 MB), covering 2000+ language varieties. GlotLID's `pes_Arab`-style labels are normalised to the two-letter codes Whisper and the translator use (fa, en, ar, zh, …), in both detection results and the ready language list. |
+| **Pinned catalogue tooling** | `tools/catalog/generate.py` regenerates `catalog.json` from the compiled-in table (now including `min_ram_mb`), and `check.py` validates the RAM figures against the source. New upstream URLs are pinned to immutable revisions. |
 
 ## What changed in 1.3.0
 

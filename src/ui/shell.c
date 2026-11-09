@@ -196,7 +196,7 @@ void shell_speak(shell_state *s, const char *text, const char *lang) {
  * the fault log / the row it belongs to as well, so the toast is a notification,
  * not the record. */
 #define OSAI_TOAST_MS_CLEAR 3500
-#define OSAI_TOAST_MS_ERROR 5500
+#define OSAI_TOAST_MS_ERROR 12000
 
 void shell_set_message(shell_state *s, bool err, const char *fmt, ...) {
     if (!s) return;
@@ -594,18 +594,35 @@ osa_rect shell_draw_chrome(shell_state *s, ui_context *u, osa_rect r, const char
 void shell_draw_toast(shell_state *s, ui_context *u, osa_rect area) {
     if (!s->message[0]) return;
     float pad = 20 * u->L.scale;
-    float h = 42 * u->L.scale;
-    float w = MINF(area.w - pad * 2, 560 * u->L.scale);
+    float w = MINF(area.w - pad * 2, 720 * u->L.scale);
+    float size = UI_FS_SMALL * u->L.scale;
+    /* An error carries the engine's own sentence and the file path: clipping it
+     * to one line hid the only part that explains what went wrong. Measure the
+     * wrapped text and give the band up to four lines. */
+    int lines = 1;
+    if (s->message_is_error && u->reg) {
+        char buf[2048];
+        lines = text_wrap_lines(u->reg, size, s->message, w - 60 * u->L.scale,
+                                buf, sizeof buf, 4);
+        if (lines < 1) lines = 1;
+        if (lines > 4) lines = 4;
+    }
+    float lh = size * 1.7f;
+    float h = 26 * u->L.scale + (lines - 1) * lh + 16 * u->L.scale;
     osa_rect r = rectf(area.x + (area.w - w) * 0.5f, area.y + area.h - h - pad * 0.6f, w, h);
     osa_color base = s->message_is_error ? u->t.danger : u->t.success;
-    c_soft_shadow(u->c, r, h * 0.5f, 12 * u->L.scale, 4 * u->L.scale, u->t.shadow);
-    c_fill_round(u->c, r, h * 0.5f, col_mix(u->t.panel, base, 0.14f));
-    c_stroke_round(u->c, r, h * 0.5f, 1, col_alpha(base, 0.5f));
+    float radius = lines > 1 ? u->L.radius_sm * 2.0f : h * 0.5f;
+    c_soft_shadow(u->c, r, radius, 12 * u->L.scale, 4 * u->L.scale, u->t.shadow);
+    c_fill_round(u->c, r, radius, col_mix(u->t.panel, base, 0.14f));
+    c_stroke_round(u->c, r, radius, 1, col_alpha(base, 0.5f));
     float dx = u->L.rtl ? r.x + r.w - 20 * u->L.scale : r.x + 20 * u->L.scale;
-    c_circle(u->c, dx, r.y + h * 0.5f, 4 * u->L.scale, base);
-    osa_rect tr = u->L.rtl ? rectf(r.x + 14 * u->L.scale, r.y, r.w - 42 * u->L.scale, h)
-                           : rectf(r.x + 36 * u->L.scale, r.y, r.w - 44 * u->L.scale, h);
-    ui_label(u, tr, s->message, UI_FS_BODY * u->L.scale, u->t.text, u->L.rtl ? 2 : 0);
+    c_circle(u->c, dx, r.y + (lines > 1 ? 20 * u->L.scale : h * 0.5f), 4 * u->L.scale, base);
+    osa_rect tr = u->L.rtl ? rectf(r.x + 14 * u->L.scale, r.y + 8 * u->L.scale,
+                                   r.w - 42 * u->L.scale, h - 16 * u->L.scale)
+                           : rectf(r.x + 36 * u->L.scale, r.y + 8 * u->L.scale,
+                                   r.w - 44 * u->L.scale, h - 16 * u->L.scale);
+    if (lines > 1) ui_label_wrap(u, tr, s->message, size, u->t.text);
+    else ui_label(u, tr, s->message, UI_FS_BODY * u->L.scale, u->t.text, u->L.rtl ? 2 : 0);
 }
 
 /* =====================================================================
