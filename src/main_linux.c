@@ -8,7 +8,7 @@
  *  src/platform/win32.
  *
  *  Usage:
- *    osai --snapshots DIR [--width W] [--height H] [--lang fa|en] [--light]
+ *    osai --snapshots DIR [--width W] [--height H] [--lang fa|en] [--dark]
  *    osai --transcribe FILE [--json]
  *    osai --selftest
  *    osai --version
@@ -48,28 +48,15 @@ static void usage(void) {
            "  --snapshots DIR   render every screen to DIR/screen-*.png\n"
            "  --transcribe FILE transcribe (and translate) a WAV/FLAC/OGG file\n"
            "  --selftest        run the built-in assertions, exit 1 on failure\n"
-           "  --train [FILE]    run one training cycle (FILE: optional dataset)\n"
+           "  --train [FILE]    reports that neural fine-tuning is unsupported\n"
            "  --epochs N        training passes (default 6)\n"
            "  --models-json     print the registered models as JSON\n"
+           "  --paths-json      print the resolved data folders as JSON\n"
            "  --version         print the version\n"
            "  --width/--height  snapshot size (default 1440x900)\n"
            "  --lang fa|en      interface language (default fa)\n"
-           "  --light           light theme (default dark)\n",
+           "  --dark            dark theme (default light, matching the app)\n",
            OSAI_VERSION);
-}
-
-/* ---- a real sample so the snapshots are not empty ------------------ */
-
-static bool make_sample(const char *path) {
-    if (osa_file_exists(path)) return true;
-    long long n = 0;
-    int64_t nn = 0;
-    float *pcm = tts_speak("فایل صوتی را انتخاب کنید", "fa", &nn);
-    n = nn;
-    if (!pcm || n <= 0) return false;
-    bool ok = osa_audio_save_wav(path, pcm, n, OSAI_SR);
-    free(pcm);
-    return ok;
 }
 
 /* ---- snapshots ---------------------------------------------------- */
@@ -97,9 +84,7 @@ static int run_snapshots(const char *dir, int w, int h, shell_lang lang, bool da
          * image. Reusing the same directory means the sample transcription
          * must not append a new row on every run. */
         const char *scratch = osa_snapshot_data_dir();
-        static char db[OSAI_MAX_PATH + 32];
-        snprintf(db, sizeof db, "%s/Database/openspeech.db", scratch);
-        remove(db);
+        osa_dir_remove_recursive(scratch);
 #ifdef _WIN32
         _putenv_s("OSAI_DATA_DIR", scratch);
 #else
@@ -128,14 +113,10 @@ static int run_snapshots(const char *dir, int w, int h, shell_lang lang, bool da
     shell.dark = dark;
     shell.scale = 1.0f;
 
-    /* a real transcription, so the transcribe screen shows real content */
-    char sample[OSAI_MAX_PATH];
-    snprintf(sample, sizeof sample, "%s/osai-sample-fa.wav", osa_path(OSAI_DIR_CACHE));
-    if (make_sample(sample)) {
-        osa_strlcpy(shell.audio_path, sample, sizeof shell.audio_path);
-        shell_load_waveform(&shell, sample);
-        shell_run_transcribe(&shell);
-    }
+    /* Fresh install: no bundled weights, no synthetic transcript. Let the
+     * background restore/check finish before rendering the gated UI. */
+    for(int i=0;i<200 && (shell.job || shell.restoring);i++){shell_job_tick(&shell);osa_sleep_ms(5);}
+    shell.message[0]=0;
 
     static const char *names[SCREEN_COUNT] = {
         "transcribe", "live", "translate", "history", "models",
@@ -183,21 +164,7 @@ static int run_snapshots(const char *dir, int w, int h, shell_lang lang, bool da
     }
     shell.models_tab = 0;
 
-    /* the evaluation screen with results, as a second frame */
-    shell.screen = SCREEN_EVALUATION;
-    free(shell.eval_json);
-    shell.eval_json = osa_app_evaluate(app, NULL);
-    if (shell.eval_json) {
-        shell_draw(&shell, &canvas, &ui, NULL);
-        char path[OSAI_MAX_PATH + 64];
-        snprintf(path, sizeof path, "%s/screen-06b-evaluation-results.png", dir);
-        if (canvas_save_png(&canvas, path)) {
-            printf("  %s\n", path);
-            written++;
-        }
-    }
-
-    /* English + light theme, so both directions of the layout are covered */
+    /* English + the other theme, so both directions of the layout are covered */
     shell.lang = lang == UI_FA ? UI_EN : UI_FA;
     shell.dark = !dark;
     shell.screen = SCREEN_TRANSCRIBE;
@@ -215,7 +182,7 @@ static int run_snapshots(const char *dir, int w, int h, shell_lang lang, bool da
     canvas_free(&canvas);
     osa_app_destroy(app);
     printf("%d images written to %s\n", written, dir);
-    return written == SCREEN_COUNT + 3 ? 0 : 1;
+    return written == SCREEN_COUNT + 2 ? 0 : 1;
 }
 
 /* ---- transcribe --------------------------------------------------- */
@@ -243,6 +210,8 @@ static int run_transcribe(const char *path, bool json) {
         fprintf(stderr, "app init failed: %s\n", err.msg);
         return 1;
     }
+    osa_app_restore_saved(app, &err);
+    if (!osa_app_ready(app)) { fprintf(stderr,"download and activate speech, translation and language models first\n"); osa_app_destroy(app); return 1; }
     osa_app_transcript tr;
     osa_app_translation mt;
     bool ok = osa_app_transcribe_and_translate(app, path, &tr, &mt, &err);
@@ -252,7 +221,7 @@ static int run_transcribe(const char *path, bool json) {
         return 1;
     }
     if (json) {
-        char a[OSAI_MAX_PATH * 2], b[8192 * 2], c[8192 * 2];
+        char a[OSAI_MAX_PATH * 2], b[131072], c[131072];
         json_escape(tr.text, b, sizeof b);
         json_escape(mt.text, c, sizeof c);
         json_escape(path, a, sizeof a);
@@ -272,6 +241,19 @@ static int run_transcribe(const char *path, bool json) {
     return 0;
 }
 
+/* ---- paths --------------------------------------------------------
+ * Reports where the program actually writes. The contract is that every folder
+ * lives under <exe dir>/data, so CI can assert it instead of trusting a comment. */
+static int run_paths_json(void) {
+    if (!osa_paths_init()) { fprintf(stderr, "data folder is not writable\n"); return 1; }
+    printf("{\"exe_dir\":\"%s\",\"root\":\"%s\",\"models\":\"%s\",\"downloads\":\"%s\","
+           "\"database\":\"%s\",\"logs\":\"%s\",\"cache\":\"%s\"}\n",
+           osa_exe_dir(), osa_path(OSAI_DIR_ROOT), osa_path(OSAI_DIR_MODELS),
+           osa_path(OSAI_DIR_DOWNLOADS), osa_path(OSAI_DIR_DB), osa_path(OSAI_DIR_LOGS),
+           osa_path(OSAI_DIR_CACHE));
+    return 0;
+}
+
 /* ---- selftest ----------------------------------------------------- */
 
 static int failures;
@@ -281,81 +263,29 @@ static void check(bool cond, const char *what) {
 }
 
 static int run_selftest(void) {
-    osa_error err;
-    osa_app *app = osa_app_create(&err);
-    if (!app) {
-        fprintf(stderr, "app init failed: %s\n", err.msg);
-        return 1;
-    }
-    printf("app\n");
-    osa_app_status st;
-    osa_app_get_status(app, &st);
-    check(st.db_ready, "database opened");
-    check(st.asr_ready, "ASR model loaded");
-    check(st.mt_ready, "translation model loaded");
-    check(st.n_models >= 2, "builtin models registered");
-    check(strlen(st.data_root) > 0, "data root resolved");
-
-    printf("translation\n");
-    struct { const char *in, *out; } cases[] = {
-        { "سلام حال شما خوب است", "Hello, how are you?" },
-        { "ممنون", "Thanks" },
-        { "ممنونم", "Thank you" },
-        { "خداحافظ", "Goodbye" },
-        { "Hello, how are you?", "سلام حال شما خوب است" },
-        { "Thank you", "ممنونم" },
-        { "Good morning", "صبح بخیر" },
-        { "Stop the recording", "ضبط را متوقف کنید" },
-    };
-    for (size_t i = 0; i < sizeof cases / sizeof cases[0]; i++) {
-        osa_app_translation mt;
-        bool ok = osa_app_translate(app, cases[i].in, NULL, &mt, &err);
-        /* The pair can be long; %.*s keeps gcc from warning about truncation
-         * and keeps the label readable in the log. */
-        char what[512];
-        snprintf(what, sizeof what, "%.180s -> %.180s", cases[i].in,
-                 mt.text[0] ? mt.text : "(empty)");
-        check(ok && osa_strieq(mt.text, cases[i].out), what);
-    }
-
-    printf("speech\n");
-    char wav[OSAI_MAX_PATH];
-    snprintf(wav, sizeof wav, "%s/selftest.wav", osa_path(OSAI_DIR_CACHE));
-    int64_t n = 0;
-    float *pcm = tts_speak("فایل صوتی را انتخاب کنید", "fa", &n);
-    check(pcm && n > 0, "TTS produced samples");
-    if (pcm) {
-        float peak = 0;
-        for (long long i = 0; i < n; i++) if (fabsf(pcm[i]) > peak) peak = fabsf(pcm[i]);
-        check(peak > 0.01f, "TTS is not silent");
-        check(osa_audio_save_wav(wav, pcm, n, OSAI_SR), "WAV written");
-        free(pcm);
-    }
-    osa_app_transcript tr;
-    osa_app_translation mt;
-    bool ok = osa_app_transcribe_and_translate(app, wav, &tr, &mt, &err);
-    check(ok, "transcribe + translate completed");
-    if (ok) {
-        printf("       heard: %s\n", tr.text);
-        check(tr.text[0] != 0, "transcript is not empty");
-        check(tr.confidence > 0.0f && tr.confidence <= 1.0f, "confidence in range");
-        check(tr.duration_s > 0.3, "duration measured");
-        check(mt.text[0] != 0, "translation is not empty");
-    }
-    osa_file_remove(wav);
-
-    printf("database\n");
-    char *hist = osa_app_history_json(app, 50, NULL);
-    check(hist && strstr(hist, "\"text\""), "history has rows");
-    free(hist);
-    char *models = osa_app_models_json(app, NULL);
-    check(models && strstr(models, "\"active\":true"), "a model is active");
-    free(models);
-
+    osa_dir_remove_recursive("/tmp/osai-selftest");
+#ifdef _WIN32
+    _putenv_s("OSAI_DATA_DIR","/tmp/osai-selftest");
+#else
+    setenv("OSAI_DATA_DIR","/tmp/osai-selftest",1);
+#endif
+    osa_error err; osa_app *app=osa_app_create(&err);
+    if(!app){fprintf(stderr,"app init failed: %s\n",err.msg);return 1;}
+    printf("fresh-install gate\n");
+    osa_app_status st; osa_app_get_status(app,&st);
+    check(st.db_ready,"database opened");
+    check(!st.asr_ready&&!st.mt_ready&&!st.lid_ready,"no models active on fresh install");
+    check(st.n_models==0,"no models installed on fresh install");
+    check(!osa_app_ready(app),"functionality gated until all three models are active");
+    osa_pack_info packs[32]; int np=osa_app_packs(app,packs,32); int kinds[3]={0,0,0};bool verified=true;
+    for(int i=0;i<np;i++){verified&=packs[i].url[0]&&strlen(packs[i].sha256)==64&&packs[i].size_mb>0; if(osa_streq(packs[i].kind,"asr"))kinds[0]++;if(osa_streq(packs[i].kind,"mt"))kinds[1]++;if(osa_streq(packs[i].kind,"lang"))kinds[2]++;}
+    check(np>=6&&kinds[0]>=2&&kinds[1]>=2&&kinds[2]>=2,"catalog offers several speech, translation and language models");
+    check(verified,"every catalog entry has URL, SHA-256 and real size");
+    osa_app_translation mt; check(!osa_app_translate(app,"سلام","fa",&mt,&err),"translation refused before activation");
+    check(!osa_app_install_builtin_pack(app,"anything",&err),"no synthetic/builtin model installation");
     osa_app_destroy(app);
-    printf("\n%s (%d failure%s)\n", failures ? "FAILED" : "PASSED", failures,
-           failures == 1 ? "" : "s");
-    return failures ? 1 : 0;
+    printf("\n%s (%d failure%s)\n",failures?"FAILED":"PASSED",failures,failures==1?"":"s");
+    return failures?1:0;
 }
 
 /* ---- main --------------------------------------------------------- */
@@ -363,7 +293,7 @@ static int run_selftest(void) {
 int main(int argc, char **argv) {
     const char *snapdir = NULL;
     const char *file = NULL;
-    bool json = false, light = false, selftest = false, models_json = false;
+    bool json = false, dark = false, selftest = false, models_json = false, paths_json = false;
     int w = 1440, h = 900;
     shell_lang lang = UI_FA;
     const char *train_data = NULL;
@@ -380,9 +310,11 @@ int main(int argc, char **argv) {
         else if (osa_streq(a, "--width") && i + 1 < argc) w = atoi(argv[++i]);
         else if (osa_streq(a, "--height") && i + 1 < argc) h = atoi(argv[++i]);
         else if (osa_streq(a, "--json")) json = true;
-        else if (osa_streq(a, "--light")) light = true;
+        else if (osa_streq(a, "--dark")) dark = true;
+        else if (osa_streq(a, "--light")) dark = false;
         else if (osa_streq(a, "--selftest")) selftest = true;
         else if (osa_streq(a, "--models-json")) models_json = true;
+        else if (osa_streq(a, "--paths-json")) paths_json = true;
         else if (osa_streq(a, "--train")) {
             /* `--train` on its own trains on the bundled lexicon; a following
              * argument that is not a switch is a dataset file. */
@@ -400,7 +332,8 @@ int main(int argc, char **argv) {
     if (!snapdir && !selftest)
         osa_crash_log_init(false);
 
-    if (snapdir) return run_snapshots(snapdir, w, h, lang, !light);
+    if (paths_json) return run_paths_json();
+    if (snapdir) return run_snapshots(snapdir, w, h, lang, dark);
     if (file) return run_transcribe(file, json);
     if (selftest) return run_selftest();
     if (train) {

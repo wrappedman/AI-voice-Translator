@@ -26,7 +26,7 @@
 /* Result of one "transcribe an audio file" call. */
 typedef struct osa_app_transcript {
     char     id[40];
-    char     text[8192];
+    char     text[OSAI_MAX_TEXT];
     char     language[8];
     char     model_id[40];
     double   confidence;
@@ -39,7 +39,7 @@ typedef struct osa_app_transcript {
 /* Result of one "translate" call, including the stored row id. */
 typedef struct osa_app_translation {
     char     id[40];
-    char     text[8192];
+    char     text[OSAI_MAX_TEXT];
     char     source_lang[8];
     char     target_lang[8];
     char     engine[32];
@@ -52,6 +52,9 @@ typedef struct osa_app_status {
     bool     db_ready;
     bool     asr_ready;
     bool     mt_ready;
+    bool     lid_ready;
+    char     lid_model[128];
+    char     lid_backend[32];
     char     asr_model[128];
     char     asr_backend[32];
     char     mt_model[128];
@@ -70,14 +73,21 @@ typedef struct osa_app osa_app;
 
 /* ---- lifecycle ---------------------------------------------------- */
 
-/* Create the data directory tree, open/migrate the SQLite database and load the
- * builtin ASR + translation models. Safe to call once per process. */
+/* Open storage without installing or activating anything. Saved activations
+ * are restored explicitly on a worker via osa_app_restore_saved(). */
 osa_app *osa_app_create(osa_error *err);
 void     osa_app_destroy(osa_app *app);
 
 /* Re-scan the models directory and report readiness (used after installing or
  * activating a model). */
 bool osa_app_refresh(osa_app *app, osa_error *err);
+typedef struct osa_lang_info osa_lang_info;
+bool osa_app_restore_saved(osa_app *app, osa_error *err);
+bool osa_app_ready(osa_app *app);
+void osa_app_cancel(osa_app *app);
+void osa_app_reset_cancel(osa_app *app);
+int osa_app_asr_languages(osa_app *app, osa_lang_info *out, int max);
+const char *osa_lang_name(const char *code, bool persian);
 
 /* ---- status ------------------------------------------------------- */
 
@@ -137,6 +147,9 @@ mt_style osa_app_style(const osa_app *app);
  * history screen shows it immediately. */
 bool osa_app_translate(osa_app *app, const char *text, const char *src,
                        osa_app_translation *out, osa_error *err);
+/* Same active models, no history row: for repeatedly refreshed live partials. */
+bool osa_app_translate_live(osa_app *app, const char *text, const char *src,
+                            osa_app_translation *out, osa_error *err);
 
 /* Translate for display only: nothing is written to the database. Returns a
  * pointer to an internal buffer, valid until the next call. Used by the history
@@ -163,28 +176,20 @@ bool osa_app_delete_transcript(osa_app *app, const char *id, osa_error *err);
 
 /* ---- downloads ---------------------------------------------------- */
 
-/* The catalogue of models and language packs that can be downloaded.
- *
- * Everything the application ships is installed offline; this list is for the
- * extra material a user may want (a bigger ASR model, another language pair).
- * It is a static table compiled into the binary, so the screen is complete and
- * browsable with the machine offline; only pressing "download" touches the
- * network.
- */
+/* Verified downloadable models. No weights or phrasebooks are bundled. */
 typedef struct osa_pack_info {
     char id[64];
     char name[128];
     char kind[16];          /* "asr" or "mt" or "lang"               */
-    char language[16];      /* "fa", "en", "fa->en", ...             */
+    char language[512];     /* model-derived capability list */
     char license[64];
     char url[512];          /* empty: this entry cannot be fetched   */
     char sha256[72];
     char notes[256];
     double size_mb;
+    int min_ram_mb;         /* approximate memory the model needs while running */
     bool installed;
-    /* True when the application builds this pack itself, offline. Such an
-     * entry has a working button: pressing it writes the pack into the data
-     * folder and reloads the translation engine. */
+    /* Every catalog row is a real, integrity-checked download. */
     bool installable;
 } osa_pack_info;
 
@@ -224,6 +229,34 @@ char *osa_app_models_json(osa_app *app, osa_error *err);
 /* Activate a model by id. Never deletes the previous one: it stays installed and
  * can be re-activated later (the "never lose the previous version" rule). */
 bool osa_app_activate_model(osa_app *app, const char *id, osa_error *err);
+
+/* Deletes a model: unloads it when active, removes the database row and deletes
+ * the file (plus any leftover download). This is the only destructive model
+ * operation and the UI asks for confirmation before calling it. */
+bool osa_app_remove_model(osa_app *app, const char *id, osa_error *err);
+
+/* ---- models folder ------------------------------------------------ */
+
+/* Where installed model files are written. Defaults to <data>/Models and can be
+ * pointed at any writable folder (an external disk, a shared model library). */
+void osa_app_models_dir(osa_app *app, char *out, size_t cap);
+bool osa_app_set_models_dir(osa_app *app, const char *dir, osa_error *err);
+
+typedef struct osa_sync_result {
+    int scanned;                 /* candidate files looked at              */
+    int added;                   /* newly registered models                */
+    int existing;                /* already registered, nothing to do      */
+    int unknown;                 /* not in the verified catalogue          */
+    char unknown_names[400];     /* a few names, for an honest report      */
+} osa_sync_result;
+
+/* Identifies the files already present in the models folder by SHA-256 against
+ * the pinned catalogue and registers the matches as installed (inactive), so the
+ * user can activate them from the Models screen. Unknown files are reported, not
+ * registered: an unverified file can never become an engine. */
+bool osa_app_sync_models(osa_app *app, volatile int *cancel,
+                         void (*progress)(int64_t done, int64_t total, void *ud), void *ud,
+                         osa_sync_result *out, osa_error *err);
 
 /* Import a .osam (ASR) or .osmt (translation) container into the models dir,
  * hash it and register it. Returns the new id in `id_out`. */

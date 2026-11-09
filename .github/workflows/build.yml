@@ -73,8 +73,10 @@ jobs:
       - name: Build OpenSpeechAI.exe
         run: make win -j"$(nproc)"
 
-      - name: Verify the PE header
-        run: python3 tools/verify_exe.py dist/bin/OpenSpeechAI.exe
+      - name: Verify the PE headers
+        run: |
+          python3 tools/verify_exe.py dist/bin/OpenSpeechAI.exe
+          python3 tools/verify_exe.py dist/bin/OpenSpeechWorker.exe --console
 
       - name: Package and hash
         run: make dist
@@ -87,6 +89,26 @@ jobs:
           name: OpenSpeechAI-win64
           path: |
             dist/bin/OpenSpeechAI.exe
+            dist/bin/OpenSpeechWorker.exe
             dist/OpenSpeechAI-*-win64.zip
             dist/checksums-*.txt
           if-no-files-found: error
+
+  # ---------------------------------------------------------------------
+  # Native Windows runtime smoke: the shipped worker must accept a model path
+  # with spaces and Persian letters and answer a real detect request.
+  # ---------------------------------------------------------------------
+  windows-smoke:
+    name: worker smoke (windows)
+    runs-on: windows-latest
+    needs: windows
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: OpenSpeechAI-win64
+          path: dist
+
+      - name: Run the shipped worker from a Persian/spaces folder
+        run: python tools/win_smoke.py dist/bin/OpenSpeechWorker.exe

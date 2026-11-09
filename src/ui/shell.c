@@ -55,16 +55,12 @@ static const char *nav_label_key(shell_screen s) {
 }
 
 static bool lt_fa(shell_state *s) { return s->lang == UI_FA; }
+static bool lang_rtl(const char*c){return c&&(osa_streq(c,"fa")||osa_streq(c,"ar")||osa_streq(c,"he")||osa_streq(c,"ur")||osa_streq(c,"ps")||osa_streq(c,"sd")||osa_streq(c,"yi"));}
+static bool screen_allowed(shell_state*s,shell_screen sc){return s->models_ready||sc==SCREEN_MODELS||sc==SCREEN_SETTINGS||sc==SCREEN_ABOUT;}
 
 const char *shell_lang_name(shell_state *s, const char *code) {
     if (!code || !*code) return "—";
-    /* The language's own name is what a drop-down shows, but a *sentence* about
-     * a language has to be in one script: an English word inside a Persian
-     * sentence reads as a bug in the interface, not as a language name. */
-    bool fa = s && s->lang == UI_FA;
-    if (osa_starts(code, "fa")) return "فارسی";
-    if (osa_starts(code, "en")) return fa ? "انگلیسی" : "English";
-    return code;
+    return osa_lang_name(code, s && s->lang == UI_FA);
 }
 
 /* ---- preferences -------------------------------------------------- */
@@ -75,7 +71,7 @@ static void prefs_path(char *out, size_t cap) {
 
 void shell_load_prefs(shell_state *s) {
     s->lang = UI_FA;
-    s->dark = true;
+    s->dark = false;          /* Persian + light is the shipping default */
     s->scale = 1.0f;
     s->auto_detect = true;
     s->save_audio = true;
@@ -89,8 +85,8 @@ void shell_load_prefs(shell_state *s) {
     s->asr_threads = 4;
     if (s->asr_threads < 1) s->asr_threads = 1;
     if (s->asr_threads > 16) s->asr_threads = 16;
-    osa_strlcpy(s->lang_src, "", sizeof s->lang_src);
-    osa_strlcpy(s->lang_dst, "en", sizeof s->lang_dst);
+    osa_strlcpy(s->lang_src, "auto", sizeof s->lang_src);
+    osa_strlcpy(s->lang_dst, "fa", sizeof s->lang_dst);
     s->style = MT_STYLE_NEUTRAL;
     s->train_epochs = 6;
     s->train_lang = 0;
@@ -124,9 +120,8 @@ void shell_load_prefs(shell_state *s) {
         fclose(f);
     }
     if (s->scale < 0.75f || s->scale > 2.0f) s->scale = 1.0f;
-    /* hand the persisted pair and register to the engine */
+    /* Model-derived pair is restored after the background model check. */
     osa_app_set_style(s->app, s->style);
-    osa_app_set_languages(s->app, s->lang_src, s->lang_dst, NULL);
 }
 
 void shell_save_prefs(shell_state *s) {
@@ -156,26 +151,19 @@ void shell_save_prefs(shell_state *s) {
 
 bool shell_init(shell_state *s, osa_app *app) {
     if (!s) return false;
-    memset(s, 0, sizeof *s);
-    s->app = app;
-    s->screen = SCREEN_TRANSCRIBE;
-    s->ds_sel = -1;              /* -1: the bundled lexicon, no dataset file */
+    memset(s, 0, sizeof *s); s->app = app; s->screen = SCREEN_TRANSCRIBE; s->ds_sel = -1;
     shell_load_prefs(s);
-    /* a useful starting sentence, in the user's own language, so the Translate
-     * screen is not an empty box on first run */
+    shell_refresh_models_dir(s);
     osa_strlcpy(s->tr_in, "از آشنایی با شما خوشحالم", sizeof s->tr_in);
-    shell_run_translate_silent(s);       /* pre-filled, not a user action */
+    s->restoring = true; s->working = true;
+    shell_start_job(s, SHELL_JOB_RESTORE, NULL);
     return true;
 }
-
 void shell_shutdown(shell_state *s) {
     if (!s) return;
-    free(s->peaks);
-    free(s->history_json);
-    free(s->models_json);
-    free(s->eval_json);
-    s->peaks = NULL;
-    s->history_json = s->models_json = s->eval_json = NULL;
+    shell_cancel_jobs(s); shell_live_shutdown(s);
+    free(s->peaks); free(s->history_json); free(s->models_json); free(s->eval_json);
+    s->peaks = NULL; s->history_json = s->models_json = s->eval_json = NULL;
 }
 
 /* Synthesises `text` with the builtin TTS and plays it. The clip is written to
@@ -208,7 +196,7 @@ void shell_speak(shell_state *s, const char *text, const char *lang) {
  * the fault log / the row it belongs to as well, so the toast is a notification,
  * not the record. */
 #define OSAI_TOAST_MS_CLEAR 3500
-#define OSAI_TOAST_MS_ERROR 5500
+#define OSAI_TOAST_MS_ERROR 12000
 
 void shell_set_message(shell_state *s, bool err, const char *fmt, ...) {
     if (!s) return;
@@ -275,107 +263,51 @@ void shell_refresh_phonetic(shell_state *s) {
     s->phonetic[0] = 0;
     if (!s->show_phonetic) return;
     if (!s->translation[0]) return;
-    const char *lang = s->detected_lang[0] ? s->detected_lang : "fa";
-    /* the translation is in the opposite language to the transcript */
-    const char *tgt = osa_starts(lang, "fa") ? "en" : "fa";
-    osa_app_pronounce(s->translation, tgt, s->phonetic, sizeof s->phonetic);
+    osa_app_pronounce(s->translation, s->lang_dst, s->phonetic, sizeof s->phonetic);
 }
 
 bool shell_run_transcribe(shell_state *s) {
-    if (!s->app || !s->audio_path[0]) {
-        shell_set_message(s, true, "%s", tt(s->lang, "msg.nofile"));
-        return false;
-    }
-    s->working = true;
-    s->message[0] = 0;
-    osa_error err;
-    osa_app_transcript tr;
-    osa_app_translation mt;
-    bool ok = osa_app_transcribe_and_translate(s->app, s->audio_path, &tr, &mt, &err);
-    s->working = false;
-    if (!ok) {
-        shell_set_message(s, true, "%s: %s", tt(s->lang, "msg.failed"), err.msg);
-        return false;
-    }
-    osa_strlcpy(s->transcript, tr.text, sizeof s->transcript);
-    osa_strlcpy(s->correction, tr.text, sizeof s->correction);
-    osa_strlcpy(s->translation, mt.text, sizeof s->translation);
-    osa_strlcpy(s->detected_lang, tr.language, sizeof s->detected_lang);
-    osa_strlcpy(s->transcript_id, tr.id, sizeof s->transcript_id);
-    s->transcript_conf = (float)tr.confidence;
-    s->transcript_rtf = tr.rtf;
-    s->transcript_dur = tr.duration_s;
-    s->transcript_ms = tr.proc_ms;
-    s->transcript_words = tr.n_words;
-    shell_refresh_phonetic(s);
-    shell_set_message(s, false, "%s", tt(s->lang, "msg.ok"));
-    /* refresh the history cache so the history screen is current */
-    free(s->history_json);
-    s->history_json = osa_app_history_json(s->app, 100, NULL);
-    return true;
+    if (!s || !s->audio_path[0]) { shell_set_message(s,true,"%s",tt(s->lang,"msg.nofile")); return false; }
+    if (!s->models_ready) { shell_set_message(s,true,"%s",tt(s->lang,"models.required")); return false; }
+    return shell_start_job(s,SHELL_JOB_TRANSCRIBE,s->audio_path);
 }
-
+bool shell_select_audio(shell_state *s,const char *path){
+    if(!s||!path||!*path)return false;
+    if(!s->models_ready){shell_set_message(s,true,"%s",tt(s->lang,"models.required"));return false;}
+    osa_strlcpy(s->audio_path,path,sizeof s->audio_path);
+    s->transcript[0]=s->translation[0]=s->correction[0]=s->transcript_id[0]=0;free(s->peaks);s->peaks=NULL;s->n_peaks=0;
+    return shell_start_job(s,SHELL_JOB_LOAD_AUDIO,path);
+}
+bool shell_delete_model(shell_state *s,const char *id){return shell_start_job(s,SHELL_JOB_DELETE,id);}
+bool shell_sync_models(shell_state *s){s->sync_valid=false;s->sync_done=s->sync_total=0;return shell_start_job(s,SHELL_JOB_SYNC,NULL);}
+void shell_refresh_models_dir(shell_state *s){if(s&&s->app)osa_app_models_dir(s->app,s->models_dir,sizeof s->models_dir);}
+void shell_set_models_dir(shell_state *s,const char *path){
+    if(!s||!s->app||!path||!*path)return;
+    osa_error err;osa_err_ok(&err);
+    if(!osa_app_set_models_dir(s->app,path,&err)){shell_set_message(s,true,"%s",err.msg);return;}
+    shell_refresh_models_dir(s);
+    shell_set_message(s,false,tt(s->lang,"settings.dirset"),s->models_dir);
+}
+bool shell_activate_model(shell_state *s,const char *id){return shell_start_job(s,SHELL_JOB_ACTIVATE,id);}
 bool shell_load_transcript(shell_state *s, const char *id, const char *text,
                            const char *lang, float confidence, double duration) {
     if (!text || !*text) return false;
     if (id) osa_strlcpy(s->transcript_id, id, sizeof s->transcript_id);
-    osa_strlcpy(s->transcript, text, sizeof s->transcript);
-    osa_strlcpy(s->correction, text, sizeof s->correction);
+    osa_strlcpy(s->transcript, text, sizeof s->transcript); osa_strlcpy(s->correction, text, sizeof s->correction);
     osa_strlcpy(s->detected_lang, lang ? lang : "", sizeof s->detected_lang);
-    s->transcript_conf = confidence;
-    s->transcript_dur = duration;
-    s->transcript_ms = 0;
-    s->translation[0] = 0;
-    const char *pv = osa_app_translate_preview(s->app, text);
-    if (pv) osa_strlcpy(s->translation, pv, sizeof s->translation);
-    shell_refresh_phonetic(s);
-    return true;
+    s->transcript_conf = confidence; s->transcript_dur = duration; s->transcript_ms = 0; s->translation[0] = 0;
+    for(int i=0;i<g_hist_n;i++)if(osa_streq(g_hist_rows[i].id,id)){osa_strlcpy(s->translation,g_hist_rows[i].translation,sizeof s->translation);break;}
+    shell_refresh_phonetic(s); return true;
 }
-
-/* `announce` is false when the call comes from the editor translating as the
- * user types: a status line on every keystroke is noise. The button always
- * announces, because a press that produces no visible change is what made the
- * button look broken in the first place. */
 static void translate_impl(shell_state *s, bool announce) {
+    (void)announce;
     if (!s || !s->app) return;
-    /* An empty box with a button that does nothing is indistinguishable from a
-     * broken button, so this says what is missing instead of returning. */
-    if (!s->tr_in[0]) {
-        shell_set_message(s, true, "%s", tt(s->lang, "translate.emptyinput"));
-        return;
-    }
-    s->tr_out[0] = 0;
-    s->tr_phonetic[0] = 0;
-    osa_error err;
-    osa_app_translation mt;
-    /* "" means "use the detect setting": when auto-detect is off the stored
-     * source language is passed explicitly */
-    const char *src = s->auto_detect ? "" : s->lang_src;
-    if (!osa_app_translate(s->app, s->tr_in, src, &mt, &err)) {
-        shell_set_message(s, true, "%s: %s", tt(s->lang, "msg.failed"), err.msg);
-        return;
-    }
-    osa_strlcpy(s->tr_out, mt.text, sizeof s->tr_out);
-    osa_strlcpy(s->tr_out_lang, mt.target_lang, sizeof s->tr_out_lang);
-    s->tr_score = mt.confidence;
-    if (s->show_phonetic && osa_starts(mt.target_lang, "en"))
-        osa_app_pronounce(mt.text, mt.target_lang, s->tr_phonetic, sizeof s->tr_phonetic);
-    /* the pair the engine actually used becomes the visible pair, unless the
-     * user pinned it in Settings */
-    if (!s->lang_src[0] && mt.source_lang[0])
-        osa_strlcpy(s->lang_src, mt.source_lang, sizeof s->lang_src);
-    if (!s->lang_dst[0] && mt.target_lang[0])
-        osa_strlcpy(s->lang_dst, mt.target_lang, sizeof s->lang_dst);
-    if (announce) {
-        const char *from = shell_lang_name(s, mt.source_lang);
-        const char *to = shell_lang_name(s, mt.target_lang);
-        shell_set_message(s, false, "%s (%s \342\206\220 %s)",
-                          tt(s->lang, "translate.done"), from, to);
-    }
+    if (!s->tr_in[0]) { shell_set_message(s,true,"%s",tt(s->lang,"translate.emptyinput")); return; }
+    if (!s->models_ready) { shell_set_message(s,true,"%s",tt(s->lang,"models.required")); return; }
+    shell_start_job(s,SHELL_JOB_TRANSLATE,s->auto_detect?"auto":s->lang_src);
 }
-
-void shell_run_translate(shell_state *s) { translate_impl(s, true); }
-void shell_run_translate_silent(shell_state *s) { translate_impl(s, false); }
+void shell_run_translate(shell_state *s) { translate_impl(s,true); }
+void shell_run_translate_silent(shell_state *s) { (void)s; /* never infer on paint/keystroke/history selection */ }
 
 /* ---- sidebar ------------------------------------------------------ */
 
@@ -485,7 +417,8 @@ static void draw_sidebar(shell_state *s, ui_context *u, osa_rect r) {
         osa_rect ir = rectf(r.x + 10 * u->L.scale, y, r.w - 20 * u->L.scale, item_h);
         if (y + item_h > r.y + r.h - 120 * u->L.scale) break;
         bool selected = (s->screen == (shell_screen)i);
-        if (ui_row(u, 1000 + i, ir, selected)) {
+        bool allowed=screen_allowed(s,(shell_screen)i);
+        if (allowed && ui_row(u, 1000 + i, ir, selected)) {
             s->screen = (shell_screen)i;
             s->message[0] = 0;
             u->popup_id = 0;
@@ -498,7 +431,7 @@ static void draw_sidebar(shell_state *s, ui_context *u, osa_rect r) {
             }
         }
         bool hov = rect_has(ir, u->in.mx, u->in.my);
-        osa_color fg = selected ? u->t.accent : (hov ? u->t.text : u->t.text_dim);
+        osa_color fg = !allowed ? u->t.text_faint : selected ? u->t.accent : (hov ? u->t.text : u->t.text_dim);
         float ix = u->L.rtl ? ir.x + ir.w - 22 * u->L.scale : ir.x + 22 * u->L.scale;
         draw_nav_icon(u, (shell_screen)i, ix, ir.y + ir.h * 0.5f, fg);
         osa_rect lr = u->L.rtl ? rectf(ir.x + 10 * u->L.scale, ir.y,
@@ -506,7 +439,7 @@ static void draw_sidebar(shell_state *s, ui_context *u, osa_rect r) {
                                : rectf(ir.x + 44 * u->L.scale, ir.y,
                                        ir.w - 54 * u->L.scale, ir.h);
         ui_label(u, lr, tt(s->lang, nav_label_key((shell_screen)i)),
-                 UI_FS_BODY * u->L.scale, selected ? u->t.text : u->t.text_dim,
+                 UI_FS_BODY * u->L.scale, !allowed ? u->t.text_faint : selected ? u->t.text : u->t.text_dim,
                  u->L.rtl ? 2 : 0);
         /* keyboard-free nav: the row handles the click, not the label */
         y += item_h + gap;
@@ -554,20 +487,47 @@ osa_rect shell_draw_chrome(shell_state *s, ui_context *u, osa_rect r, const char
     float title_x = u->L.rtl ? r.x + pad + cluster_w + 16 * u->L.scale : r.x + pad;
     ui_label(u, rectf(title_x, r.y + 9 * u->L.scale, title_w, 24 * u->L.scale),
              tt(s->lang, title_key), UI_FS_H1 * u->L.scale, u->t.text, u->L.rtl ? 2 : 0);
-    ui_label(u, rectf(title_x, r.y + 33 * u->L.scale, title_w, 18 * u->L.scale),
-             tt(s->lang, subtitle_key), UI_FS_SMALL * u->L.scale, u->t.text_dim,
-             u->L.rtl ? 2 : 0);
+    /* The subtitle line reports the active model in every category, so the top
+     * of the window always answers "which model is running?" — including right
+     * after an activation, without opening the Models screen. */
+    {
+        osa_app_status a = s->status_cache;
+        char head[600];
+        if (a.asr_model[0] || a.mt_model[0] || a.lid_model[0]) {
+            const char *none = tt(s->lang, "models.notactive");
+            snprintf(head, sizeof head, tt(s->lang, "models.activehead"),
+                     a.asr_ready ? a.asr_model : none,
+                     a.mt_ready ? a.mt_model : none,
+                     a.lid_ready ? a.lid_model : none);
+            ui_label(u, rectf(title_x, r.y + 33 * u->L.scale, title_w, 18 * u->L.scale),
+                     head, UI_FS_SMALL * u->L.scale, u->t.text_dim, u->L.rtl ? 2 : 0);
+        } else {
+            ui_label(u, rectf(title_x, r.y + 33 * u->L.scale, title_w, 18 * u->L.scale),
+                     tt(s->lang, subtitle_key), UI_FS_SMALL * u->L.scale, u->t.text_dim,
+                     u->L.rtl ? 2 : 0);
+        }
+    }
 
     float right = u->L.rtl ? r.x + pad : r.x + r.w - pad;
     float chip_h = 28 * u->L.scale;
     float cy = r.y + (r.h - chip_h) * 0.5f;
 
     /* model readiness */
-    osa_app_status st;
-    osa_app_get_status(s->app, &st);
+    osa_app_status st = s->status_cache;
+    bool all_ready=st.asr_ready&&st.mt_ready&&st.lid_ready;
     osa_rect chip = rectf(u->L.rtl ? right : right - chip_w, cy, chip_w, chip_h);
-    ui_status_chip(u, chip, tt(s->lang, st.asr_ready ? "status.modeready" : "status.nomodel"),
-                   st.asr_ready ? u->t.success : u->t.danger);
+    if (s->downloading) {
+        char pct[32], loc[64], label[128];
+        snprintf(pct, sizeof pct, "%d%%", (int)(s->dl_progress * 100.0 + 0.5));
+        text_localize_digits(pct, s->lang == UI_FA ? "fa" : "en", loc, sizeof loc);
+        snprintf(label, sizeof label, tt(s->lang, "status.downloading"), loc);
+        ui_status_chip(u, chip, label, u->t.accent);
+    } else if (s->activating) {
+        ui_status_chip(u, chip, tt(s->lang, "status.activating"), u->t.accent);
+    } else {
+        ui_status_chip(u, chip, tt(s->lang, s->restoring?"status.checking":all_ready ? "status.modeready" : "status.nomodel"),
+                       all_ready ? u->t.success : u->t.warning);
+    }
     right += u->L.rtl ? chip_w + 8 * u->L.scale : -(chip_w + 8 * u->L.scale);
 
     /* FA / EN switch */
@@ -634,18 +594,35 @@ osa_rect shell_draw_chrome(shell_state *s, ui_context *u, osa_rect r, const char
 void shell_draw_toast(shell_state *s, ui_context *u, osa_rect area) {
     if (!s->message[0]) return;
     float pad = 20 * u->L.scale;
-    float h = 42 * u->L.scale;
-    float w = MINF(area.w - pad * 2, 560 * u->L.scale);
+    float w = MINF(area.w - pad * 2, 720 * u->L.scale);
+    float size = UI_FS_SMALL * u->L.scale;
+    /* An error carries the engine's own sentence and the file path: clipping it
+     * to one line hid the only part that explains what went wrong. Measure the
+     * wrapped text and give the band up to five lines. */
+    int lines = 1;
+    if (s->message_is_error && u->reg) {
+        char buf[2048];
+        lines = text_wrap_lines(u->reg, size, s->message, w - 60 * u->L.scale,
+                                buf, sizeof buf, 5);
+        if (lines < 1) lines = 1;
+        if (lines > 5) lines = 5;
+    }
+    float lh = size * 1.7f;
+    float h = 26 * u->L.scale + (lines - 1) * lh + 16 * u->L.scale;
     osa_rect r = rectf(area.x + (area.w - w) * 0.5f, area.y + area.h - h - pad * 0.6f, w, h);
     osa_color base = s->message_is_error ? u->t.danger : u->t.success;
-    c_soft_shadow(u->c, r, h * 0.5f, 12 * u->L.scale, 4 * u->L.scale, u->t.shadow);
-    c_fill_round(u->c, r, h * 0.5f, col_mix(u->t.panel, base, 0.14f));
-    c_stroke_round(u->c, r, h * 0.5f, 1, col_alpha(base, 0.5f));
+    float radius = lines > 1 ? u->L.radius_sm * 2.0f : h * 0.5f;
+    c_soft_shadow(u->c, r, radius, 12 * u->L.scale, 4 * u->L.scale, u->t.shadow);
+    c_fill_round(u->c, r, radius, col_mix(u->t.panel, base, 0.14f));
+    c_stroke_round(u->c, r, radius, 1, col_alpha(base, 0.5f));
     float dx = u->L.rtl ? r.x + r.w - 20 * u->L.scale : r.x + 20 * u->L.scale;
-    c_circle(u->c, dx, r.y + h * 0.5f, 4 * u->L.scale, base);
-    osa_rect tr = u->L.rtl ? rectf(r.x + 14 * u->L.scale, r.y, r.w - 42 * u->L.scale, h)
-                           : rectf(r.x + 36 * u->L.scale, r.y, r.w - 44 * u->L.scale, h);
-    ui_label(u, tr, s->message, UI_FS_BODY * u->L.scale, u->t.text, u->L.rtl ? 2 : 0);
+    c_circle(u->c, dx, r.y + (lines > 1 ? 20 * u->L.scale : h * 0.5f), 4 * u->L.scale, base);
+    osa_rect tr = u->L.rtl ? rectf(r.x + 14 * u->L.scale, r.y + 8 * u->L.scale,
+                                   r.w - 42 * u->L.scale, h - 16 * u->L.scale)
+                           : rectf(r.x + 36 * u->L.scale, r.y + 8 * u->L.scale,
+                                   r.w - 44 * u->L.scale, h - 16 * u->L.scale);
+    if (lines > 1) ui_label_wrap(u, tr, s->message, size, u->t.text);
+    else ui_label(u, tr, s->message, UI_FS_BODY * u->L.scale, u->t.text, u->L.rtl ? 2 : 0);
 }
 
 /* =====================================================================
@@ -703,10 +680,10 @@ static void draw_file_card(shell_state *s, ui_context *u, osa_rect card) {
     float bx2 = u->L.rtl ? in.x + bw + 8 * u->L.scale : in.x + in.w - bw * 2 - 8 * u->L.scale;
     /* primary action occupies the trailing slot, secondary sits next to it */
     if (ui_button_busy(u, 2002, rectf(bx, in.y + 2 * u->L.scale, bw, bh),
-                       tt(s->lang, "btn.transcribe"), true, s->working))
+                       tt(s->lang, "btn.transcribe"), s->models_ready, s->working))
         shell_run_transcribe(s);
     if (ui_button(u, 2001, rectf(bx2, in.y + 2 * u->L.scale, bw, bh),
-                  tt(s->lang, "btn.choose"), false))
+                  tt(s->lang, "btn.choose"), s->models_ready))
         s->request = SHELL_REQ_PICK_AUDIO;
 
     /* middle: name + meta line */
@@ -957,7 +934,7 @@ static void draw_transcribe(shell_state *s, ui_context *u, osa_rect body) {
     osa_rect col_b = rectf(u->L.rtl ? inner.x : inner.x + col_w + gap, top, col_w,
                            avail_h);
 
-    bool src_rtl = osa_starts(s->detected_lang, "fa");
+    bool src_rtl = lang_rtl(s->detected_lang);
     char c_val[48] = "—", m_val[48] = "—", lab_c[64], lab_m[64];
     osa_strlcpy(lab_c, tt(s->lang, "transcribe.words"), sizeof lab_c);
     osa_strlcpy(lab_m, tt(s->lang, "transcribe.confidence"), sizeof lab_m);
@@ -970,12 +947,12 @@ static void draw_transcribe(shell_state *s, ui_context *u, osa_rect body) {
     }
     draw_result_pane(s, u, col_a, "transcribe.source", 2100, s->transcript, NULL,
                      src_rtl, u->t.accent, lab_c, c_val);
-    bool tr_rtl = osa_starts(s->detected_lang, "en");
+    bool tr_rtl = lang_rtl(s->lang_dst);
     char tgt_label[96], tgt_val[64];
     osa_strlcpy(tgt_label, tt(s->lang, "transcribe.target"), sizeof tgt_label);
     if (s->translation[0])
         snprintf(tgt_val, sizeof tgt_val, "%s",
-                 shell_lang_name(s, tr_rtl ? "fa" : "en"));
+                 shell_lang_name(s, s->lang_dst));
     else
         osa_strlcpy(tgt_val, "—", sizeof tgt_val);
     draw_result_pane(s, u, col_b, "transcribe.result", 2101, s->translation,
@@ -1001,78 +978,119 @@ static void draw_transcribe(shell_state *s, ui_context *u, osa_rect body) {
 
 /* ---- public draw entry point -------------------------------------- */
 
-typedef struct dl_job {
-    char          id[64];
-    char          file[OSAI_MAX_PATH];
-    volatile int  permille;
-    volatile int  cancel;
-    volatile int  done;
-    int           rc;
-    osa_error     err;
-    osa_thread    th;
-} dl_job;
-
-/* Runs on the worker thread: network and hashing only. It never touches the
- * application database, which the UI thread keeps using. */
-static void dl_progress_cb(int64_t got, int64_t total, void *ud) {
-    dl_job *j = (dl_job *)ud;
-    if (total > 0) j->permille = (int)((got * 1000) / total);
-}
-
-static void dl_worker(void *ud) {
-    dl_job *j = (dl_job *)ud;
-    j->rc = osa_app_fetch_pack(j->id, dl_progress_cb, j, &j->cancel,
-                               j->file, sizeof j->file, &j->err);
-    j->done = 1;
-}
-
-bool shell_download_start(shell_state *s, const char *id) {
-    if (!s || !id || s->dl) return false;
-    dl_job *j = (dl_job *)calloc(1, sizeof *j);
-    if (!j) return false;
-    osa_strlcpy(j->id, id, sizeof j->id);
-    if (!osa_thread_start(&j->th, dl_worker, j)) { free(j); return false; }
-    s->dl = j;
-    s->downloading = true;
-    s->dl_progress = 0;
-    osa_strlcpy(s->dl_pack, id, sizeof s->dl_pack);
-    return true;
-}
-
-void shell_download_tick(shell_state *s) {
-    dl_job *j = s ? s->dl : NULL;
-    if (!j) return;
-    s->dl_progress = j->permille / 1000.0;
-    if (!j->done) return;
-    osa_thread_join(&j->th);
-    s->dl = NULL;
-    s->downloading = false;
-    s->dl_pack[0] = 0;
-    s->dl_progress = 0;
-    free(s->models_json);
-    s->models_json = NULL;
-    if (j->rc == 0) {
-        osa_error ierr;
-        if (osa_app_install_pack_file(s->app, j->file, &ierr)) {
-            osa_file_remove(j->file);
-            s->models_tab = 0;               /* show it in the installed list */
-            shell_set_message(s, false, "%s", tt(s->lang, "msg.ok"));
-        } else {
-            shell_set_message(s, true, "%s: %s", tt(s->lang, "msg.failed"), ierr.msg);
-        }
-    } else if (j->rc == -2) {
-        shell_set_message(s, true, "%s", tt(s->lang, "msg.failed"));
-    } else {
-        shell_set_message(s, true, "%s: %s", tt(s->lang, "msg.failed"), j->err.msg);
+typedef struct shell_job {
+    shell_job_kind kind; osa_app *app; char arg[OSAI_MAX_PATH]; char *input;
+    osa_app_transcript tr; osa_app_translation mt; char *eval_json;
+    float *peaks; int n_peaks; volatile int permille,cancel,done; bool ok; int rc;
+    osa_error err; osa_thread th; volatile int64_t got,total;
+    osa_sync_result sync;
+} shell_job;
+static void job_progress(int64_t got,int64_t total,void *ud){shell_job*j=ud;j->got=got;j->total=total;if(total>0)j->permille=(int)(got*1000/total);}
+static void job_worker(void *ud){
+    shell_job*j=ud;osa_err_ok(&j->err);osa_app_reset_cancel(j->app);
+    switch(j->kind){
+      case SHELL_JOB_RESTORE:j->ok=osa_app_restore_saved(j->app,&j->err);break;
+      case SHELL_JOB_LOAD_AUDIO:{osa_audio au;if(osa_audio_load(j->arg,&au,&j->err)){enum{NBINS=260};j->peaks=calloc(NBINS,sizeof(float));if(j->peaks){int64_t per=au.n/NBINS;if(per<1)per=1;float mx=0;for(int i=0;i<NBINS;i++){int64_t a=(int64_t)i*per,b=a+per;if(b>au.n)b=au.n;float p=0;for(int64_t k=a;k<b;k++){float v=fabsf(au.samples[k]);if(v>p)p=v;}j->peaks[i]=p;if(p>mx)mx=p;}if(mx>1e-5f)for(int i=0;i<NBINS;i++)j->peaks[i]/=mx;j->n_peaks=NBINS;j->ok=true;}osa_audio_free(&au);}break;}
+      case SHELL_JOB_TRANSCRIBE:j->ok=osa_app_transcribe_and_translate(j->app,j->arg,&j->tr,&j->mt,&j->err);break;
+      case SHELL_JOB_TRANSLATE:j->ok=osa_app_translate(j->app,j->input,j->arg,&j->mt,&j->err);break;
+      case SHELL_JOB_DOWNLOAD:j->rc=osa_app_download_pack(j->app,j->arg,job_progress,j,&j->cancel,&j->err);j->ok=j->rc==0;break;
+      case SHELL_JOB_ACTIVATE:j->ok=osa_app_activate_model(j->app,j->arg,&j->err);break;
+      case SHELL_JOB_EVALUATE:j->eval_json=osa_app_evaluate(j->app,&j->err);j->ok=j->eval_json!=NULL;break;
+      case SHELL_JOB_DELETE:j->ok=osa_app_remove_model(j->app,j->arg,&j->err);break;
+      case SHELL_JOB_SYNC:j->ok=osa_app_sync_models(j->app,&j->cancel,job_progress,j,&j->sync,&j->err);break;
     }
-    free(j);
+    if(osa_atomic_load(&j->cancel))j->ok=false;
+    __sync_synchronize(); j->done=1;
 }
+bool shell_start_job(shell_state*s,shell_job_kind kind,const char*arg){
+    if(!s||!s->app||s->job)return false;
+    if(s->live&&kind!=SHELL_JOB_RESTORE){shell_set_message(s,true,"%s",tt(s->lang,"live.stopfirst"));return false;}
+    if((kind==SHELL_JOB_TRANSCRIBE||kind==SHELL_JOB_TRANSLATE)&&!s->models_ready){shell_set_message(s,true,"%s",tt(s->lang,"models.required"));return false;}
+    shell_job*j=calloc(1,sizeof*j);if(!j)return false;j->kind=kind;j->app=s->app;if(arg)osa_strlcpy(j->arg,arg,sizeof j->arg);
+    if(kind==SHELL_JOB_TRANSLATE){j->input=osa_strdup(s->tr_in);if(!j->input){free(j);return false;}}
+    if(!osa_thread_start(&j->th,job_worker,j)){free(j->input);free(j);return false;}
+    s->job=j;s->working=kind!=SHELL_JOB_DOWNLOAD;s->downloading=kind==SHELL_JOB_DOWNLOAD;
+    s->activating=kind==SHELL_JOB_ACTIVATE;s->syncing=kind==SHELL_JOB_SYNC;s->message[0]=0;
+    if(s->activating)shell_set_message(s,false,"%s",tt(s->lang,"models.activating"));
+    if(kind==SHELL_JOB_DELETE)shell_set_message(s,false,"%s",tt(s->lang,"models.deleting"));
+    if(kind==SHELL_JOB_SYNC){s->sync_done=s->sync_total=0;shell_set_message(s,false,"%s",tt(s->lang,"settings.synchint"));}
+    if(kind==SHELL_JOB_DOWNLOAD){s->dl_progress=0;s->dl_got=s->dl_total=0;osa_strlcpy(s->dl_pack,arg,sizeof s->dl_pack);}return true;
+}
+void shell_job_tick(shell_state*s){
+    if(!s||!s->job)return;shell_job*j=s->job;
+    if(j->kind==SHELL_JOB_DOWNLOAD){s->dl_progress=j->permille/1000.0;s->dl_got=j->got;s->dl_total=j->total;}
+    if(j->kind==SHELL_JOB_SYNC){s->sync_done=(int)j->got;s->sync_total=(int)j->total;}if(!osa_atomic_load(&j->done))return;
+    osa_thread_join(&j->th);s->job=NULL;s->working=false;s->downloading=false;s->activating=false;s->syncing=false;s->restoring=false;s->models_ready=osa_app_ready(s->app);s->status_valid=false;
+    if(j->ok){
+      switch(j->kind){
+        case SHELL_JOB_RESTORE:osa_app_get_languages(s->app,s->lang_src,sizeof s->lang_src,s->lang_dst,sizeof s->lang_dst);s->style=osa_app_style(s->app);if(!s->models_ready)s->screen=SCREEN_MODELS;break;
+        case SHELL_JOB_LOAD_AUDIO:free(s->peaks);s->peaks=j->peaks;j->peaks=NULL;s->n_peaks=j->n_peaks;shell_set_message(s,false,"%s",tt(s->lang,"msg.fileselected"));break;
+        case SHELL_JOB_TRANSCRIBE:osa_strlcpy(s->transcript,j->tr.text,sizeof s->transcript);osa_strlcpy(s->correction,j->tr.text,sizeof s->correction);osa_strlcpy(s->translation,j->mt.text,sizeof s->translation);osa_strlcpy(s->detected_lang,j->tr.language,sizeof s->detected_lang);osa_strlcpy(s->transcript_id,j->tr.id,sizeof s->transcript_id);s->transcript_conf=(float)j->tr.confidence;s->transcript_rtf=j->tr.rtf;s->transcript_dur=j->tr.duration_s;s->transcript_ms=j->tr.proc_ms;s->transcript_words=j->tr.n_words;shell_refresh_phonetic(s);free(s->history_json);s->history_json=osa_app_history_json(s->app,100,NULL);shell_set_message(s,false,"%s",tt(s->lang,"msg.ok"));break;
+        case SHELL_JOB_TRANSLATE:osa_strlcpy(s->tr_out,j->mt.text,sizeof s->tr_out);osa_strlcpy(s->tr_out_lang,j->mt.target_lang,sizeof s->tr_out_lang);s->tr_score=j->mt.confidence;s->tr_phonetic[0]=0;if(s->show_phonetic)osa_app_pronounce(j->mt.text,j->mt.target_lang,s->tr_phonetic,sizeof s->tr_phonetic);shell_set_message(s,false,"%s (%s → %s)",tt(s->lang,"translate.done"),shell_lang_name(s,j->mt.source_lang),shell_lang_name(s,j->mt.target_lang));break;
+        case SHELL_JOB_DOWNLOAD:free(s->models_json);s->models_json=NULL;s->models_tab=0;shell_set_message(s,false,"%s",tt(s->lang,"models.installed_inactive"));break;
+        case SHELL_JOB_ACTIVATE:{
+            free(s->models_json);s->models_json=NULL;
+            osa_app_get_languages(s->app,s->lang_src,sizeof s->lang_src,s->lang_dst,sizeof s->lang_dst);
+            char name[128];osa_strlcpy(name,j->arg,sizeof name);
+            osa_pack_info pk[32];int npk=osa_app_packs(s->app,pk,32);
+            for(int i=0;i<npk;i++)if(osa_streq(pk[i].id,j->arg)){osa_strlcpy(name,pk[i].name,sizeof name);break;}
+            osa_app_get_status(s->app,&s->status_cache);s->status_ms=osa_now_ms();s->status_valid=true;
+            shell_set_message(s,false,tt(s->lang,"models.activated"),name);
+            break;}
+        case SHELL_JOB_EVALUATE:free(s->eval_json);s->eval_json=j->eval_json;j->eval_json=NULL;break;
+        case SHELL_JOB_DELETE:{
+            char name[128];osa_strlcpy(name,j->arg,sizeof name);
+            osa_pack_info pk[32];int npk=osa_app_packs(s->app,pk,32);
+            for(int i=0;i<npk;i++)if(osa_streq(pk[i].id,j->arg)){osa_strlcpy(name,pk[i].name,sizeof name);break;}
+            free(s->models_json);s->models_json=NULL;s->delete_id[0]=0;
+            osa_app_get_status(s->app,&s->status_cache);s->status_ms=osa_now_ms();s->status_valid=true;
+            osa_app_get_languages(s->app,s->lang_src,sizeof s->lang_src,s->lang_dst,sizeof s->lang_dst);
+            shell_set_message(s,false,tt(s->lang,"models.deleted"),name);
+            break;}
+        case SHELL_JOB_SYNC:{
+            s->sync=j->sync;s->sync_valid=true;
+            free(s->models_json);s->models_json=NULL;
+            if(j->sync.added)s->models_tab=0;
+            char a[16],b[16],c[16],na[48],nb[48],nc[48];
+            snprintf(a,sizeof a,"%d",j->sync.added);snprintf(b,sizeof b,"%d",j->sync.existing);snprintf(c,sizeof c,"%d",j->sync.unknown);
+            const char*dig=s->lang==UI_FA?"fa":"en";
+            text_localize_digits(a,dig,na,sizeof na);text_localize_digits(b,dig,nb,sizeof nb);text_localize_digits(c,dig,nc,sizeof nc);
+            if(!j->sync.added&&!j->sync.existing&&!j->sync.unknown)shell_set_message(s,false,"%s",tt(s->lang,"settings.syncnone"));
+            else shell_set_message(s,false,tt(s->lang,"settings.syncdone"),na,nb,nc);
+            break;}
+      }
+    }else{
+        /* Keep the engine's own sentence (it is the only thing that explains a
+         failed load) but lead with a Persian/English explanation for the three
+         causes a user can actually act on. */
+        const char*raw=j->err.msg[0]?j->err.msg:tt(s->lang,"msg.cancelled");
+        const char*hint=NULL;
+        if(strstr(raw,"memory")||strstr(raw,"bad_alloc")||strstr(raw,"free RAM"))hint=tt(s->lang,"err.memory");
+        else if(strstr(raw,"cannot be opened")||strstr(raw,"cannot open")||strstr(raw,"missing"))hint=tt(s->lang,"err.modelfile");
+        else if(strstr(raw,"integrity")||strstr(raw,"wrong file format"))hint=tt(s->lang,"err.integrity");
+        const char *where=j->kind==SHELL_JOB_ACTIVATE?tt(s->lang,"models.loghint"):"";
+        /* Put the engine's sentence and the log pointer on their own lines.
+         * A single mixed RTL/LTR line could still be clipped by the toast's
+         * one-line fallback; explicit newlines guarantee the path is visible. */
+        if(hint&&where[0])shell_set_message(s,true,"%s: %s\n%s\n%s",tt(s->lang,"msg.failed"),hint,raw,where);
+        else if(hint)shell_set_message(s,true,"%s: %s\n%s",tt(s->lang,"msg.failed"),hint,raw);
+        else if(where[0])shell_set_message(s,true,"%s: %s\n%s",tt(s->lang,"msg.failed"),raw,where);
+        else shell_set_message(s,true,"%s: %s",tt(s->lang,"msg.failed"),raw);
+    }
+    s->dl_pack[0]=0;s->dl_progress=0;s->dl_got=s->dl_total=0;free(j->input);free(j->peaks);free(j->eval_json);free(j);
+}
+void shell_cancel_jobs(shell_state*s){if(!s)return;osa_app_cancel(s->app);if(s->job){shell_job*j=s->job;__sync_lock_test_and_set(&j->cancel,1);osa_thread_join(&j->th);free(j->input);free(j->peaks);free(j->eval_json);free(j);s->job=NULL;}s->working=s->downloading=s->activating=s->syncing=s->restoring=false;}
+/* Legacy entry points now share the same job queue; installation never happens on the UI thread. */
+bool shell_download_start(shell_state*s,const char*id){return shell_start_job(s,SHELL_JOB_DOWNLOAD,id);}
+void shell_download_tick(shell_state*s){shell_job_tick(s);}
 
 void shell_draw(shell_state *s, osa_canvas *c, ui_context *u, const ui_input *in) {
     if (!s || !c || !u) return;
     s->frame++;
     shell_message_tick(s);
-    shell_download_tick(s);
+    shell_job_tick(s);
+    s->models_ready = osa_app_ready(s->app);
+    if(!s->status_valid || osa_now_ms()-s->status_ms>1000){osa_app_get_status(s->app,&s->status_cache);s->status_ms=(double)osa_now_ms();s->status_valid=true;}
     ui_frame_begin(u, c, in);
 
     ui_set_theme(u, s->dark);

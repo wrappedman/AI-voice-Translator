@@ -15,20 +15,22 @@ extern "C" {
 typedef struct wsp_ctx wsp_ctx;
 
 typedef struct wsp_result {
-    char   text[8192];
+    char   text[65536];
     char   language[8];     /* ISO 639-1 as detected or forced, e.g. "fa" */
     float  confidence;      /* mean token probability, 0..1 */
 } wsp_result;
 
-/* Loads a ggml model file (for example ggml-tiny.bin). Returns NULL and fills
+/* Loads a ggml model file (a verified multilingual GGUF/GGML file). Returns NULL and fills
  * `err` when the file is missing, is not a whisper model, or cannot be read. */
 wsp_ctx *wsp_load(const char *path, char *err, size_t cap);
 void     wsp_free(wsp_ctx *c);
+void     wsp_set_cancel(wsp_ctx *c, volatile int *cancel);
+int      wsp_languages(wsp_ctx *c, const char **codes, int max);
 
 /* Returns true when `path` starts with the ggml magic. Cheap: reads 4 bytes. */
 bool wsp_is_model_file(const char *path);
 
-/* Transcribes mono 16 kHz float samples. `lang` is "fa", "en" or NULL/"" for
+/* Transcribes mono 16 kHz float samples. `lang` is a Whisper language code or NULL/"" for
  * automatic detection. Blocking. */
 bool wsp_transcribe(wsp_ctx *c, const float *pcm, int64_t n, const char *lang,
                     wsp_result *out, char *err, size_t cap);

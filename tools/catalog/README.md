@@ -1,46 +1,37 @@
 # Model catalogue
 
-`catalog.json` is the single place where shipped and optional models are
-described. Two things read it:
+`catalog.json` describes the **downloadable** models offered by the application.
+No weights are bundled. Two things read it:
 
-* `tools/catalog/check.py` — validates the file and cross-checks it against the
-  bytes that actually ship, so a stale `sha256` cannot reach a release.
-* the application, when a future build wants to offer optional models. Today
-  every entry has `"url": ""` and `"status": "installed"`, which means "bundled,
-  nothing to download".
+* `tools/catalog/check.py` — validates the file and cross-checks every pin
+  against the compiled-in catalog in `src/app/osai_app.c`.
+* the release packager (`tools/make_dist.py`) ships it as `assets/catalog.json`
+  for documentation/provenance; the runtime source of truth is the C catalog.
 
 ## Schema
 
 | Field | Type | Meaning |
 |-------|------|---------|
-| `id` | string | Stable identifier. Must match the model's own id. |
+| `id` | string | Stable identifier. Must match the runtime catalog. |
 | `name` | string | Shown in the Models screen. |
-| `kind` | `asr` \| `mt` | Which engine consumes the file. |
-| `language` | string | `fa`, `en`, or `fa;en` for bidirectional. |
-| `engine` | string | `exemplar`, `trained`, or `phrasebook`. |
-| `license` | string | SPDX expression. Must not be empty. |
-| `homepage` | string | Where the model came from. |
-| `size_bytes` | int | Exact size of the container. |
-| `sha256` | string | Lowercase hex, 64 characters. |
-| `url` | string | Empty for bundled models. |
-| `status` | string | `installed`, `available`, or `deprecated`. |
+| `kind` | `asr` \| `mt` \| `lang` | Which engine consumes the file. |
+| `language` | string | Capability summary (currently `multilingual`). |
+| `engine` | `whisper.cpp` \| `llama.cpp` \| `fasttext` | Inference backend. |
+| `license` | string | SPDX expression for the weights. |
+| `homepage` | string | Upstream project/model card. |
+| `size_bytes` | int | Exact artifact size. |
+| `sha256` | string | Lowercase hex, 64 characters. Required. |
+| `url` | string | Pinned HTTPS download URL. |
+| `status` | `available` | Nothing is `installed`/bundled. |
 | `min_free_gb` | string | Advisory disk requirement. |
 | `notes` | string | Human-readable description. |
+| `verified` | `sha256` | Integrity check performed before installation. |
 
 ## Rules
 
-1. A bundled model appears in the user's data folder on first run, so its
-   `sha256` **must** equal the hash of the file the binary produces. `check.py`
-   verifies this by materialising the builtin models and hashing them.
-2. `id` is never reused, even after a model is retired. Bump `version` inside
-   the container instead.
-3. `url` may only be set for `status: available`. The application never downloads
-   anything automatically; the user has to ask for it, and the download is
-   verified against `sha256` before it is installed.
-
-## Running the checker
-
-```sh
-python3 tools/catalog/check.py            # validate catalog.json
-python3 tools/catalog/check.py --hash     # also hash the builtin containers
-```
+1. Every entry must have a real HTTPS URL, exact positive size and SHA-256.
+   Size-only verification is not allowed.
+2. `id` is never reused. Bump the pin/URL when upstream changes.
+3. Installation registers the model **inactive**; the user activates it.
+4. At most one active model per `kind` is enforced by the store.
+5. `check.py` fails if `dist/models` or `dist/bin/models` contains artifacts.

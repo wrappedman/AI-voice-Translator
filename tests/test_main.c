@@ -1,18 +1,13 @@
 /* =====================================================================
- *  OpenSpeech AI — unit and integration tests
+ *  OpenSpeech AI — regression tests for the no-bundle / verified-model build
  *
- *  Self-contained: no test framework, no fixtures on disk. Every test builds
- *  what it needs, asserts, and cleans up. `make test` runs the suite; the exit
- *  code is the number of failures so CI can gate on it.
- *
- *  Deliberately *not* covered here:
- *    - anything that needs a microphone or a display (covered by the snapshot
- *      job, which renders with the same code the Windows build uses)
- *    - the Windows window procedure (it needs a message loop; the logic it
- *      calls is covered by the app-layer tests)
+ *  These tests do NOT ship or fabricate model weights. They assert the
+ *  fresh-install contract, catalog integrity, atomic activation, Unicode
+ *  handling, audio decoding, worker isolation and UI gating. Optional real
+ *  inference smoke tests run only when OSAI_TEST_ASR / OSAI_TEST_MT /
+ *  OSAI_TEST_LID / OSAI_TEST_WAV point at user-supplied official artifacts.
  * ===================================================================== */
 #include <stdio.h>
-#include <time.h>
 #include <stdlib.h>
 #include <string.h>
 #include <math.h>
@@ -20,973 +15,543 @@
 #include <unistd.h>
 
 #include "osai_common.h"
-#include "whisper_bridge.h"
 #include "osai_platform.h"
+#include "osai_process.h"
 #include "osai_store.h"
-#include "audio.h"
-#include "tts.h"
-#include "asr.h"
-#include "mt.h"
-#include "nn.h"
 #include "osai_app.h"
-
-/* ---- harness ------------------------------------------------------ */
+#include "audio.h"
+#include "shell.h"
 
 static int g_pass, g_fail;
-static const char *g_suite = "";
+static void suite(const char *name){ printf("\n%s\n",name); }
+static void ok_(bool cond,const char *fmt,...){
+    va_list ap; va_start(ap,fmt); char msg[512]; vsnprintf(msg,sizeof msg,fmt,ap); va_end(ap);
+    printf("  %-4s %s\n",cond?"ok":"FAIL",msg); if(cond)g_pass++;else g_fail++;
+}
+#define CHECK(c) ok_((c),"%s",#c)
+#define CHECK_MSG(c,...) ok_((c),__VA_ARGS__)
+#define CHECK_STR(a,b) ok_(osa_streq((a),(b)),"%s == \"%s\" (got \"%s\")",#a,(b),(a))
 
-static void suite(const char *name) {
-    g_suite = name;
-    printf("\n%s\n", name);
+static char g_root[256];
+static void use_temp_root(const char *tag){
+    snprintf(g_root,sizeof g_root,"/tmp/osai-%s-XXXXXX",tag);
+    if(!mkdtemp(g_root)){perror("mkdtemp");exit(2);}
+    setenv("OSAI_DATA_DIR",g_root,1);
+    osa_paths_reset();
+}
+static void clean_root(void){ osa_dir_remove_recursive(g_root); }
+
+static void test_json_unicode(void){
+    suite("json unicode");
+    const char *doc="{\"text\":\"\\u0633\\u0644\\u0627\\u0645 \\uD83D\\uDE00\",\"ok\":true}";
+    char out[128]={0}; bool b=false;
+    CHECK(osa_json_get_string(doc,"text",out,sizeof out));
+    CHECK_STR(out,"سلام 😀");
+    CHECK(osa_json_get_bool(doc,"ok",&b)&&b);
+    osa_arena a; osa_arena_init(&a);
+    char *esc=osa_json_escape(&a,"سلام \"x\"\n");
+    char round[128]={0}; char *obj=NULL;
+    /* wrap escaped string in an object and decode it back */
+    obj=malloc(strlen(esc)+32); sprintf(obj,"{\"v\":%s}",esc);
+    CHECK(osa_json_get_string(obj,"v",round,sizeof round));
+    CHECK_STR(round,"سلام \"x\"\n");
+    free(obj); osa_arena_free(&a);
 }
 
-static void ok_(bool cond, const char *fmt, ...) {
-    va_list ap;
-    va_start(ap, fmt);
-    char msg[512];
-    vsnprintf(msg, sizeof msg, fmt, ap);
-    va_end(ap);
-    printf("  %-4s %s\n", cond ? "ok" : "FAIL", msg);
-    if (cond) g_pass++; else g_fail++;
-}
-
-#define CHECK(cond)              ok_((cond), "%s", #cond)
-#define CHECK_MSG(cond, ...)     ok_((cond), __VA_ARGS__)
-#define CHECK_STR_EQ(a, b)       ok_(osa_streq((a), (b)), "%s == \"%s\"  (got \"%s\")", #a, (b), (a))
-#define CHECK_NEAR(a, b, eps)    ok_(fabs((double)(a) - (double)(b)) <= (eps), \
-                                     "%s ~= %s  (%.6f vs %.6f)", #a, #b, (double)(a), (double)(b))
-
-/* ---- common ------------------------------------------------------- */
-
-static void test_utf8(void) {
-    suite("utf8 + rtl");
-    /* decode + re-encode round trip */
-    const char *s = "سلام world";
-    size_t len = strlen(s);
-    size_t pos = 0;
-    int n = 0;
-    while (pos < len) {
-        osa_rune r = 0;
-        int used = osa_utf8_decode(s + pos, len - pos, &r);
-        if (used <= 0) break;
-        pos += (size_t)used;
-        n++;
-    }
-    CHECK_MSG(n == 10 && pos == len, "iterates 10 scalars, consumes the whole string");
-    /* direction is decided per rune; the paragraph direction is the first
-     * strong character, which is what the text layer relies on */
-    CHECK(osa_rune_is_rtl(0x0633));            /* ARABIC LETTER SEEN */
-    CHECK(!osa_rune_is_rtl('A'));
-    CHECK(!osa_rune_is_rtl('0'));
-    CHECK(!osa_rune_is_rtl(' '));
-}
-
-static void test_strings(void) {
-    suite("string helpers");
-    CHECK(osa_streq("a", "a"));
-    CHECK(!osa_streq("a", "A"));
-    CHECK(osa_strieq("HeLLo", "hello"));
-    CHECK(osa_starts("hello world", "hello"));
-    CHECK(!osa_starts("hello", "world"));
-    char buf[8];
-    osa_strlcpy(buf, "a long string", sizeof buf);
-    CHECK_MSG(strlen(buf) == 7, "strlcpy truncates to 7 bytes");
-    CHECK(buf[7] == 0);
-    CHECK(osa_clampf(5.0f, 0.0f, 1.0f) == 1.0f);
-    CHECK(osa_clampf(-5.0f, 0.0f, 1.0f) == 0.0f);
-}
-
-static void test_json(void) {
-    suite("json");
-    osa_arena a;
-    osa_arena_init(&a);
-    const char *raw = "he said \"hi\"\nand left\t!";
-    char *esc = osa_json_escape(&a, raw);
-    CHECK(esc && esc[0] == '"' && esc[strlen(esc) - 1] == '"');
-    CHECK(strstr(esc, "\\\"") != NULL);
-    CHECK(strstr(esc, "\\n") != NULL);
-
-    const char *doc = "{\"name\":\"OpenSpeech\",\"ok\":true,\"n\":42.5}";
-    char name[64];
-    bool b = false;
-    double d = 0;
-    CHECK(osa_json_get_string(doc, "name", name, sizeof name));
-    CHECK_STR_EQ(name, "OpenSpeech");
-    CHECK(osa_json_get_bool(doc, "ok", &b) && b);
-    CHECK(osa_json_get_num(doc, "n", &d));
-    CHECK_NEAR(d, 42.5, 1e-9);
-    osa_arena_free(&a);
-}
-
-static void test_hash(void) {
-    suite("sha256 + base64 + crc32");
-    /* known vector: sha256("abc") */
-    const char *path = "/tmp/osai_test_hash.bin";
-    FILE *f = fopen(path, "wb");
-    CHECK(f != NULL);
-    if (f) { fwrite("abc", 1, 3, f); fclose(f); }
-    char hex[65];
-    uint64_t size = 0;
-    osa_sha256_file(path, hex, &size);
-    CHECK_MSG(size == 3, "hashed 3 bytes");
-    CHECK_STR_EQ(hex, "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad");
-    osa_file_remove(path);
-
-    /* base64 round trip over binary data */
-    uint8_t data[64];
-    for (int i = 0; i < 64; i++) data[i] = (uint8_t)(i * 3);
-    char enc[128];
-    size_t el = osa_base64_encode(data, sizeof data, enc);
-    CHECK(el > 0);
-    uint8_t dec[128];
-    size_t dl = osa_base64_decode(enc, el, dec);
-    CHECK_MSG(dl == sizeof data, "base64 round trip length");
-    CHECK(memcmp(data, dec, sizeof data) == 0);
-
-    /* crc32 of "123456789" is the standard check value */
-    CHECK_MSG(osa_crc32(0, "123456789", 9) == 0xCBF43926u, "crc32 check value");
-}
-
-/* ---- audio -------------------------------------------------------- */
-
-static void test_audio(void) {
-    suite("audio");
-    const int sr = OSAI_SR;
-    const int64_t n = sr;                     /* 1 second */
-    float *samples = (float *)calloc((size_t)n, sizeof(float));
-    CHECK(samples != NULL);
-    if (!samples) return;
-    /* 440 Hz tone */
-    for (int64_t i = 0; i < n; i++)
-        samples[i] = 0.5f * sinf(2.0f * (float)OSAI_PI * 440.0f * (float)i / sr);
-
-    const char *path = "/tmp/osai_test_tone.wav";
-    CHECK(osa_audio_save_wav(path, samples, n, sr));
-
-    osa_audio au;
-    CHECK(osa_audio_load(path, &au, NULL));
-    CHECK_MSG(au.n == n, "loaded %lld samples (expected %lld)", (long long)au.n, (long long)n);
-    CHECK(au.src_rate == sr);
-    CHECK_NEAR(osa_audio_duration_s(&au), 1.0, 0.01);
-
-    /* resampling to 8 kHz must halve the count */
-    float *half = NULL;
-    int64_t half_n = 0;
-    osa_audio_resample(au.samples, au.n, OSAI_SR, &half, &half_n, 8000);
-    CHECK_MSG(half && half_n >= n / 2 - 2 && half_n <= n / 2 + 2,
-              "resample to 8 kHz gives %lld samples", (long long)half_n);
-    free(half);
-
-    /* the tone is well above the noise floor */
-    double energy = 0;
-    for (int64_t i = 0; i < au.n; i++) energy += (double)au.samples[i] * au.samples[i];
-    CHECK_MSG(sqrt(energy / (double)au.n) > 0.2, "tone RMS %.3f",
-              sqrt(energy / (double)au.n));
-    osa_audio_free(&au);
-
-    /* a silent file: VAD must report no speech */
-    float *silence = (float *)calloc((size_t)sr, sizeof(float));
-    const char *sp = "/tmp/osai_test_silence.wav";
-    osa_audio_save_wav(sp, silence, sr, sr);
-    osa_audio sa;
-    if (osa_audio_load(sp, &sa, NULL)) {
-        int nseg = osa_audio_vad(&sa, NULL, 0);
-        CHECK_MSG(nseg == 0, "VAD finds %d segments in silence", nseg);
-        osa_audio_free(&sa);
-    }
-    free(silence);
-    free(samples);
-    osa_file_remove(path);
-    osa_file_remove(sp);
-
-    /* AAC/M4A goes through a platform hook. Where there is no decoder the
-     * answer must be an honest refusal that names the format, not a silent
-     * failure or a crash: the picker offers .m4a on every build. */
-    {
-        const char *fake = "/tmp/osai_test_fake.m4a";
-        CHECK(osa_file_write_atomic(fake, "not really audio", 16));
-        osa_audio m4a;
-        osa_error e;
-        bool ok = osa_audio_load(fake, &m4a, &e);
-#if defined(_WIN32)
-        (void)ok;
-#else
-        CHECK_MSG(!ok, "the headless build has no AAC decoder");
-        CHECK_MSG(e.msg[0] != 0, "the refusal carries a message");
-#endif
-        if (ok) osa_audio_free(&m4a);
-        osa_file_remove(fake);
-    }
-}
-
-/* ---- TTS ---------------------------------------------------------- */
-
-static void test_tts(void) {
-    suite("tts");
-    struct { const char *text, *lang; } cases[] = {
-        { "سلام دنیا", "fa" },
-        { "hello world", "en" },
-        { "فایل صوتی را انتخاب کنید", "fa" },
-    };
-    for (size_t i = 0; i < sizeof cases / sizeof cases[0]; i++) {
-        int64_t n = 0;
-        float *pcm = tts_speak(cases[i].text, cases[i].lang, &n);
-        CHECK_MSG(pcm && n > 0, "\"%s\" produces %lld samples", cases[i].text,
-                  (long long)n);
-        if (!pcm) continue;
-        float peak = 0;
-        double sum = 0;
-        for (int64_t k = 0; k < n; k++) {
-            float v = fabsf(pcm[k]);
-            if (v > peak) peak = v;
-            sum += (double)pcm[k] * pcm[k];
-        }
-        /* Silence is the classic failure mode of this synthesiser: assert on the
-         * energy, not just on the buffer existing. */
-        CHECK_MSG(peak > 0.02f, "  peak %.3f (not silent)", (double)peak);
-        CHECK_MSG(peak <= 1.0f, "  peak %.3f (no clipping)", (double)peak);
-        CHECK_MSG(sum > 0.0, "  non-zero energy");
-        /* longer text must take longer, monotonically */
-        int64_t n2 = 0;
-        char longer[256];
-        snprintf(longer, sizeof longer, "%s %s", cases[i].text, cases[i].text);
-        float *pcm2 = tts_speak(longer, cases[i].lang, &n2);
-        CHECK_MSG(pcm2 && n2 > n, "  repeated text is longer (%lld > %lld)",
-                  (long long)n2, (long long)n);
-        free(pcm2);
-        free(pcm);
-    }
-    /* an empty string must not crash or produce audio */
-    int64_t n = 0;
-    float *pcm = tts_speak("", "fa", &n);
-    CHECK_MSG(n == 0, "empty input produces no samples");
-    free(pcm);
-}
-
-/* ---- translation -------------------------------------------------- */
-
-static void test_mt(void) {
-    suite("translation");
-    osa_error err;
-    mt_model *m = mt_model_builtin(&err);
-    CHECK(m != NULL);
-    if (!m) return;
-
-    struct { const char *in, *out; } cases[] = {
-        /* whole-sentence phrasebook */
-        { "سلام حال شما خوب است", "Hello, how are you?" },
-        { "خداحافظ", "Goodbye" },
-        { "ممنونم", "Thank you" },
-        { "Hello, how are you?", "سلام حال شما خوب است" },
-        { "Thank you", "ممنونم" },
-        { "Good morning", "صبح بخیر" },
-        { "Stop the recording", "ضبط را متوقف کنید" },
-        /* normalisation: punctuation, case, Arabic yeh instead of Persian yeh */
-        { "THANK YOU", "ممنونم" },
-        { "Hello, how are you?", "سلام حال شما خوب است" },
-        { "سلام حال شما خوب است!", "Hello, how are you?" },
-    };
-    for (size_t i = 0; i < sizeof cases / sizeof cases[0]; i++) {
-        mt_result r;
-        bool got = mt_translate(m, cases[i].in, MT_AUTO, &r, &err);
-        CHECK_MSG(got && osa_streq(r.text, cases[i].out), "\"%s\" -> \"%s\" (got \"%s\")",
-                  cases[i].in, cases[i].out, r.text);
-        if (got) {
-            CHECK_MSG(r.confidence > 0.5f, "  confidence %.2f", (double)r.confidence);
-            CHECK_MSG(r.dst_lang != MT_AUTO, "  direction detected");
-        }
-    }
-
-    /* language detection is by script and must be unambiguous */
-    CHECK(mt_detect_lang("hello there") == MT_EN);
-    CHECK(mt_detect_lang("سلام") == MT_FA);
-    CHECK(mt_detect_lang("") == MT_AUTO);
-
-    /* unknown words are kept, not dropped silently */
-    mt_result r;
-    if (mt_translate(m, "کتاب", MT_FA, &r, &err))
-        CHECK_MSG(r.n_pieces >= 1, "unknown Persian word yields %d piece(s)", r.n_pieces);
-
-    /* A sentence with no known words must come back as itself, not as "".
-     * It used to be dropped whenever the source script matched the *target*
-     * script, so "open the door" (EN -> FA) produced an empty string. */
-    if (mt_translate(m, "open the door", MT_AUTO, &r, &err)) {
-        CHECK_MSG(r.text[0] != 0, "untranslatable sentence is not empty (\"%s\")", r.text);
-        CHECK_MSG(strstr(r.text, "door") != NULL, "unknown word kept: \"%s\"", r.text);
-    }
-    /* and a half-known sentence keeps both halves */
-    if (mt_translate(m, "hello world", MT_AUTO, &r, &err)) {
-        CHECK_MSG(strstr(r.text, "سلام") != NULL && strstr(r.text, "world") != NULL,
-                  "mixed known/unknown: \"%s\"", r.text);
-    }
-    /* EN/EM dash are word separators, same as a space */
-    mt_result dash;
-    if (mt_translate(m, "fa–en", MT_AUTO, &dash, &err) &&
-        mt_translate(m, "fa-en", MT_AUTO, &dash, &err))
-        CHECK_MSG(dash.n_pieces == 2, "en dash splits into %d pieces", dash.n_pieces);
-
-    /* empty input is an error, not an empty success */
-    CHECK(!mt_translate(m, "", MT_AUTO, &r, &err));
-
-    /* round trip through the .osmt container */
-    const char *path = "/tmp/osai_test.osmt";
-    CHECK(mt_model_save(m, path, &err));
-    mt_model *m2 = mt_model_load(path, &err);
-    CHECK(m2 != NULL);
-    if (m2) {
-        mt_result a, b;
-        const char *probe = "صبح بخیر";
-        if (mt_translate(m, probe, MT_AUTO, &a, &err) &&
-            mt_translate(m2, probe, MT_AUTO, &b, &err))
-            CHECK_STR_EQ(b.text, a.text);
-        CHECK_STR_EQ(mt_model_backend(m2), "osmt");
-        mt_model_free(m2);
-    }
-    osa_file_remove(path);
-    mt_model_free(m);
-}
-
-/* ---- ASR ---------------------------------------------------------- */
-
-static void test_neural_net(void) {
-    suite("neural network");
-    /* 3 in -> 4 hidden x 2 layers -> 2 out */
-    nn_model *n = nn_create(3, 4, 2, 2, 0);
-    CHECK(n != NULL);
-    if (!n) return;
-    float in[3] = { 0.5f, -0.25f, 1.0f };
-    float out[2] = {0, 0};
-    double s = nn_forward(n, in, out);
-    (void)s;
-    CHECK(out[0] >= 0.0f && out[0] <= 1.0f);
-    CHECK(out[1] >= 0.0f && out[1] <= 1.0f);
-
-    /* the same input twice must give the same output (determinism) */
-    float out2[2] = {0, 0};
-    nn_forward(n, in, out2);
-    CHECK_NEAR(out2[0], out[0], 1e-7);
-    CHECK_NEAR(out2[1], out[1], 1e-7);
-
-    /* save + load round trip */
-    const char *path = "/tmp/osai_test.nn";
-    FILE *f = fopen(path, "wb");
-    CHECK(f != NULL);
-    if (f) {
-        nn_save(n, f);
-        fclose(f);
-        FILE *in_f = fopen(path, "rb");
-        nn_model *n2 = nn_create(3, 4, 2, 2, 0);
-        CHECK(in_f && n2 && nn_load(n2, in_f));
-        if (in_f) fclose(in_f);
-        if (n2) {
-            float out3[2] = {0, 0};
-            nn_forward(n2, in, out3);
-            CHECK_NEAR(out3[0], out[0], 1e-5);
-            CHECK_NEAR(out3[1], out[1], 1e-5);
-            nn_free(n2);
-        }
-    }
-    osa_file_remove(path);
-    nn_free(n);
-}
-
-/* Voice activity detection.
- *
- * The threshold used to be derived from the mean frame energy. When a short
- * word fills its own buffer the mean is speech energy, so `mean * 1.6` landed
- * above the quieter syllables and the segment started mid-word, cutting the
- * first syllable off. Padded silence is what exposed it: whether the VAD fired
- * at all changed with 10 ms of extra padding. These cases pin the behaviour to
- * something monotonic. */
-static void test_vad(void) {
-    suite("vad");
-
-    /* one synthetic word, padded with silence up to 130 ms: the segment must
-     * start at the beginning of the word and keep essentially all of it */
-    const char *word = "انتخاب";
-    int64_t n = 0;
-    float *pcm = tts_speak(word, "fa", &n);
-    CHECK(pcm && n > 0);
-    if (pcm) {
-        float peak = 0;
-        for (int64_t i = 0; i < n; i++) if (fabsf(pcm[i]) > peak) peak = fabsf(pcm[i]);
-        int64_t end = n;
-        while (end > 0 && fabsf(pcm[end - 1]) < peak * 0.02f) end--;
-        CHECK_MSG(end > OSAI_SR / 4, "speech is %lld samples", (long long)end);
-
-        int64_t cap = end + 4096;
-        float *padded = (float *)calloc((size_t)cap, sizeof(float));
-        CHECK(padded != NULL);
-        if (padded) {
-            memcpy(padded, pcm, (size_t)end * sizeof(float));
-            int bad_start = 0, missed = 0;
-            for (int pad = 0; pad <= 2080; pad += 160) {   /* 0 .. 130 ms */
-                osa_audio a;
-                osa_audio_init(&a);
-                a.samples = padded;
-                a.n = end + pad;
-                osa_segment segs[8];
-                int ns = osa_audio_vad(&a, segs, 8);
-                if (ns <= 0) { missed++; continue; }
-                /* 30 ms of slack: the VAD pads 120 ms before the onset */
-                if (segs[0].start > 0.030f) bad_start++;
-            }
-            CHECK_MSG(missed == 0, "VAD found speech at every pad (%d missed)", missed);
-            CHECK_MSG(bad_start == 0, "VAD starts at the word, not mid-word (%d bad)", bad_start);
-            free(padded);
-        }
-        free(pcm);
-    }
-
-    /* digital silence must produce no segments at all */
-    float *sil = (float *)calloc((size_t)OSAI_SR, sizeof(float));
-    CHECK(sil != NULL);
-    if (sil) {
-        osa_audio a;
-        osa_audio_init(&a);
-        a.samples = sil;
-        a.n = OSAI_SR;
-        osa_segment segs[8];
-        CHECK_MSG(osa_audio_vad(&a, segs, 8) == 0, "silence yields no segments");
-        free(sil);
-    }
-}
-
-static void test_asr(void) {
-    suite("asr");
-    osa_error err;
-    asr_model *m = asr_model_fixture("fa", &err);
-    CHECK(m != NULL);
-    if (!m) return;
-    CHECK_MSG(strlen(asr_model_id(m)) > 0, "model id: %s", asr_model_id(m));
-    CHECK_MSG(osa_starts(asr_model_id(m), "builtin-asr-"), "id is stable");
-    CHECK_MSG(strlen(asr_model_backend(m)) > 0, "backend: %s", asr_model_backend(m));
-    CHECK_MSG(osa_streq(asr_model_language(m), "fa"), "language: %s", asr_model_language(m));
-
-    /* Transcribe synthetic speech that this project's own TTS produced. The
-     * test asserts on the *shape* of the result (non-empty, plausible
-     * confidence, monotonic timing) rather than an exact string: the decoder
-     * is an exemplar matcher and small template changes legitimately move the
-     * output, which would make an exact assertion flaky. Accuracy is measured
-     * separately by the WER harness. */
-    const char *phrase = "فایل صوتی را انتخاب کنید";
-    int64_t n = 0;
-    float *pcm = tts_speak(phrase, "fa", &n);
-    CHECK(pcm && n > 0);
-    if (!pcm) { asr_model_free(m); return; }
-
-    asr_result r;
-    bool got = asr_transcribe_samples(m, pcm, n, "fa", &r, &err);
-    CHECK_MSG(got, "transcribe synthetic speech");
-    if (got) {
-        CHECK_MSG(r.text[0] != 0, "transcript: \"%s\"", r.text);
-        CHECK_MSG(r.confidence > 0.05f && r.confidence <= 1.0f,
-                  "confidence %.2f in range", (double)r.confidence);
-        CHECK_MSG(r.proc_ms > 0.0, "took %.1f ms", r.proc_ms);
-        CHECK_MSG(r.duration_s > 1.0, "audio is %.2f s", r.duration_s);
-        /* most words should be recovered; exact equality is not required */
-        double wer = asr_wer(phrase, r.text, "fa");
-        CHECK_MSG(wer < 0.75, "WER on TTS audio %.2f", wer);
-        free(r.segments);            /* owned by the caller */
-        r.segments = NULL;
-    }
-
-    /* silence must not produce confident speech */
-    float *sil = (float *)calloc((size_t)OSAI_SR, sizeof(float));
-    if (sil) {
-        asr_result s;
-        if (asr_transcribe_samples(m, sil, OSAI_SR, "fa", &s, &err)) {
-            CHECK_MSG(s.text[0] == 0 || s.confidence < 0.3f,
-                      "silence gives no confident text (\"%s\", %.2f)",
-                      s.text, (double)s.confidence);
-            free(s.segments);
-        }
-        free(sil);
-    }
-
-    /* Templates longer than 64 frames must be decodable.
-     *
-     * They used to be skipped by the candidate sweep (it only read the
-     * transposed cache, which holds 64 rows), so any word of more than about
-     * 0.6 s could never win a span: "recording" came back as "weather this".
-     * Assert on the long words specifically, in English, where the longest
-     * lexicon entries live. */
-    {
-        osa_error e2 = {0};
-        asr_model *en = asr_model_fixture("en", &e2);
-        CHECK(en != NULL);
-        if (en) {
-            static const char *long_words[] = { "recording", "recognition", "translation" };
-            for (size_t i = 0; i < sizeof long_words / sizeof long_words[0]; i++) {
-                int64_t n2 = 0;
-                float *p2 = tts_speak(long_words[i], "en", &n2);
-                if (!p2) { CHECK_MSG(false, "tts for %s", long_words[i]); continue; }
-                asr_result rr;
-                if (asr_transcribe_samples(en, p2, n2, "en", &rr, NULL)) {
-                    CHECK_MSG(osa_streq(rr.text, long_words[i]),
-                              "long template '%s' decoded as '%s'", long_words[i], rr.text);
-                    free(rr.segments);
-                } else {
-                    CHECK_MSG(false, "long template '%s' failed to decode", long_words[i]);
-                }
-                free(p2);
-            }
-
-            /* A model with one language's lexicon must refuse another language
-             * instead of answering with confident nonsense. */
-            int64_t n3 = 0;
-            float *p3 = tts_speak("hello world", "en", &n3);
-            if (p3) {
-                asr_result rr;
-                osa_error er = {0};
-                bool ok = asr_transcribe_samples(m, p3, n3, "en", &rr, &er);
-                CHECK_MSG(!ok && er.msg[0], "foreign language is refused: %s", er.msg);
-                if (ok) free(rr.segments);
-                free(p3);
-            }
-            asr_model_free(en);
-        }
-    }
-
-    /* edit distance helpers */
-    CHECK_NEAR(asr_wer("a b c", "a b c", "en"), 0.0, 1e-9);
-    CHECK_NEAR(asr_wer("a b c", "a x c", "en"), 1.0 / 3.0, 1e-9);
-    CHECK_NEAR(asr_wer("a b", "a b c d", "en"), 1.0, 1e-9);
-    CHECK_NEAR(asr_cer("abc", "abc"), 0.0, 1e-9);
-
-    free(pcm);
-    asr_model_free(m);
-}
-
-/* ---- store -------------------------------------------------------- */
-
-static void test_store(void) {
-    suite("database");
-    char dbpath[OSAI_MAX_PATH];
-    snprintf(dbpath, sizeof dbpath, "/tmp/osai_test_%d.db", (int)getpid());
-    osa_file_remove(dbpath);
-    osa_error err;
-    osa_db *db = osa_db_open(dbpath, &err);
-    CHECK(db != NULL);
-    if (!db) return;
-
-    osa_transcription t;
-    memset(&t, 0, sizeof t);
-    osa_strlcpy(t.id, "t-1", sizeof t.id);
-    osa_strlcpy(t.text, "سلام", sizeof t.text);
-    osa_strlcpy(t.language, "fa", sizeof t.language);
-    osa_strlcpy(t.model_id, "builtin-asr-fa", sizeof t.model_id);
-    osa_strlcpy(t.source, "file", sizeof t.source);
-    osa_strlcpy(t.status, "ok", sizeof t.status);
-    t.confidence = 0.9;
-    t.duration_ms = 1000;
-    t.proc_ms = 200;
-    CHECK_MSG(osa_store_transcription_add(db, &t, &err), "insert transcript");
-
-    osa_rs rs;
-    CHECK(osa_store_transcription_list(db, &rs, 10, NULL, &err));
-    CHECK_MSG(rs.nrows == 1, "one row in the list");
-    if (rs.nrows == 1) {
-        const char *txt = osa_rs_val(&rs, 0, "text");
-        CHECK_MSG(txt && osa_streq(txt, "سلام"), "text round trips");
-    }
-    osa_rs_free(&rs);
-
-    /* delete removes it */
-    CHECK(osa_store_transcription_delete(db, "t-1", &err));
-    CHECK(osa_store_transcription_list(db, &rs, 10, NULL, &err));
-    CHECK_MSG(rs.nrows == 0, "row removed");
-    osa_rs_free(&rs);
-
-    /* model add + activate semantics */
-    osa_model m;
-    memset(&m, 0, sizeof m);
-    osa_strlcpy(m.id, "test-model", sizeof m.id);
-    osa_strlcpy(m.name, "Test model", sizeof m.name);
-    osa_strlcpy(m.kind, "asr", sizeof m.kind);
-    osa_strlcpy(m.engine, "exemplar", sizeof m.engine);
-    osa_strlcpy(m.version, "1.0.0", sizeof m.version);
-    osa_strlcpy(m.sha256, "00", sizeof m.sha256);
-    m.size_bytes = 1234;
-    CHECK(osa_store_model_add(db, &m, &err));
-    CHECK_MSG(osa_store_model_set_active(db, "test-model", &err), "activate model");
-    osa_rs mrs;
-    CHECK(osa_store_model_list(db, &mrs, NULL, &err));
-    CHECK_MSG(mrs.nrows == 1, "one model registered");
-    osa_rs_free(&mrs);
-
-    osa_db_close(db);
-    osa_file_remove(dbpath);
-}
-
-/* ---- app layer ---------------------------------------------------- */
-
-static void test_app(void) {
-    suite("application api");
-    osa_error err;
-    osa_app *app = osa_app_create(&err);
-    CHECK(app != NULL);
-    if (!app) return;
-
-    osa_app_status st;
-    osa_app_get_status(app, &st);
+static void test_catalog_and_gate(void){
+    suite("fresh install / catalog / gating");
+    use_temp_root("gate");
+    osa_error err; osa_app *app=osa_app_create(&err);
+    CHECK_MSG(app!=NULL,"app create: %s",app?"ok":err.msg);
+    if(!app){clean_root();return;}
+    osa_app_status st; osa_app_get_status(app,&st);
     CHECK(st.db_ready);
-    CHECK(st.asr_ready);
-    CHECK(st.mt_ready);
-    CHECK_MSG(st.n_models >= 2, "%d models registered", st.n_models);
-    CHECK_MSG(st.data_root[0] == '/', "data root: %s", st.data_root);
-
-    /* translate persists a row */
-    osa_app_translation mt;
-    CHECK(osa_app_translate(app, "ممنون", NULL, &mt, &err));
-    CHECK_STR_EQ(mt.text, "Thanks");
-    CHECK_MSG(mt.id[0] != 0, "translation has a row id");
-
-    /* transcribe + translate end to end, using this project's TTS as input */
-    int64_t n = 0;
-    float *pcm = tts_speak("فایل صوتی را انتخاب کنید", "fa", &n);
-    char wav[OSAI_MAX_PATH];
-    snprintf(wav, sizeof wav, "/tmp/osai_test_app.wav");
-    CHECK(pcm && osa_audio_save_wav(wav, pcm, n, OSAI_SR));
-    free(pcm);
-
-    osa_app_transcript tr;
-    bool got = osa_app_transcribe_and_translate(app, wav, &tr, &mt, &err);
-    CHECK(got);
-    if (got) {
-        CHECK_MSG(tr.text[0] != 0, "transcript: %s", tr.text);
-        CHECK_MSG(tr.language[0] != 0, "language: %s", tr.language);
-        CHECK_MSG(tr.id[0] != 0, "transcript row id assigned");
-        CHECK_MSG(tr.rtf > 0.0 && tr.rtf < 1.0, "real-time factor %.2f", tr.rtf);
-        CHECK_MSG(mt.text[0] != 0, "translation: %s", mt.text);
+    CHECK_MSG(st.n_models==0,"fresh install has zero installed models (got %d)",st.n_models);
+    CHECK(!st.asr_ready&&!st.mt_ready&&!st.lid_ready);
+    CHECK(!osa_app_ready(app));
+    osa_pack_info packs[32]; int np=osa_app_packs(app,packs,32);
+    int asr=0,mt=0,lid=0,light_asr=0,light_mt=0,light_lid=0;
+    bool all_verified=true,ram_stated=true;
+    for(int i=0;i<np;i++){
+        if(osa_streq(packs[i].kind,"asr")){asr++;if(packs[i].min_ram_mb<=1000)light_asr++;}
+        if(osa_streq(packs[i].kind,"mt")){mt++;if(packs[i].min_ram_mb<=1200)light_mt++;}
+        if(osa_streq(packs[i].kind,"lang")){lid++;if(packs[i].min_ram_mb<=1000)light_lid++;}
+        if(!packs[i].url[0]||strlen(packs[i].sha256)!=64||packs[i].size_mb<=0)all_verified=false;
+        if(!osa_starts(packs[i].url,"https://"))all_verified=false;
+        if(packs[i].min_ram_mb<=0||packs[i].min_ram_mb>16384)ram_stated=false;
+        CHECK_MSG(!packs[i].installed,"catalog %s is not installed on fresh state",packs[i].id);
     }
+    CHECK_MSG(np>=6&&asr>=2&&mt>=2&&lid>=4,"catalog offers a choice in every category (asr=%d mt=%d lid=%d)",asr,mt,lid);
+    CHECK_MSG(light_asr>=2&&light_mt>=1&&light_lid>=2,
+              "each category has light models for low-memory PCs (asr=%d mt=%d lid=%d)",
+              light_asr,light_mt,light_lid);
+    CHECK(all_verified); CHECK_MSG(ram_stated,"every pack states its RAM requirement");
+    osa_app_translation tr; CHECK(!osa_app_translate(app,"سلام","fa",&tr,&err));
+    osa_app_transcript ts; CHECK(!osa_app_transcribe_file(app,"/nonexistent.wav",&ts,&err));
+    CHECK(!osa_app_install_builtin_pack(app,"anything",&err));
+    CHECK(!osa_app_set_languages(app,"xx","zz",&err));
+    osa_app_destroy(app); clean_root();
+}
 
-    /* history reflects it */
-    char *hist = osa_app_history_json(app, 100, NULL);
-    CHECK(hist && strstr(hist, "\"text\""));
-    CHECK(hist && strstr(hist, "confidence"));
-    free(hist);
+static void test_store_active(void){
+    suite("atomic single-active model store");
+    use_temp_root("store");
+    char dbpath[512]; snprintf(dbpath,sizeof dbpath,"%s/test.db",g_root);
+    osa_error err; osa_db *db=osa_db_open(dbpath,&err);
+    CHECK(db&&osa_db_migrate(db,&err));
+    if(!db){clean_root();return;}
+    osa_model m={0}; osa_strlcpy(m.kind,"asr",sizeof m.kind); osa_strlcpy(m.engine,"whisper",sizeof m.engine);
+    osa_strlcpy(m.id,"a",sizeof m.id); osa_strlcpy(m.path,"/a",sizeof m.path); osa_strlcpy(m.status,"ready",sizeof m.status);
+    CHECK(osa_store_model_add(db,&m,&err));
+    osa_strlcpy(m.id,"b",sizeof m.id); osa_strlcpy(m.path,"/b",sizeof m.path);
+    CHECK(osa_store_model_add(db,&m,&err));
+    CHECK(osa_store_model_set_active(db,"a",&err));
+    osa_rs rs; CHECK(osa_sql_query(db,"SELECT COUNT(*) AS n FROM Models WHERE kind='asr' AND active=1",&rs,&err));
+    CHECK_MSG(osa_rs_int(&rs,0,"n")==1,"exactly one active ASR after first activation"); osa_rs_free(&rs);
+    CHECK(osa_store_model_set_active(db,"b",&err));
+    CHECK(osa_sql_query(db,"SELECT COUNT(*) AS n FROM Models WHERE kind='asr' AND active=1",&rs,&err));
+    CHECK_MSG(osa_rs_int(&rs,0,"n")==1,"exactly one active ASR after switching"); osa_rs_free(&rs);
+    CHECK(osa_sql_query(db,"SELECT id FROM Models WHERE kind='asr' AND active=1",&rs,&err));
+    CHECK_STR(osa_rs_val(&rs,0,"id"),"b"); osa_rs_free(&rs);
+    CHECK(!osa_store_model_set_active(db,"missing",&err));
+    CHECK(osa_sql_query(db,"SELECT id FROM Models WHERE kind='asr' AND active=1",&rs,&err));
+    CHECK_MSG(osa_rs_val(&rs,0,"id")&&osa_streq(osa_rs_val(&rs,0,"id"),"b"),"failed activation preserves previous active"); osa_rs_free(&rs);
+    /* re-registering an active model must not silently deactivate it */
+    osa_strlcpy(m.id,"b",sizeof m.id); CHECK(osa_store_model_add(db,&m,&err));
+    CHECK(osa_sql_query(db,"SELECT COUNT(*) AS n FROM Models WHERE kind='asr' AND active=1",&rs,&err));
+    CHECK(osa_rs_int(&rs,0,"n")==1); osa_rs_free(&rs);
+    osa_db_close(db); clean_root();
+}
 
-    /* models JSON is well formed and marks one active per kind */
-    char *models = osa_app_models_json(app, NULL);
-    CHECK(models && strstr(models, "\"active\":true"));
-    free(models);
+static void test_long_history(void){
+    suite("long transcript persistence");
+    use_temp_root("hist");
+    char dbpath[512]; snprintf(dbpath,sizeof dbpath,"%s/test.db",g_root);
+    osa_error err; osa_db *db=osa_db_open(dbpath,&err); CHECK(db&&osa_db_migrate(db,&err));
+    if(!db){clean_root();return;}
+    osa_transcription t={0}; osa_strlcpy(t.id,"long",sizeof t.id); osa_strlcpy(t.language,"fa",sizeof t.language);
+    osa_strlcpy(t.source,"file",sizeof t.source); osa_strlcpy(t.status,"done",sizeof t.status);
+    memset(t.text,'x',20000); t.text[20000]=0; t.duration_ms=1234;
+    CHECK(osa_store_transcription_add(db,&t,&err));
+    osa_rs rs; CHECK(osa_store_transcription_list(db,&rs,10,NULL,&err));
+    CHECK_MSG(rs.nrows==1&&strlen(osa_rs_val(&rs,0,"text"))==20000,"20k transcript survives DB round trip");
+    CHECK_MSG(osa_rs_i64(&rs,0,"duration_ms")==1234,"duration_ms survives DB round trip");
+    osa_rs_free(&rs); osa_db_close(db); clean_root();
+}
 
-    /* evaluation runs and reports WER */
-    char *eval = osa_app_evaluate(app, NULL);
-    CHECK(eval && strstr(eval, "\"wer\""));
-    CHECK(eval && strstr(eval, "\"languages\""));
-    free(eval);
+static void test_audio_wav(void){
+    suite("audio wav round trip");
+    use_temp_root("audio");
+    char path[512]; snprintf(path,sizeof path,"%s/tone.wav",g_root);
+    enum{N=1600}; float pcm[N]; for(int i=0;i<N;i++)pcm[i]=0.2f*sinf(2.0f*3.14159265f*440.0f*i/16000.0f);
+    CHECK(osa_audio_save_wav(path,pcm,N,16000));
+    osa_audio a; osa_error err; CHECK(osa_audio_load(path,&a,&err));
+    CHECK_MSG(a.n==N&&a.src_rate==16000,"decoded %lld frames @ %d Hz",(long long)a.n,a.src_rate);
+    osa_audio_free(&a); clean_root();
+}
 
-    /* delete removes the transcript and its copied audio */
-    if (got) {
-        CHECK(osa_app_delete_transcript(app, tr.id, &err));
-        hist = osa_app_history_json(app, 100, NULL);
-        CHECK(hist && !strstr(hist, tr.id));
-        free(hist);
-    }
-
-    /* training produces a new version, activates it, and keeps the old one */
-    {
-        osa_train_result tr2;
-        osa_error te = {0};
-        if (osa_app_train(app, NULL, 1, &tr2, &te)) {
-            CHECK_MSG(tr2.model_id[0] != 0, "trained version: %s", tr2.model_id);
-            CHECK_MSG(tr2.n_added > 0, "%d exemplars added", tr2.n_added);
-            CHECK_MSG(tr2.activated, "the trained version is active");
-            osa_app_status st2;
-            osa_app_get_status(app, &st2);
-            char *mj = osa_app_models_json(app, NULL);
-            CHECK(mj && strstr(mj, "builtin-asr-fa"));
-            CHECK(mj && strstr(mj, tr2.model_id));
-            free(mj);
-            /* roll back to the builtin so later assertions see a known model */
-            CHECK(osa_app_activate_model(app, "builtin-asr-fa", NULL));
-            osa_file_remove(tr2.model_path);
-        } else {
-            CHECK_MSG(false, "training failed: %s", te.msg);
-        }
-    }
-
-    /* importing a bogus file fails cleanly instead of crashing */
-    const char *bogus = "/tmp/osai_test_bogus.osam";
-    FILE *f = fopen(bogus, "wb");
-    if (f) { fwrite("not a model", 1, 11, f); fclose(f); }
-    char id[40];
-    CHECK(!osa_app_import_model(app, bogus, id, sizeof id, &err));
-    CHECK_MSG(err.msg[0] != 0, "error message: %s", err.msg);
-    osa_file_remove(bogus);
-
-    /* a real container must import: the picker hands us a .osam path, and an
-     * extension comparison that included the dot used to reject every one. */
-    {
-        osa_error ie = {0};
-        asr_model *tmpm = asr_model_fixture("fa", &ie);
-        CHECK(tmpm != NULL);
-        if (tmpm) {
-            char tmpath[OSAI_MAX_PATH];
-            snprintf(tmpath, sizeof tmpath, "%s/osai_test_import.osam", osa_path(OSAI_DIR_MODELS));
-            if (asr_model_save(tmpm, tmpath, &ie)) {
-                char iid[64] = "";
-                bool imported = osa_app_import_model(app, tmpath, iid, sizeof iid, &ie);
-                CHECK_MSG(imported, "import a real .osam: %s", ie.msg);
-                if (imported) {
-                    CHECK_MSG(iid[0] != 0, "imported id: %s", iid);
-                    char *mj2 = osa_app_models_json(app, NULL);
-                    CHECK(mj2 && strstr(mj2, iid));
-                    free(mj2);
+/* The exact regression from the field: the app logged a correct Windows path,
+ * but the child received C:UsersAdministratorDesktopNew folderdataModels...
+ * because the command-line builder counted backslashes before ordinary letters
+ * and then dropped them. Quote construction is portable so this test runs on
+ * Linux too; a reference MSVCRT parser checks the round trip. */
+static int msvcrt_parse(const char *s, char out[][1024], int max){
+    int argc=0; const char *p=s;
+    while(*p && argc<max){
+        while(*p==' '||*p=='\t')p++;
+        if(!*p)break;
+        char *dst=out[argc]; size_t n=0; bool inq=false;
+        while(*p){
+            if(*p=='\\'){
+                size_t bs=0; while(*p=='\\'){bs++;p++;}
+                if(*p=='"'){
+                    for(size_t i=0;i<bs/2;i++)dst[n++]='\\';
+                    if(bs%2)dst[n++]='"'; else inq=!inq;
+                    p++;
+                }else{
+                    for(size_t i=0;i<bs;i++)dst[n++]='\\';
                 }
-                osa_file_remove(tmpath);
+            }else if(*p=='"'){inq=!inq;p++;}
+            else if(!inq && (*p==' '||*p=='\t'))break;
+            else dst[n++]=*p++;
+            if(n>=1023)break;
+        }
+        dst[n]=0; argc++;
+    }
+    return argc;
+}
+static void test_process_quoting(void){
+    suite("Windows argv quoting (backslashes / spaces / Persian)");
+    const char *user_argv[]={
+        "C:\\Users\\Administrator\\Desktop\\New folder\\data\\Cache\\OpenSpeechWorker.exe",
+        "--kind","lang","--model",
+        "C:\\Users\\Administrator\\Desktop\\New folder\\data\\Models\\glotlid-small.bin",
+        "--threads","2",NULL};
+    osa_error err; osa_err_ok(&err);
+    char *cmd=osa_process_quote_argv(user_argv,&err);
+    CHECK_MSG(cmd!=NULL,"quote builder succeeds: %s",cmd?"ok":err.msg);
+    if(cmd){
+        const char *want=
+            "\"C:\\Users\\Administrator\\Desktop\\New folder\\data\\Cache\\OpenSpeechWorker.exe\""
+            " \"--kind\" \"lang\" \"--model\""
+            " \"C:\\Users\\Administrator\\Desktop\\New folder\\data\\Models\\glotlid-small.bin\""
+            " \"--threads\" \"2\"";
+        CHECK_STR(cmd,want);
+        char got[16][1024]; int n=msvcrt_parse(cmd,got,16);
+        CHECK_MSG(n==7,"the quoted line parses back to 7 arguments (got %d)",n);
+        bool same=n==7;
+        for(int i=0;same&&user_argv[i];i++)same=osa_streq(got[i],user_argv[i]);
+        CHECK_MSG(same,"every argument survives quoting, especially the model path");
+        free(cmd);
+    }
+    const char *cases[][4]={
+        {"exe","C:\\Users\\بهنام\\Desktop\\پوشه جدید\\data\\Models\\glotlid-small.bin",NULL},
+        {"exe","C:\\folder with space\\trailing\\",NULL},
+        {"exe","a\"b\\c","a\\\"b",NULL},
+        {"exe","a\\","a\\\\",NULL},
+        {"exe",""," space ",NULL},
+        {"C:\\Program Files\\OpenSpeech AI\\OpenSpeechWorker.exe","--model","C:\\مدل ها\\z.bin",NULL},
+    };
+    for(size_t k=0;k<sizeof cases/sizeof cases[0];k++){
+        char *q=osa_process_quote_argv(cases[k],&err);
+        CHECK_MSG(q!=NULL,"case %zu quotes",(size_t)k);
+        if(!q)continue;
+        char got[4][1024]; int n=msvcrt_parse(q,got,4);
+        int want=0; while(cases[k][want])want++;
+        bool same=n==want;
+        for(int i=0;same&&i<want;i++)same=osa_streq(got[i],cases[k][i]);
+        CHECK_MSG(same,"case %zu round-trips through MSVCRT rules",(size_t)k);
+        free(q);
+    }
+    CHECK(osa_process_quote_argv(NULL,&err)==NULL);
+    const char *empty[]={NULL};
+    CHECK(osa_process_quote_argv(empty,&err)==NULL);
+}
+
+static void test_worker_isolation(void){
+    suite("worker isolation / invalid model");
+    char exe[512]; snprintf(exe,sizeof exe,"build/OpenSpeechWorker");
+    if(!osa_file_exists(exe)){printf("  SKIP worker binary not built (%s)\n",exe);return;}
+    const char *argv[]={exe,"--kind","mt","--model","/nonexistent/model.gguf",NULL};
+    osa_error err; osa_process *p=osa_process_start(argv,&err);
+    CHECK_MSG(p!=NULL,"worker starts: %s",p?"ok":err.msg);
+    if(!p)return;
+    char *line=NULL; bool got=osa_process_line(p,10000,NULL,&line,&err);
+    CHECK_MSG(got&&line&&strstr(line,"\"ok\":false"),"invalid model returns JSON error, not ready");
+    osa_process_stop(p);
+}
+
+static void test_shell_gate(void){
+    suite("shell gating on fresh install");
+    use_temp_root("shell");
+    osa_error err; osa_app *app=osa_app_create(&err); CHECK(app!=NULL);
+    if(!app){clean_root();return;}
+    static shell_state sh; shell_init(&sh,app);
+    for(int i=0;i<200&&sh.restoring;i++){shell_job_tick(&sh);osa_sleep_ms(5);}
+    CHECK(!sh.restoring);
+    CHECK(!sh.models_ready);
+    CHECK(!shell_select_audio(&sh,"/tmp/x.wav"));
+    CHECK(!shell_run_transcribe(&sh));
+    osa_strlcpy(sh.tr_in,"سلام",sizeof sh.tr_in);
+    shell_run_translate(&sh); CHECK(!sh.job);
+    shell_shutdown(&sh); osa_app_destroy(app); clean_root();
+}
+
+/* The real worker, a real (synthetic) fastText file, a real round trip. This is
+ * the test that would have caught the child inheriting a non-inheritable stdin:
+ * the handshake succeeded and every request afterwards failed. */
+static void test_worker_protocol(void){
+    suite("worker protocol (real process)");
+    const char *exe="build/OpenSpeechWorker", *model="build/test-lid.bin";
+    if(!osa_file_exists(exe)||!osa_file_exists(model)){
+        printf("  SKIP worker or fixture missing (run make tests)\n");return;
+    }
+    osa_error err;osa_err_ok(&err);
+    const char *argv[]={exe,"--kind","lang","--model",model,"--threads","1",NULL};
+    osa_process *p=osa_process_start(argv,&err);
+    CHECK_MSG(p!=NULL,"worker starts: %s",p?"ok":err.msg);
+    if(!p)return;
+    char *line=NULL;
+    bool got=osa_process_line(p,20000,NULL,&line,&err);
+    CHECK_MSG(got,"ready line arrives: %s",got?"ok":err.msg);
+    if(got){
+        bool ok=false;char event[32]={0},kind[16]={0};
+        osa_json_get_bool(line,"ok",&ok);
+        osa_json_get_string(line,"event",event,sizeof event);
+        osa_json_get_string(line,"kind",kind,sizeof kind);
+        CHECK(ok);CHECK_STR(event,"ready");CHECK_STR(kind,"lang");
+        CHECK_MSG(strstr(line,"\"en\"")!=NULL,"the label list is populated (nwords+nlabels)");
+        free(line);line=NULL;
+    }
+    /* two requests over the same pipe: stdin must still be open after ready */
+    const char *reqs[]={"{\"op\":\"detect\",\"text\":\"hello world\"}",
+                        "{\"op\":\"detect\",\"text\":\"سلام دنیا\"}"};
+    const char *want[]={"en","fa"};
+    for(int i=0;i<2;i++){
+        CHECK(osa_process_write(p,reqs[i],&err));
+        got=osa_process_line(p,20000,NULL,&line,&err);
+        CHECK_MSG(got,"reply %d arrives: %s",i+1,got?"ok":err.msg);
+        if(got){char code[8]={0};osa_json_get_string(line,"language",code,sizeof code);
+            CHECK_STR(code,want[i]);free(line);line=NULL;}
+    }
+    osa_process_write(p,"{\"op\":\"shutdown\"}",&err);
+    osa_process_stop(p);
+
+    /* GlotLID / FLORES labels ("pes_Arab") must arrive as the two-letter code
+     * the translator and Whisper use. */
+    if(osa_file_exists("build/test-lid-flores.bin")){
+        const char *fa[]={exe,"--kind","lang","--model","build/test-lid-flores.bin","--threads","1",NULL};
+        osa_process *f=osa_process_start(fa,&err);
+        CHECK_MSG(f!=NULL,"FLORES-label worker starts");
+        if(f){
+            line=NULL;
+            if(osa_process_line(f,20000,NULL,&line,&err)){
+                CHECK_MSG(strstr(line,"\"fa\"")!=NULL,"labels are normalised in the ready list");
+                free(line);line=NULL;
             }
-            asr_model_free(tmpm);
+            osa_process_write(f,"{\"op\":\"detect\",\"text\":\"سلام دنیا\"}",&err);
+            if(osa_process_line(f,20000,NULL,&line,&err)){
+                char code[16]={0};osa_json_get_string(line,"language",code,sizeof code);
+                CHECK_STR(code,"fa");free(line);line=NULL;
+            }else CHECK_MSG(false,"FLORES detect answered");
+            osa_process_stop(f);
         }
     }
-    osa_file_remove(wav);
 
-    /* ---- packs are built offline, and installing one changes the engine ----
-     * The Models screen's rows used to be dead labels: every entry needed a file
-     * the user had to find by hand. A catalogue entry must now have a working
-     * offline install that actually alters translation output. */
+    /* The worker must receive the path verbatim. On POSIX a backslash is an
+     * ordinary filename character, so this file exercises spaces, Persian and
+     * literal backslashes in one real load + detect round trip. */
     {
-        suite("catalogue");
-        static osa_pack_info packs[32];
-        int np = osa_app_packs(app, packs, 32);
-        CHECK_MSG(np > 0, "catalogue entries: %d", np);
-        int offline = 0, downloads = 0, installed = 0;
-        for (int i = 0; i < np; i++) {
-            if (packs[i].installable) offline++;
-            else if (packs[i].url[0]) downloads++;
-            if (packs[i].installed) installed++;
-            CHECK_MSG(packs[i].id[0] && packs[i].name[0] && packs[i].license[0],
-                      "entry %d is complete", i);
-        }
-        /* Two kinds of offer, and nothing else: built here (offline) or
-         * downloaded by URL. A third kind that means "go and find a file" is
-         * what the Models screen used to be full of. */
-        CHECK_MSG(offline + downloads == np, "%d offline + %d downloads == %d rows",
-                  offline, downloads, np);
-        CHECK_MSG(offline >= 12, "offline-installable entries: %d", offline);
-        CHECK_MSG(downloads >= 4, "downloadable entries: %d", downloads);
-        CHECK_MSG(installed >= 2, "already installed: %d", installed);
-
-        const char *src = "بیمار در بیمارستان";
-        osa_app_translation tr_a, tr_b;
-        memset(&tr_a, 0, sizeof tr_a);
-        osa_app_translate(app, src, "", &tr_a, NULL);
-        CHECK_MSG(tr_a.text[0] != 0, "translation before the pack: %s", tr_a.text);
-
-        osa_error pe = {0};
-        bool ok = osa_app_install_builtin_pack(app, "lang-pack-medical", &pe);
-        CHECK_MSG(ok, "install the medical pack: %s", pe.msg);
-        /* the file is a real, inspectable artifact in the data folder */
-        char ppath[OSAI_MAX_PATH];
-        osa_path_join(ppath, sizeof ppath, osa_path(OSAI_DIR_PACKS), "lang-pack-medical.words.tsv");
-        CHECK_MSG(osa_file_exists(ppath), "pack file written: %s", ppath);
-        /* and the engine now knows the words */
-        memset(&tr_b, 0, sizeof tr_b);
-        osa_app_translate(app, src, "", &tr_b, NULL);
-        CHECK_MSG(strstr(tr_b.text, "patient") != NULL,
-                  "pack translated the word: %s -> %s", tr_a.text, tr_b.text);
-        /* it is listed as installed from then on */
-        osa_pack_info again[32];
-        int np2 = osa_app_packs(app, again, 32);
-        bool seen = false;
-        for (int i = 0; i < np2; i++)
-            if (osa_streq(again[i].id, "lang-pack-medical")) seen = again[i].installed;
-        CHECK(seen);
-        /* an entry whose material is not in the binary refuses, with a reason */
-        osa_error re = {0};
-        CHECK(!osa_app_install_builtin_pack(app, "ggml-tiny", &re));
-        CHECK_MSG(re.msg[0] != 0, "refusal reason: %s", re.msg);
-        CHECK(!osa_app_install_builtin_pack(app, "no-such-pack", &re));
+        const char *dir="build/worker path test";
+        const char *name="C:\\Users\\Administrator\\Desktop\\New folder\\data\\Models\\glotlid-small.bin";
+        char path[700]; snprintf(path,sizeof path,"%s/%s",dir,name);
+        osa_mkdirs(dir);
+        osa_buf fixture; osa_buf_init(&fixture);
+        if(osa_file_read(model,&fixture)){
+            CHECK(osa_file_write(path,fixture.data,fixture.len));
+            const char *ha[]={exe,"--kind","lang","--model",path,"--threads","1",NULL};
+            osa_process *h=osa_process_start(ha,&err);
+            CHECK_MSG(h!=NULL,"worker starts with a spaces/Persian/backslash path: %s",h?"ok":err.msg);
+            if(h){
+                line=NULL;
+                bool r=osa_process_line(h,20000,NULL,&line,&err);
+                CHECK_MSG(r,"hostile-path ready line arrives: %s",r?"ok":err.msg);
+                if(r){free(line);line=NULL;}
+                osa_process_write(h,"{\"op\":\"detect\",\"text\":\"سلام دنیا\"}",&err);
+                r=osa_process_line(h,20000,NULL,&line,&err);
+                if(r){char code[16]={0};osa_json_get_string(line,"language",code,sizeof code);
+                    CHECK_STR(code,"fa");free(line);line=NULL;}
+                else CHECK_MSG(false,"hostile-path detect answered");
+                osa_process_stop(h);
+            }
+            osa_file_remove(path);
+        }else CHECK_MSG(false,"read LID fixture for hostile-path test");
+        osa_buf_free(&fixture);
+        osa_dir_remove_recursive(dir);
     }
 
-    /* ---- every catalogue row must be actionable ----------------------
-     * The Models screen listed seven entries that could only be satisfied by
-     * finding a file by hand, which is not a button: "many models have no
-     * download button" was the report. The rule is now mechanical — a row is
-     * either installed, installable offline, or a real download URL — and this
-     * asserts it, so a new entry cannot reintroduce the dead end. */
-    {
-        osa_pack_info all[32];
-        int n = osa_app_packs(app, all, 32);
-        CHECK(n >= 17);
-        int dead = 0, offline = 0, remote = 0;
-        for (int i = 0; i < n; i++) {
-            if (all[i].installable) offline++;
-            else if (all[i].url[0]) remote++;
-            else if (!all[i].installed) { dead++; printf("    no action for %s\n", all[i].id); }
-        }
-        CHECK_MSG(dead == 0, "%d catalogue rows offer no action", dead);
-        CHECK_MSG(offline >= 12, "%d rows install offline", offline);
-        CHECK_MSG(remote >= 4, "%d rows are real downloads", remote);
-        /* the four that used to be manual are now built, and each produces a
-         * loadable model rather than a text table */
-        const char *models[] = { "asr-large-fa", "ggml-small-fa",
-                                 "mt-opus-fa-en", "mt-opus-en-fa" };
-        for (int i = 0; i < 4; i++) {
-            osa_error e;
-            CHECK_MSG(osa_app_install_builtin_pack(app, models[i], &e),
-                      "install %s: %s", models[i], e.msg);
-            bool now = false;
-            int n2 = osa_app_packs(app, all, 32);
-            for (int k = 0; k < n2; k++)
-                if (osa_streq(all[k].id, models[i])) now = all[k].installed;
-            CHECK_MSG(now, "%s is listed as installed", models[i]);
-        }
+    /* A bad file must report the loader's own sentence, not a generic one. */
+    const char *bad[]={exe,"--kind","lang","--model","build/does-not-exist.bin","--threads","1",NULL};
+    osa_process *q=osa_process_start(bad,&err);
+    if(q){
+        line=NULL;
+        if(osa_process_line(q,20000,NULL,&line,&err)){
+            bool ok=true;char msg[512]={0};
+            osa_json_get_bool(line,"ok",&ok);osa_json_get_string(line,"error",msg,sizeof msg);
+            CHECK(!ok);
+            CHECK_MSG(msg[0]!=0,"the worker explains the failure: %s",msg);
+            free(line);
+        }else CHECK_MSG(false,"a failing load still answers with one line");
+        osa_process_stop(q);
     }
+}
 
-    /* ---- training data is pickable inside the application ------------ */
-    {
-        osa_dataset_info ds[8];
-        int n = osa_app_datasets(app, ds, 8);
-        CHECK_MSG(n >= 3, "%d bundled training sets", n);
-        for (int i = 0; i < n; i++) CHECK(ds[i].installable);
-        osa_error e;
-        char path[OSAI_MAX_PATH];
-        CHECK_MSG(osa_app_install_dataset(app, ds[0].id, path, sizeof path, &e),
-                  "build %s: %s", ds[0].id, e.msg);
-        CHECK(osa_file_exists(path));
-        int n2 = osa_app_datasets(app, ds, 8);
-        CHECK(ds[0].installed);
-        CHECK_MSG(ds[0].n_pairs > 0, "%d pairs in the built set", ds[0].n_pairs);
-        (void)n2;
-        /* and the trainer actually consumes it */
-        osa_train_result tr;
-        memset(&tr, 0, sizeof tr);
-        CHECK_MSG(osa_app_train(app, path, 1, &tr, &e), "train on the built set: %s", e.msg);
-        CHECK_MSG(tr.n_added > 0, "%d exemplars added from the dataset", tr.n_added);
-        CHECK(tr.model_id[0] != 0);
-    }
+/* Models folder: the choice persists, and Sync reports what it cannot verify
+ * instead of registering an arbitrary file as an engine. */
+static void test_models_folder_and_sync(void){
+    suite("models folder + sync");
+    osa_error err;osa_err_ok(&err);
+    osa_app *app=osa_app_create(&err);
+    CHECK_MSG(app!=NULL,"app created: %s",app?err.msg:"");
+    if(!app)return;
+    char dir[OSAI_MAX_PATH]={0};osa_app_models_dir(app,dir,sizeof dir);
+    CHECK_MSG(strstr(dir,"Models")!=NULL,"default models folder is data/Models (%s)",dir);
 
+    char chosen[512];snprintf(chosen,sizeof chosen,"%smy-models",osa_path(OSAI_DIR_ROOT));
+    CHECK(osa_mkdirs(chosen));
+    CHECK(osa_app_set_models_dir(app,chosen,&err));
+    char back[OSAI_MAX_PATH]={0};osa_app_models_dir(app,back,sizeof back);
+    CHECK_MSG(strstr(back,"my-models")!=NULL,"the chosen folder is reported back (%s)",back);
+
+    /* a file that is not in the catalogue: reported, never registered */
+    char fake[700];snprintf(fake,sizeof fake,"%s/random.gguf",chosen);
+    char *junk=malloc(200000);memset(junk,7,200000);
+    CHECK(osa_file_write(fake,junk,200000));free(junk);
+    osa_sync_result res;
+    CHECK(osa_app_sync_models(app,NULL,NULL,NULL,&res,&err));
+    CHECK_MSG(res.added==0,"an unverified file is never registered (%d added)",res.added);
+    CHECK_MSG(res.unknown==1,"the unverified file is reported (%d unknown)",res.unknown);
+    CHECK_MSG(strstr(res.unknown_names,"random.gguf")!=NULL,"the report names the file");
+    char *json=osa_app_models_json(app,NULL);
+    CHECK_MSG(json&&osa_streq(json,"[]"),"nothing was installed by the sync");
+    free(json);
+
+    /* the choice survives a restart */
+    osa_app_destroy(app);
+    app=osa_app_create(&err);
+    if(app){char again[OSAI_MAX_PATH]={0};osa_app_models_dir(app,again,sizeof again);
+        CHECK_MSG(strstr(again,"my-models")!=NULL,"the folder choice persisted (%s)",again);}
+
+    /* delete removes the row and the file */
+    osa_model m;memset(&m,0,sizeof m);
+    osa_strlcpy(m.id,"test-delete",sizeof m.id);osa_strlcpy(m.name,"Test",sizeof m.name);
+    osa_strlcpy(m.kind,"mt",sizeof m.kind);osa_strlcpy(m.engine,"llama.cpp",sizeof m.engine);
+    osa_strlcpy(m.path,fake,sizeof m.path);osa_strlcpy(m.status,"installed",sizeof m.status);
+    m.size_bytes=200000;
+    char appdb[600];snprintf(appdb,sizeof appdb,"%sopenspeech.db",osa_path(OSAI_DIR_DB));
+    osa_db *db=osa_db_open(appdb,&err);
+    CHECK_MSG(db!=NULL,"second connection to the app database: %s",db?"ok":err.msg);
+    if(db){CHECK(osa_store_model_add(db,&m,&err));osa_db_close(db);}
+    CHECK(osa_file_exists(fake));
+    CHECK_MSG(osa_app_remove_model(app,"test-delete",&err),"remove succeeds: %s",err.msg);
+    CHECK(!osa_file_exists(fake));
+    json=osa_app_models_json(app,NULL);
+    CHECK_MSG(json&&osa_streq(json,"[]"),"the database row is gone");
+    free(json);
     osa_app_destroy(app);
 }
 
-/* ---- platform ----------------------------------------------------- */
-
-/* A damaged whisper file must be refused without ending the program, and must
- * not leave a row behind. The file carries the ggml magic and then garbage, which
- * is what whisper.cpp chokes on by throwing. */
-static void test_whisper_guard(void) {
-    char dir[OSAI_MAX_PATH];
-    snprintf(dir, sizeof dir, "/tmp/osai_test_wsp_%ld", (long)time(NULL));
-    char bad[OSAI_MAX_PATH];
-    snprintf(bad, sizeof bad, "%s/bad-tiny.bin", dir);
-    FILE *f = NULL;
-    char cmd[OSAI_MAX_PATH + 32];
-    snprintf(cmd, sizeof cmd, "mkdir -p %s", dir);
-    (void)system(cmd);
-    f = fopen(bad, "wb");
-    CHECK(f != NULL);
-    if (f) {
-        const unsigned char junk[] = {'l', 'm', 'g', 'g', 0, 0, 0, 0, 'g', 'a', 'r', 'b'};
-        fwrite(junk, 1, sizeof junk, f);
-        fclose(f);
-    }
-    CHECK(wsp_is_model_file(bad));
-    char werr[160];
-    wsp_ctx *w = wsp_load(bad, werr, sizeof werr);
-    CHECK(w == NULL);
-    CHECK(werr[0] != 0);
-    wsp_free(w);
-    CHECK(!wsp_is_model_file("/tmp/osai_no_such_file.bin"));
+static void test_worker_path(void){
+    suite("worker resolution");
+    char path[OSAI_MAX_PATH]={0}; osa_error err;
+    bool ok=osa_worker_path(path,sizeof path,&err);
+    CHECK_MSG(ok,"worker path resolved: %s",ok?path:err.msg);
+    CHECK_MSG(ok&&osa_file_exists(path),"the resolved worker actually exists");
 }
 
-static void test_platform(void) {
-    suite("platform");
-    const char *root = osa_path(OSAI_DIR_ROOT);
-    CHECK_MSG(root && root[0] != 0, "data root: %s", root ? root : "(null)");
-    CHECK(root && osa_dir_exists(root));
-    CHECK_MSG(osa_path(OSAI_DIR_MODELS)[0] != 0, "models dir resolves");
-    CHECK_MSG(osa_disk_free(osa_path(OSAI_DIR_ROOT)) > 0, "disk free is positive");
-    CHECK_MSG(osa_cpu_count() >= 1, "%d cpu(s)", osa_cpu_count());
-
-    osa_sys_stats stats;
-    memset(&stats, 0, sizeof stats);
-    osa_sys_stats_sample(&stats);
-    CHECK_MSG(stats.ram_total_mb > 0, "ram total %.0f MB", (double)stats.ram_total_mb);
-    CHECK_MSG(stats.ram_used_mb <= stats.ram_total_mb + 1, "ram used is sane");
-    /* The About screen shows this process, not the machine: the machine figure
-     * moves with every other program, which is what made an idle window look
-     * like it was leaking. */
-    CHECK_MSG(stats.proc_ram_mb > 0, "process ram %.1f MB", (double)stats.proc_ram_mb);
-    CHECK_MSG(stats.proc_ram_mb < stats.ram_total_mb, "process ram is below the machine total");
-    float live_pr = osa_process_ram_mb();
-    CHECK_MSG(live_pr > 0, "live process ram %.1f MB", (double)live_pr);
-    osa_sys_stats_freeze(true);
-    CHECK(osa_sys_stats_frozen());
-    osa_sys_stats frozen;
-    osa_sys_stats_sample(&frozen);
-    CHECK(frozen.proc_ram_mb > 0);                 /* the harness still has a value */
-    CHECK_MSG(osa_process_ram_mb() > 0, "even frozen, the real process size is readable");
-    osa_sys_stats_freeze(false);
-    CHECK(!osa_sys_stats_frozen());
-
-    /* the fault log names a file in the data folder and can be armed quietly */
-    osa_crash_log_init(true);
-    CHECK_MSG(osa_crash_log_path()[0] != 0, "fault log path: %s", osa_crash_log_path());
-
-    /* mkdirs is idempotent */
-    CHECK(osa_mkdirs("/tmp/osai_test_dir_nested_a/b/c"));
-    CHECK(osa_dir_exists("/tmp/osai_test_dir_nested_a/b/c"));
-    CHECK(osa_mkdirs("/tmp/osai_test_dir_nested_a/b/c"));
-
-    /* atomic write */
-    const char *p = "/tmp/osai_test_atomic.txt";
-    CHECK(osa_file_write_atomic(p, "hello", 5));
-    CHECK(osa_file_exists(p));
-    osa_buf back;
-    osa_buf_init(&back);           /* osa_file_read resets the buffer, it does not create it */
-    if (osa_file_read(p, &back)) {
-        CHECK_MSG(back.len == 5 && memcmp(back.data, "hello", 5) == 0,
-                  "read back %zu bytes", back.len);
-        osa_buf_free(&back);
-    } else {
-        CHECK_MSG(false, "read back the file");
+/* The product writes only under <exe dir>/data. This runs the real host in a
+ * child process with OSAI_DATA_DIR removed and a throwaway HOME that holds an
+ * old-style profile, so both the new location and the one-time move are proved
+ * rather than asserted in a comment. */
+static void test_activation_diagnostics(void){
+    suite("activation diagnostics");
+    use_temp_root("actdiag");
+    osa_error err;osa_err_ok(&err);
+    osa_app *app=osa_app_create(&err);
+    CHECK(app!=NULL);
+    if(app){
+        char dbp[600];snprintf(dbp,sizeof dbp,"%sopenspeech.db",osa_path(OSAI_DIR_DB));
+        osa_db *db=osa_db_open(dbp,&err);
+        if(db){
+            osa_model m;memset(&m,0,sizeof m);
+            osa_strlcpy(m.id,"fasttext-lid176-ftz",sizeof m.id);
+            osa_strlcpy(m.name,"fastText LID 176 (compressed)",sizeof m.name);
+            osa_strlcpy(m.kind,"lang",sizeof m.kind);osa_strlcpy(m.engine,"fastText",sizeof m.engine);
+            osa_strlcpy(m.status,"installed",sizeof m.status);
+            osa_strlcpy(m.path,"/nonexistent/lid.176.ftz",sizeof m.path);
+            m.size_bytes=938013;
+            CHECK(osa_store_model_add(db,&m,&err));osa_db_close(db);
+        }
+        CHECK(!osa_app_activate_model(app,"fasttext-lid176-ftz",&err));
+        CHECK_MSG(strstr(err.msg,"missing")!=NULL,"the failure says the file is missing: %s",err.msg);
+        CHECK_MSG(strstr(err.msg,"/nonexistent/lid.176.ftz")!=NULL,"the failure names the path");
+        CHECK_MSG(strstr(err.msg,"Sync")!=NULL,"the failure tells the user how to repair it");
+        osa_app_destroy(app);
     }
-    osa_file_remove(p);
-
-    /* uuid shape */
-    char u1[37], u2[37];
-    osa_uuid(u1);
-    osa_uuid(u2);
-    CHECK_MSG(strlen(u1) == 36, "uuid length %zu", strlen(u1));
-    CHECK_MSG(!osa_streq(u1, u2), "uuids are unique");
-    CHECK(u1[8] == '-' && u1[13] == '-' && u1[18] == '-' && u1[23] == '-');
+    clean_root();
 }
 
-/* ---- main --------------------------------------------------------- */
+static void test_portable_data_dir(void){
+    suite("portable data folder + profile migration");
+    const char *host="build/openspeech";
+    if(!osa_file_exists(host)){printf("  SKIP headless host not built\n");return;}
+    char home[256]; snprintf(home,sizeof home,"/tmp/osai-home-XXXXXX");
+    if(!mkdtemp(home)){CHECK_MSG(false,"mkdtemp");return;}
+    char legacy[512],models[600],probe[700],prefs[600];
+    snprintf(legacy,sizeof legacy,"%s/.local/share/OpenSpeechAI",home);
+    snprintf(models,sizeof models,"%s/Models",legacy);
+    snprintf(probe,sizeof probe,"%s/portable-probe.txt",models);
+    snprintf(prefs,sizeof prefs,"%s/settings.ini",legacy);
+    CHECK(osa_mkdirs(models));
+    CHECK(osa_file_write(probe,"moved",5));
+    CHECK(osa_file_write(prefs,"lang=fa\ndark=0\n",14));
 
-int main(int argc, char **argv) {
-    bool verbose = argc > 1 && osa_streq(argv[1], "-v");
-    (void)verbose;
-    /* A fresh data folder every run: the application restores the recogniser
-     * the database says is active, so a shared folder would make these tests
-     * depend on whatever an earlier run trained. */
-    {
-        char tmp[64];
-        snprintf(tmp, sizeof tmp, "/tmp/osai_test_data_%ld", (long)time(NULL));
-        setenv("OSAI_DATA_DIR", tmp, 1);
+    const char *old_home=getenv("HOME");
+    char saved_home[512]={0}; if(old_home)osa_strlcpy(saved_home,old_home,sizeof saved_home);
+    setenv("HOME",home,1);
+    unsetenv("OSAI_DATA_DIR");
+    const char *argv[]={host,"--paths-json",NULL};
+    osa_error err; osa_process *p=osa_process_start(argv,&err);
+    CHECK_MSG(p!=NULL,"host starts: %s",p?"ok":err.msg);
+    char root[OSAI_MAX_PATH]={0},exedir[OSAI_MAX_PATH]={0};
+    if(p){
+        char *line=NULL;
+        if(osa_process_line(p,15000,NULL,&line,&err)){
+            osa_json_get_string(line,"root",root,sizeof root);
+            osa_json_get_string(line,"exe_dir",exedir,sizeof exedir);
+            free(line);
+        }
+        osa_process_stop(p);
     }
-    printf("OpenSpeech AI test suite\n");
-    printf("=======================\n");
+    char want[OSAI_MAX_PATH+16]; snprintf(want,sizeof want,"%s/data/",exedir);
+    CHECK_MSG(root[0]&&osa_streq(root,want),"data root is <exe dir>/data (%s)",root);
+    char moved[OSAI_MAX_PATH+64],movedprefs[OSAI_MAX_PATH+32];
+    snprintf(moved,sizeof moved,"%sModels/portable-probe.txt",root);
+    snprintf(movedprefs,sizeof movedprefs,"%ssettings.ini",root);
+    CHECK_MSG(osa_file_exists(moved),"old profile models were moved beside the exe");
+    CHECK_MSG(!osa_file_exists(probe),"nothing is left in the old profile model folder");
+    CHECK_MSG(!osa_dir_exists(legacy),"the emptied profile folder is removed");
+    /* clean the probe out of the build tree; keep any real developer data */
+    osa_file_remove(moved);
+    if(osa_file_exists(movedprefs)){
+        osa_buf b; osa_buf_init(&b);
+        if(osa_file_read(movedprefs,&b)&&b.len==14&&!memcmp(b.data,"lang=fa\ndark=0\n",14))osa_file_remove(movedprefs);
+        osa_buf_free(&b);
+    }
+    osa_dir_remove_recursive(home);
+    if(saved_home[0])setenv("HOME",saved_home,1);
+    if(g_root[0])setenv("OSAI_DATA_DIR",g_root,1);
+}
 
-    test_strings();
-    test_utf8();
-    test_json();
-    test_hash();
-    test_platform();
-    test_audio();
-    test_tts();
-    test_neural_net();
-    test_mt();
-    test_store();
-    test_vad();
-    test_asr();
-    test_app();
-    test_whisper_guard();
+static void test_optional_real_models(void){
+    suite("optional real-model smoke (user-supplied weights)");
+    const char *asr=getenv("OSAI_TEST_ASR"),*mt=getenv("OSAI_TEST_MT"),*lid=getenv("OSAI_TEST_LID"),*wav=getenv("OSAI_TEST_WAV");
+    if(!asr||!mt||!lid||!wav){printf("  SKIP set OSAI_TEST_ASR/MT/LID/WAV to run real inference\n");return;}
+    use_temp_root("real");
+    osa_error err; osa_app *app=osa_app_create(&err); CHECK(app!=NULL);
+    if(!app){clean_root();return;}
+    CHECK(osa_app_install_pack_file(app,asr,&err));
+    CHECK(osa_app_install_pack_file(app,mt,&err));
+    CHECK(osa_app_install_pack_file(app,lid,&err));
+    CHECK(osa_app_activate_model(app,"whisper-medium-q5",&err));
+    CHECK(osa_app_activate_model(app,"qwen25-3b-q4km",&err));
+    CHECK(osa_app_activate_model(app,"fasttext-lid176",&err));
+    CHECK(osa_app_ready(app));
+    CHECK(osa_app_set_languages(app,"fa","en",&err));
+    osa_app_translation tr; CHECK(osa_app_translate(app,"سلام، حال شما چطور است؟","fa",&tr,&err));
+    CHECK_MSG(tr.text[0]!=0,"real MT produced non-empty output");
+    osa_app_transcript ts; osa_app_translation mt2;
+    CHECK(osa_app_transcribe_and_translate(app,wav,&ts,&mt2,&err));
+    CHECK_MSG(ts.text[0]!=0,"real ASR produced non-empty transcript");
+    CHECK_MSG(mt2.text[0]!=0,"file transcription translation produced output");
+    osa_app_destroy(app); clean_root();
+}
 
-    printf("\n=======================\n");
-    printf("%d passed, %d failed\n", g_pass, g_fail);
-    return g_fail;
+int main(void){
+    test_json_unicode();
+    test_catalog_and_gate();
+    test_store_active();
+    test_long_history();
+    test_audio_wav();
+    test_process_quoting();
+    test_worker_isolation();
+    test_shell_gate();
+    test_worker_path();
+    test_worker_protocol();
+    test_models_folder_and_sync();
+    test_activation_diagnostics();
+    test_portable_data_dir();
+    test_optional_real_models();
+    printf("\n%d passed, %d failed\n",g_pass,g_fail);
+    return g_fail?1:0;
 }

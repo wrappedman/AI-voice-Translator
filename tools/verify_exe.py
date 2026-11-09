@@ -1,10 +1,17 @@
 #!/usr/bin/env python3
 """Sanity-check a built Windows executable.
 
-CI cannot run a Windows binary, so the next best thing is to verify the parts
-of the PE header a broken build gets wrong: machine type, optional-header
-magic, GUI subsystem, no DLL flag, and the embedded version resource.
+This verifies the PE header and a few load-bearing strings/resources without
+executing the binary. A separate native Windows CI job (tools/win_smoke.py)
+runs the shipped worker against a synthetic model in a Persian/spaces folder:
+  * OpenSpeechAI.exe      x86-64 PE32+, GUI subsystem, version + DPI manifest
+  * OpenSpeechWorker.exe  x86-64 PE32+, console subsystem, UTF-8 manifest
+
+Usage:
+    verify_exe.py dist/bin/OpenSpeechAI.exe
+    verify_exe.py dist/bin/OpenSpeechWorker.exe --console
 """
+import argparse
 import os
 import re
 import struct
@@ -12,46 +19,63 @@ import sys
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
-# The exe is a UTF-16LE resource blob on Windows targets and plain ASCII nowhere;
-# a string check has to look for both encodings or it fails on a good build.
-def _contains(haystack: bytes, needle: str) -> bool:
-    if needle.encode("utf-8") in haystack:
-        return True
-    if needle.encode("utf-16-le") in haystack:
-        return True
-    return False
 
-# Strings that must be in the shipped binary because they are the code paths the
-# 1.1.0 bug reports were about. If a link step silently drops a file — or leaves
-# a weak stub in place of the real implementation — the string is missing, and
-# this notices without a Windows machine. Persian literals live in the resource
-# strings, so both encodings are searched.
-REQUIRED = [
-    ("Media Foundation is not available", "the AAC/M4A decoder is linked in"),
-    ("فهرست داده‌ها", "the in-app training-data list"),
+def _contains(haystack: bytes, needle: str) -> bool:
+    return needle.encode("utf-8") in haystack or needle.encode("utf-16-le") in haystack
+
+
+APP_REQUIRED = [
+    ("Media Foundation is unavailable", "the AAC/M4A decoder is linked in"),
     ("ترجمه انجام شد", "the translate confirmation"),
+    ("ابتدا مدل گفتار", "the model-required gate message"),
+    ("درباره نرم‌افزار", "the renamed About section"),
+    ("تشخیص گفتار و ترجمه آفلاین", "the offline tagline"),
+    ("behnam ehsani", "the developer card"),
+    ("inbox.ehsani@gmail.com", "the developer contact"),
+    ("cannot start the model worker", "the diagnosable spawn failure"),
+    ("worker.log", "worker stderr logging"),
+    ("OSAI_WORKER", "the embedded worker resource name"),
+    ("همگام‌سازی", "the models-folder sync action"),
+    ("پوشه مدل‌ها", "the models-folder setting"),
+    ("حذف شود؟", "the two-step delete confirmation"),
+    ("درباره سازنده", "the developer section"),
+    ("the worker command line is too long", "the MSVCRT argv quoting guard"),
 ]
-# Strings that must NOT appear: a weak fallback next to the real implementation
-# means the linker picked one at random.
+WORKER_REQUIRED = [
+    ("cannot parse the worker command line", "wide Windows argv parsing"),
+    ("cannot open the language model file", "the wide-path fastText loader"),
+]
 FORBIDDEN = [
     "no AAC decoder on this platform",
+    "افزودن مدل از فایل",          # local-file import was removed
+    "keep it beside OpenSpeechAI.exe",
 ]
-
-EXPECT_MACHINE = 0x8664        # AMD64
+EXPECT_MACHINE = 0x8664
 EXPECT_MAGIC_PE32P = 0x020B
-SUBSYSTEM_GUI = 2
 
 
-def check(path: str) -> int:
+def version_from_header() -> str:
+    header = os.path.join(ROOT, "src", "core", "osai_common.h")
+    with open(header, encoding="utf-8") as f:
+        m = re.search(r'#define\s+OSAI_VERSION\s+"([0-9.]+)"', f.read())
+    if not m:
+        raise SystemExit("cannot read OSAI_VERSION from %s" % header)
+    return m.group(1)
+
+
+def check(path: str, console: bool) -> int:
     with open(path, "rb") as f:
         data = f.read()
     fails = []
-    for needle, why in REQUIRED:
+    required = WORKER_REQUIRED if console else APP_REQUIRED
+    for needle, why in required:
         if not _contains(data, needle):
             fails.append("missing %r: %s" % (needle, why))
     for needle in FORBIDDEN:
         if _contains(data, needle):
-            fails.append("contains %r, which should not be in a Windows build" % needle)
+            fails.append("contains forbidden fallback %r" % needle)
+    if not _contains(data, "UTF-8"):
+        fails.append("missing UTF-8 activeCodePage manifest")
     if data[:2] != b"MZ":
         fails.append("missing DOS signature")
         return report(fails, path, data)
@@ -67,40 +91,39 @@ def check(path: str) -> int:
     if magic != EXPECT_MAGIC_PE32P:
         fails.append("optional header magic 0x%04x, expected PE32+" % magic)
     subsystem = struct.unpack_from("<H", data, opt + 68)[0]
-    if subsystem != SUBSYSTEM_GUI:
-        fails.append("subsystem %d, expected %d (GUI)" % (subsystem, SUBSYSTEM_GUI))
+    expect_sub = 3 if console else 2
+    if subsystem != expect_sub:
+        fails.append("subsystem %d, expected %d (%s)" % (subsystem, expect_sub, "console" if console else "GUI"))
     dll = struct.unpack_from("<H", data, opt + 70)[0] & 1
     if dll:
         fails.append("image is marked as a DLL")
-    # The version is checked against the one header the whole program uses, so a
-    # release cannot ship with the previous version's string baked in.
-    ver = version_from_header()
-    for needle, what in ((b"OpenSpeech AI", "product name"),
-                         (ver.encode(), "version string (%s)" % ver),
-                         (b"permonitorv2", "DPI manifest")):
-        if needle not in data:
-            fails.append("missing %s resource" % what)
-    # The resource is stored as UTF-16, so a stale FILEVERSION block would not
-    # show up in the search above. Check the previous-version string explicitly:
-    # 1.0.0.0 in the file properties of a 1.1.0 release is exactly the kind of
-    # drift this script exists to catch.
-    stale = [v for v in ("1.0.0.0", "0.9.0.0")
-             if v != ver and v.encode("utf-16-le") in data]
-    for v in stale:
-        fails.append("file properties still report version %s" % v)
-    if ver.encode("utf-16-le") not in data:
-        fails.append("version resource does not carry %s" % ver)
+    if not console:
+        ver = version_from_header()
+        for needle, what in ((b"OpenSpeech AI", "product name"),
+                             (ver.encode(), "version string (%s)" % ver),
+                             (b"permonitorv2", "DPI manifest")):
+            if needle not in data:
+                fails.append("missing %s resource" % what)
+        stale = [v for v in ("1.0.0.0", "0.9.0.0", "1.1.0.0", "1.2.0.0", "1.3.0.0", "1.3.1.0", "1.4.0.0")
+                 if v != ver and v.encode("utf-16-le") in data]
+        for v in stale:
+            fails.append("file properties still report version %s" % v)
+        if ver.encode("utf-16-le") not in data:
+            fails.append("version resource does not carry %s" % ver)
+        # The worker must travel inside the app resource, otherwise activation
+        # fails on a machine where only OpenSpeechAI.exe was copied.
+        worker = os.path.join(os.path.dirname(os.path.abspath(path)), "OpenSpeechWorker.exe")
+        if os.path.exists(worker):
+            with open(worker, "rb") as f:
+                payload = f.read()
+            if payload[:8192] not in data or payload[-8192:] not in data:
+                fails.append("the embedded worker payload does not match OpenSpeechWorker.exe")
+            else:
+                print("  ok   inference worker embedded as RCDATA (%d bytes)" % len(payload))
+        else:
+            fails.append("OpenSpeechWorker.exe not found next to the app; cannot check the embedded copy")
+        print("  ok   subsystem %d (GUI, no console window)" % subsystem)
     return report(fails, path, data)
-
-
-def version_from_header() -> str:
-    """The version lives in exactly one place: src/core/osai_common.h."""
-    header = os.path.join(ROOT, "src", "core", "osai_common.h")
-    with open(header, encoding="utf-8") as f:
-        m = re.search(r'#define\s+OSAI_VERSION\s+"([0-9.]+)"', f.read())
-    if not m:
-        raise SystemExit("cannot read OSAI_VERSION from %s" % header)
-    return m.group(1)
 
 
 def report(fails, path, data) -> int:
@@ -110,12 +133,13 @@ def report(fails, path, data) -> int:
             print("  FAIL %s" % f)
         print("%s: INVALID (%.1f MB)" % (path, size_mb))
         return 1
-    print("%s: ok — x86-64 PE32+, GUI subsystem, static, %.1f MB" % (path, size_mb))
+    print("%s: ok — x86-64 PE32+, static, %.1f MB" % (path, size_mb))
     return 0
 
 
 if __name__ == "__main__":
-    if len(sys.argv) != 2:
-        print("usage: verify_exe.py PATH", file=sys.stderr)
-        sys.exit(2)
-    sys.exit(check(sys.argv[1]))
+    ap = argparse.ArgumentParser()
+    ap.add_argument("path")
+    ap.add_argument("--console", action="store_true", help="expect a console worker instead of the GUI app")
+    args = ap.parse_args()
+    sys.exit(check(args.path, args.console))

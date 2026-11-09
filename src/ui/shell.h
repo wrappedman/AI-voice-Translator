@@ -41,10 +41,11 @@ typedef enum shell_lang { UI_FA = 0, UI_EN = 1 } shell_lang;
 typedef enum shell_request {
     SHELL_REQ_NONE = 0,
     SHELL_REQ_PICK_AUDIO,      /* open the audio file picker          */
-    SHELL_REQ_PICK_PACK,       /* open the language pack / model picker */
     SHELL_REQ_PICK_DATASET,    /* open the training dataset picker     */
     SHELL_REQ_OPEN_FOLDER,     /* show the data folder in Explorer    */
-    SHELL_REQ_SAVE_TRANSCRIPT  /* save the current transcript to a file */
+    SHELL_REQ_SAVE_TRANSCRIPT, /* save the current transcript to a file */
+    SHELL_REQ_OPEN_URL,        /* open request_url in the browser/mail client */
+    SHELL_REQ_PICK_MODELS_DIR  /* pick the folder that holds model files */
 } shell_request;
 
 typedef struct shell_state {
@@ -56,10 +57,10 @@ typedef struct shell_state {
 
     /* transcribe screen */
     char          audio_path[OSAI_MAX_PATH];
-    char          transcript[8192];
-    char          translation[8192];
+    char          transcript[OSAI_MAX_TEXT];
+    char          translation[OSAI_MAX_TEXT];
     char          phonetic[4096];        /* آوانویسی of the translation       */
-    char          correction[4096];      /* edited transcript awaiting review  */
+    char          correction[OSAI_MAX_TEXT];      /* edited transcript awaiting review  */
     char          detected_lang[8];
     char          transcript_id[40];
     float         transcript_conf;
@@ -68,7 +69,7 @@ typedef struct shell_state {
     double        transcript_ms;
     int           transcript_words;
     bool          working;
-    char          message[512];
+    char          message[1024];
     bool          message_is_error;
     int64_t       message_at_ms;      /* when it was raised (auto-dismiss)   */
     int64_t       message_life_ms;    /* 0 = use the default for its kind    */
@@ -94,9 +95,15 @@ typedef struct shell_state {
     int           models_tab;            /* 0 installed, 1 downloadable */
     int           packs_scroll;
     double        dl_progress;           /* 0..1 while downloading      */
+    int64_t       dl_got, dl_total;      /* bytes, for the row's percentage */
     char          dl_pack[64];
     bool          downloading;
-    struct dl_job *dl;                   /* background fetch, or NULL   */
+    struct dl_job *dl;                   /* legacy alias: same as job for downloads */
+    struct shell_job *job;               /* one cancellable background action */
+    bool          restoring;
+    bool          activating;            /* a model is being loaded right now */
+    bool          syncing;               /* the models folder is being scanned */
+    bool          models_ready;
 
     /* training */
     int           train_epochs;
@@ -135,9 +142,9 @@ typedef struct shell_state {
     mt_style      style;
 
     /* translate screen buffer */
-    char          tr_in[4096];
-    char          tr_out[4096];
-    char          tr_phonetic[2048];
+    char          tr_in[OSAI_MAX_TEXT];
+    char          tr_out[OSAI_MAX_TEXT];
+    char          tr_phonetic[4096];
     char          tr_out_lang[8];
     double        tr_score;
 
@@ -145,7 +152,15 @@ typedef struct shell_state {
      * The host consumes the request, fills in the result and clears it; the UI
      * itself never touches the filesystem dialog APIs. */
     shell_request request;
-    char          request_path[OSAI_MAX_PATH];
+    char          request_url[512];      /* payload for SHELL_REQ_OPEN_URL */
+    char          request_path[OSAI_MAX_PATH]; /* folder for OPEN_FOLDER */
+
+    /* models screen: folder + sync + delete confirmation */
+    char          models_dir[OSAI_MAX_PATH];
+    char          delete_id[40];         /* row awaiting a second click */
+    osa_sync_result sync;                /* last sync report */
+    bool          sync_valid;
+    int           sync_done, sync_total; /* progress while syncing */
 
     /* ui bookkeeping */
     int           frame;
@@ -166,9 +181,20 @@ bool shell_load_waveform(shell_state *s, const char *path);
 /* Runs the transcribe (+translate) action for the current file. Used by the
  * button and by the command-line/snapshot driver. */
 bool shell_run_transcribe(shell_state *s);
+bool shell_select_audio(shell_state *s, const char *path);
+bool shell_activate_model(shell_state *s, const char *id);
+/* Deletes the model file and its database row (unload first). */
+bool shell_delete_model(shell_state *s, const char *id);
+/* Points the app at a folder of model files and persists the choice. */
+void shell_set_models_dir(shell_state *s, const char *path);
+void shell_refresh_models_dir(shell_state *s);
+/* Registers catalogue-matching files found in the models folder. */
+bool shell_sync_models(shell_state *s);
+void shell_job_tick(shell_state *s);
+void shell_cancel_jobs(shell_state *s);
+void shell_live_shutdown(shell_state *s);
 
-/* Downloads a catalogue pack on a worker thread. The window keeps painting; the
- * file is installed on the UI thread by shell_download_tick() once it arrives. */
+/* Downloads, verifies and installs on a worker; never activates automatically. */
 bool shell_download_start(shell_state *s, const char *id);
 void shell_download_tick(shell_state *s);
 

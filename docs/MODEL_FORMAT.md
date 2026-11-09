@@ -1,182 +1,99 @@
-# Model formats
+# Model formats and verification (1.4.1)
 
-OpenSpeech AI ships two model containers. Both are **little-endian**, **flat**
-(no compression, no pointers) and were designed so that a model is a single file
-that can be copied, hashed and imported without any side data.
+OpenSpeech AI no longer ships or accepts the old exemplar `.osam` / phrasebook
+`.osmt` containers as active models. The supported artifacts are standard
+upstream inference files, downloaded by the user and verified before use.
 
-| Container | Extension | Produced by | Used by |
-|-----------|-----------|-------------|---------|
-| Acoustic / exemplar ASR | `.osam` | `asr_model_save()` | `asr_model_load()` |
-| Translation phrasebook | `.osmt` | `mt_model_save()` | `mt_model_load()` |
+| Category | Artifact | Container | Engine |
+|---|---|---|---|
+| Speech (`asr`) | `ggml-{tiny,base,small}-q5_1.bin`, `ggml-medium-{q5_0,q8_0}.bin`, `ggml-large-v3-turbo-{q5_0,q8_0}.bin`, `ggml-large-v3-q5_0.bin` | whisper.cpp ggml | `whisper_bridge.cpp` |
+| Translation (`mt`) | `qwen2.5-0.5b-instruct-{q4_k_m,q8_0}.gguf`, `qwen2.5-1.5b-instruct-q4_k_m.gguf`, `qwen2.5-3b-instruct-{q4_k_m,q6_k,q8_0}.gguf`, `qwen2.5-7b-instruct-q3_k_m.gguf` | GGUF (single file) | `OpenSpeechWorker` / llama.cpp |
+| Language ID (`lang`) | `lid.176.{bin,ftz}` (fastText, 176 languages) and GlotLID v4 `model_v4_small.{ftz,bin}`, `model_v4.ftz`, `model.bin` (2000+ varieties) | fastText supervised | `OpenSpeechWorker` / fastText |
 
-A model is identified everywhere else by its **id**, not by its path, so a file
-can move between machines freely.
+Multi-file GGUF splits (Qwen2.5 7B Q4_K_M and above) are deliberately not listed:
+the downloader fetches one pinned file, so a split model could never be complete.
 
----
+## Catalog pin
 
-## 1. `.osam` — speech model
+Every downloadable entry records:
 
-The container is a fixed-size C struct written verbatim, followed by three
-variable-length sections. Sizes below are in bytes; offsets assume the version 1
-layout.
+- stable `id`, human name, `kind`, engine, licence and homepage;
+- exact `size_bytes`;
+- lowercase 64-character `sha256`;
+- pinned HTTPS `url` (revision-specific where the host supports it);
+- `min_ram_mb`: approximate resident memory while the model runs; shown in the
+  download list («رم لازم»), used for the «سبک» badge (≤ ~1 GB) and by the
+  activation memory warning;
+- `status: available`, `verified: sha256`.
 
-### Header
+The runtime catalog in `src/app/osai_app.c` is the source of truth;
+`tools/catalog/generate.py` regenerates the release manifest
+`tools/catalog/catalog.json` from it, and `tools/catalog/check.py` cross-checks
+ids, URLs, hashes, sizes and RAM figures between the two.
 
-```c
-typedef struct osam_header {
-    uint32_t magic;              /* 0x4D41534F  = "OSAM" (little-endian ASCII)   */
-    uint32_t version;            /* 1                                             */
-    uint32_t n_tokens;           /* number of word tokens the model can emit      */
-    uint32_t n_confusions;       /* number of confusion-pair entries              */
-    uint32_t n_bigrams;          /* number of bigram language-model entries       */
-    uint32_t layer_specs[4];     /* MLP layer widths; unused slots are 0          */
-    uint32_t n_specs;            /* how many of layer_specs are meaningful        */
+## Install rules
 
-    char     name[128];          /* human-readable model name                     */
-    char     version_s[32];      /* model version, e.g. "1.0.0"                   */
-    char     language[8];        /* "fa" or "en"                                  */
-    char     base_model[128];    /* id this model was derived from, or ""         */
-    char     license[128];       /* SPDX expression, e.g. "GPL-3.0-or-later"      */
-    char     source_url[512];    /* where the model came from, or ""              */
-    char     note[256];          /* free text shown in the model card             */
-    char     backend[16];        /* "exemplar" or "trained"                      */
+1. Download to `<Downloads>/<id>.<ext>.part` with resume/cancel support.
+2. Verify byte size and SHA-256 against the catalog pin.
+3. Copy to `<Models>/<id>.<ext>.tmp`, verify again, atomically rename.
+4. Register the model **inactive**. Activation is a separate user action.
+5. **There is no local-file import.** The UI button, file dialog and job kind were
+   removed in 1.3.0: only a catalogue download can install a model, so an
+   arbitrary GGUF/ggml/fastText file can never become an engine. The app-layer
+   helper `osa_app_install_pack_file` still exists for verified reinstall of a
+   file whose hash matches a catalogue pin, but no UI path reaches it.
+6. Reinstalling an already-present verified file registers it without
+   overwriting an active/loaded model file.
+7. **Sync** applies the same rule to files the user already has: the configured
+   models folder is scanned, candidates are matched by exact size and SHA-256, and
+   only matches are registered (inactive). Unknown files are reported by name.
+8. **Delete** removes the database row and the file itself, after unloading the
+   engine. It is the only destructive model operation and needs two clicks.
 
-    uint32_t feat_dim;           /* feature vector length per frame               */
-    uint32_t n_exemplars;        /* number of word templates                      */
-    uint32_t tmpl_floats;        /* float count in the template block             */
-} osam_header;
-```
+## Activation
 
-### Body
+Activation resolves the worker (`osa_worker_path`): on Windows it extracts the
+embedded `OSAI_WORKER` resource into `data/Cache/OpenSpeechWorker.exe` after a
+SHA-256 check, falling back to a copy beside the exe. The child is spawned with an
+explicit application path, `data`-relative working directory and its stderr
+appended to `data/Logs/worker.log`. Activation then loads the engine/worker and
+switches the SQLite active row in a transaction. A partial unique index guarantees at most one active model
+per `kind`. Failure leaves the previous active model intact.
 
-Immediately after the header, in this order:
+## Language capabilities
 
-1. **Vocabulary** — `n_tokens` NUL-terminated UTF-8 strings, concatenated. A
-   reader walks the block from the end of the previous token to the next `\0`.
-2. **Templates** — `tmpl_floats` `float32` values, row-major. Each exemplar
-   occupies a contiguous slice; `n_exemplars` describes how the slices are
-   grouped by token.
-3. **Confusions** — `n_confusions` pairs of `uint16_t` token indices.
-4. **Bigrams** — `n_bigrams` quadruples of `(uint16 a, uint16 b, float32 logp,
-   uint16 pad)`.
+- **ASR:** language list is read from the loaded Whisper model
+  (`whisper_full_lang_max_id` / language strings). The UI popups and settings
+  use that list; there is no fixed fa/en rejection.
+- **MT:** each translation pack carries its own language list (the Qwen2.5 set is
+  `en fa ar zh fr es pt de it ru ja ko vi th id tr hi he nl pl uk`), recorded on
+  the installed model row and read back by the UI. This is an
+  application capability list, not a claim that GGUF metadata enumerates
+  translation directions. Unsupported targets are rejected before inference.
+- **LID:** fastText LID 176 and GlotLID v4 return a label used for auto-detect.
+  GlotLID/FLORES labels are ISO-639-3 + script (`pes_Arab`, `eng_Latn`); the
+  worker normalises them to the two-letter codes Whisper and Qwen use
+  (`fa`, `en`, …) in both `detect` results and the `ready.languages` list, and
+  keeps the original label when no honest ISO-1 mapping exists. If the detected
+  language is outside the MT set, translation fails with a readable message
+  instead of silently producing garbage. On Windows the model path is quoted
+  with the MSVCRT rules, parsed by the worker with `CommandLineToArgvW`, and the
+  file is opened with `_wfopen` and streamed to fastText, so spaces,
+  backslashes and non-ASCII (e.g. Persian) folder names work regardless of the
+  ANSI code page.
 
-The current writer emits sections 1 and 2; the reader tolerates their absence
-when the corresponding header count is zero, which is what forward compatibility
-relies on.
+## Text limits and failure behaviour
 
-### Guarantees and expectations
+- UI/app text buffers: 64 KiB (`OSAI_MAX_TEXT`).
+- MT input is chunked at ≤2400 UTF-8 bytes per request.
+- Worker reply overflow, timeout, cancellation or incomplete output fails the
+  operation; partial translations are not saved as complete history rows.
+- History stores `translation`, `target_lang` and `duration_ms` alongside the
+  transcript.
 
-- **All strings are NUL-terminated inside their field.** A reader must never
-  assume the field is exactly full.
-- **Unknown trailing data is ignored.** That lets a newer writer append sections
-  without breaking older readers, as long as `version` stays 1.
-- **A different `version` is rejected**, not guessed at.
-- **The file is self-contained.** Loading it never reads anything else, in
-  particular never the network.
+## Legacy containers
 
-### Validation on import
-
-`osa_app_import_model()` checks, in order:
-
-1. the file exists, is readable, and is smaller than 512 MB;
-2. the first four bytes are a known magic (`OSAM` or `OSMT`);
-3. the version is one this build understands;
-4. the SHA-256 is computed and stored with the model card.
-
-If any check fails the file is left untouched and the model list is unchanged —
-the app never ends up with a half-registered model.
-
-### Integrity
-
-There is no checksum inside the container: the SHA-256 recorded in the database
-when a model is registered is the authority. Re-importing the same bytes gives
-the same hash, so a catalogue entry can pin an exact model.
-
----
-
-## 2. `.osmt` — translation phrasebook
-
-```c
-typedef struct mt_hdr {
-    uint32_t magic;              /* 0x544D534F                                  */
-    uint32_t version;            /* 1                                           */
-    int32_t  n_pairs;            /* sentence pairs                              */
-    int32_t  n_gloss;            /* word glosses                                */
-
-    char     id[64];             /* model id                                    */
-    char     name[128];
-    char     license[128];
-    char     source[512];        /* provenance, may be empty                    */
-    char     backend[24];        /* written as "osmt"                        */
-    char     src_tag[8];         /* "fa" or "en"                                */
-    char     dst_tag[8];
-} mt_hdr;
-```
-
-### Body
-
-Each string — in **all** sections — is encoded as:
-
-```
-uint8   length       (0..250)
-uint8   bytes[length] (UTF-8, not NUL-terminated)
-```
-
-Then, in order:
-
-1. `n_pairs` × `(src string, dst string)`;
-2. `n_gloss` × `(src string, dst string)`.
-
-A length of `0` is a valid, empty string (used for "this side has no gloss").
-
-### Matching semantics
-
-The phrasebook is compared on **normalised** text, not on raw bytes, because
-that is what makes user input match:
-
-- Persian: Arabic yeh `U+064A` → Persian yeh `U+06CC`; Arabic kaf `U+0643` →
-  `U+06A9`; ZWNJ/ZWJ and tatweel removed; runs of whitespace collapsed.
-- Latin: lowercased; punctuation folded to single spaces.
-- Both: leading and trailing whitespace removed.
-
-Matching then proceeds **longest first**: a whole-sentence hit beats a multi-word
-phrase, which beats a single-word gloss. Unknown tokens are passed through
-unchanged rather than silently dropped, so the output shows exactly what the
-engine could not translate.
-
----
-
-## 3. `.ckpt` — training checkpoint
-
-Produced during fine-tuning so an interrupted run can resume. Layout is the
-`.osam` header followed by the same body, with a training-state block appended.
-Checkpoints live under `.../Checkpoints/` and are never loaded at start-up; they
-are an artefact, not a model.
-
----
-
-## 4. Adding your own model
-
-```sh
-# 1. put the file anywhere, then
-OpenSpeechAI.exe            # Models → Import model from file
-```
-
-The app copies it into `<data root>/Models/`, records its SHA-256 and size, and
-registers it **inactive**. Activating is a separate, explicit step: the previous
-model stays on disk, so rolling back never requires re-downloading anything.
-
-## 5. Versioning policy
-
-- `version` is bumped when the layout changes in a way a v1 reader cannot skip.
-- New *optional* trailing sections do not bump it.
-- Readers must reject unknown magics and unknown versions with a clear error
-  message; they must never partially load a container.
-
-## 6. Why not ONNX or GGUF
-
-Both are fine formats, and both would add a runtime dependency to a program whose
-main selling point is "download one file, double-click, works offline". The
-containers above are ~40 lines of serialisation each, need no third-party code,
-and are trivially auditable — which matters for a tool that processes private
-speech.
+`.osam` / `.osmt` code remains in the tree for historical reference and some
+helper engines, but they are not bundled, not auto-installed, and not accepted
+by any install path. Training/evaluation no longer fabricate exemplar or
+phrasebook scores.

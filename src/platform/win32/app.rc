@@ -39,3 +39,8 @@ BEGIN
 END
 
 1 24 "app.manifest"
+
+/* The inference worker travels inside the executable. It is extracted to
+ * <exe>/data/Cache on first activation, so a lone OpenSpeechAI.exe can still
+ * download and activate models — no "keep the worker beside the exe" failure. */
+OSAI_WORKER RCDATA "OpenSpeechWorker.exe"

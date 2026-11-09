@@ -65,7 +65,7 @@ typedef struct osa_training_job {
 } osa_training_job;
 
 typedef struct osa_catalog_entry {
-    char id[64], name[160], kind[24], language[16], url[512], license[160];
+    char id[64], name[160], kind[24], language[512], url[512], license[160];
     char homepage[256], size_text[32], sha256[72], local_path[OSAI_MAX_PATH];
     char status[16], notes[400], min_free_gb[16];
     int64_t size_bytes, downloaded_bytes;
@@ -79,14 +79,14 @@ typedef struct osa_download {
 
 typedef struct osa_transcription {
     char id[40], audio_path[OSAI_MAX_PATH], model_id[40], language[8], source[16];
-    char text[8192], corrected_text[8192], created_at[32], status[16];
+    char text[OSAI_MAX_TEXT+1], corrected_text[OSAI_MAX_TEXT+1], created_at[32], status[16];
     double confidence;
     int64_t duration_ms, proc_ms;
 } osa_transcription;
 
 typedef struct osa_translation {
     char id[40], transcription_id[40], source_lang[8], target_lang[8], engine[32];
-    char text[8192], source_text[8192], created_at[32];
+    char text[OSAI_MAX_TEXT+1], source_text[OSAI_MAX_TEXT+1], created_at[32];
 } osa_translation;
 
 /* models */

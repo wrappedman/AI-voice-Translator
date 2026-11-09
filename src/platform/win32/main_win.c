@@ -26,6 +26,7 @@
 #include <windowsx.h>
 #include <commdlg.h>
 #include <shellapi.h>
+#include <shlobj.h>
 #include <stdbool.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -49,17 +50,19 @@
  * enum instead of re-declaring integers makes that impossible. */
 #define REQ_NONE        SHELL_REQ_NONE
 #define REQ_PICK_AUDIO  SHELL_REQ_PICK_AUDIO
-#define REQ_PICK_MODEL  SHELL_REQ_PICK_PACK
 #define REQ_PICK_DATA   SHELL_REQ_PICK_DATASET
 #define REQ_OPEN_FOLDER SHELL_REQ_OPEN_FOLDER
 #define REQ_SAVE_TEXT   SHELL_REQ_SAVE_TRANSCRIPT
+#define REQ_OPEN_URL    SHELL_REQ_OPEN_URL
+#define REQ_PICK_MDIR   SHELL_REQ_PICK_MODELS_DIR
 /* Compile-time proof that the two enums still line up. They drifted once and the
  * result was a button that did nothing, so this cannot be left to review. */
 _Static_assert(REQ_PICK_AUDIO  == 1, "shell_request order changed");
-_Static_assert(REQ_PICK_MODEL  == 2, "shell_request order changed");
-_Static_assert(REQ_PICK_DATA   == 3, "shell_request order changed");
-_Static_assert(REQ_OPEN_FOLDER == 4, "shell_request order changed");
-_Static_assert(REQ_SAVE_TEXT   == 5, "shell_request order changed");
+_Static_assert(REQ_PICK_DATA   == 2, "shell_request order changed");
+_Static_assert(REQ_OPEN_FOLDER == 3, "shell_request order changed");
+_Static_assert(REQ_SAVE_TEXT   == 4, "shell_request order changed");
+_Static_assert(REQ_OPEN_URL    == 5, "shell_request order changed");
+_Static_assert(REQ_PICK_MDIR   == 6, "shell_request order changed");
 
 typedef struct host {
     HWND         hwnd;
@@ -91,6 +94,7 @@ typedef struct host {
      * second one on the spot (the modal loop is still dispatching our timer).
      * It is remembered here and started on the next frame instead. */
     int          pending_kind;
+    bool         in_frame;      /* re-entrancy guard for host_frame */
 } host;
 
 static host g_host;
@@ -139,32 +143,16 @@ static void host_blit(host *h) {
 static void finish_pick_audio(host *h, const wchar_t *file) {
     char path[OSAI_MAX_PATH];
     if (!WideCharToMultiByte(CP_UTF8, 0, file, -1, path, sizeof path, NULL, NULL)) return;
-    osa_strlcpy(h->shell.audio_path, path, sizeof h->shell.audio_path);
-    shell_load_waveform(&h->shell, h->shell.audio_path);
-    shell_run_transcribe(&h->shell);
-}
-
-static void finish_pick_model(host *h, const wchar_t *file) {
-    char path[OSAI_MAX_PATH];
-    if (!WideCharToMultiByte(CP_UTF8, 0, file, -1, path, sizeof path, NULL, NULL)) return;
-    osa_error err;
-    if (osa_app_install_pack_file(h->app, path, &err)) {
-        free(h->shell.models_json);
-        h->shell.models_json = osa_app_models_json(h->app, NULL);
-        shell_set_message(&h->shell, false, "%s", tt(h->shell.lang, "msg.ok"));
-    } else {
-        shell_set_message(&h->shell, true, "%s: %s", tt(h->shell.lang, "msg.failed"), err.msg);
-    }
+    /* Selection is not transcription. Decode the preview off the UI thread;
+     * inference starts only when the user presses Transcribe. */
+    shell_select_audio(&h->shell,path);
 }
 
 /* Training data: either a tab-separated "audio<TAB>text" file or a folder of
  * recordings. The picker offers both, so a user with a folder of clips is not
  * forced to assemble a manifest by hand. */
 static void finish_pick_dataset(host *h, const wchar_t *file) {
-    char path[OSAI_MAX_PATH];
-    if (!WideCharToMultiByte(CP_UTF8, 0, file, -1, path, sizeof path, NULL, NULL)) return;
-    osa_strlcpy(h->shell.dataset_path, path, sizeof h->shell.dataset_path);
-    shell_set_message(&h->shell, false, "%s", tt(h->shell.lang, "training.datasetset"));
+    (void)file;shell_set_message(&h->shell,true,"%s",tt(h->shell.lang,"training.unsupported"));
 }
 
 /* The transcript export: the user picks where to write it. */
@@ -180,6 +168,36 @@ static void finish_save_text(host *h, const wchar_t *file) {
     }
 }
 
+/* Folder picker for the models directory. SHBrowseForFolderW is used instead of
+ * the file dialog because it works on every supported Windows build and returns
+ * a filesystem path we can hand straight to the app layer. */
+static bool pick_models_dir(host *h) {
+    if (h->dialog_open) return false;
+    h->dialog_open = true;
+    wchar_t display[MAX_PATH * 2] = {0};
+    BROWSEINFOW bi;
+    memset(&bi, 0, sizeof bi);
+    bi.hwndOwner = h->hwnd;
+    bi.pszDisplayName = display;
+    bi.lpszTitle = L"پوشه مدل‌ها / Models folder";
+    bi.ulFlags = BIF_RETURNONLYFSDIRS | BIF_NEWDIALOGSTYLE | BIF_NONEWFOLDERBUTTON;
+    LPITEMIDLIST id = SHBrowseForFolderW(&bi);
+    bool ok = false;
+    if (id) {
+        wchar_t path[MAX_PATH * 2] = {0};
+        if (SHGetPathFromIDListW(id, path)) {
+            char utf8[OSAI_MAX_PATH];
+            if (WideCharToMultiByte(CP_UTF8, 0, path, -1, utf8, sizeof utf8, NULL, NULL)) {
+                shell_set_models_dir(&h->shell, utf8);
+                ok = true;
+            }
+        }
+        CoTaskMemFree(id);
+    }
+    h->dialog_open = false;
+    return ok;
+}
+
 static bool start_dialog(host *h, int kind) {
     if (h->dialog_open) return false;
     h->dialog_open = true;
@@ -192,6 +210,10 @@ static bool start_dialog(host *h, int kind) {
     h->ofn.nMaxFile = MAX_PATH * 2;
     h->ofn.Flags = OFN_FILEMUSTEXIST | OFN_PATHMUSTEXIST | OFN_EXPLORER |
                    OFN_NOCHANGEDIR;
+    if (kind == REQ_PICK_MDIR) {
+        h->dialog_open = false;
+        return pick_models_dir(h);
+    }
     if (kind == REQ_SAVE_TEXT) {
         h->ofn.Flags = OFN_OVERWRITEPROMPT | OFN_PATHMUSTEXIST | OFN_NOCHANGEDIR;
         h->ofn.lpstrFilter =
@@ -224,12 +246,10 @@ static bool start_dialog(host *h, int kind) {
             L"All files\0*.*\0";
         h->ofn.lpstrTitle = L"انتخاب فایل صوتی / Choose an audio file";
     } else {
-        h->ofn.lpstrFilter =
-            L"Language packs and models (*.pack;*.osam;*.osmt;*.tsv)\0*.pack;*.osam;*.osmt;*.tsv\0"
-            L"OpenSpeech models (*.osam;*.osmt)\0*.osam;*.osmt\0"
-            L"Language pack (*.pack;*.tsv)\0*.pack;*.tsv\0"
-            L"All files\0*.*\0";
-        h->ofn.lpstrTitle = L"نصب بسته زبان یا مدل / Install a pack or model";
+        /* Model import from a local file was removed on purpose: models are
+         * installed only from the verified official catalogue. */
+        h->dialog_open = false;
+        return false;
     }
     BOOL ok = GetOpenFileNameW(&h->ofn);
     /* Read the result *after* the dialog has closed, and clear the flag before
@@ -238,7 +258,6 @@ static bool start_dialog(host *h, int kind) {
     if (ok) {
         if (kind == REQ_PICK_AUDIO) finish_pick_audio(h, h->ofn_file);
         else if (kind == REQ_PICK_DATA) finish_pick_dataset(h, h->ofn_file);
-        else finish_pick_model(h, h->ofn_file);
     }
     return ok ? true : false;
 }
@@ -282,20 +301,32 @@ static double now_seconds(void) {
 }
 
 static void host_frame(host *h) {
-    if (!h->running) return;
+    /* ShellExecute, the common dialogs and the tray menu all pump messages while
+     * they run. Without this guard a WM_TIMER delivered inside that nested loop
+     * drew a second frame with the same click still latched, and one press of
+     * "Folder" opened two Explorer windows. */
+    if (!h->running || h->in_frame) return;
+    h->in_frame = true;
     double t = now_seconds();
     float dt = (float)(t - h->last_tick);
     if (dt < 0) dt = 0;
     if (dt > 0.25f) dt = 0.25f;      /* a stalled window must not jump */
     h->last_tick = t;
 
-    h->in.n_chars = h->n_typed;
-    memcpy(h->in.chars, h->typed, sizeof h->typed);
-    h->in.wheel = (float)h->wheel;
-    h->in.released = !h->in.down;
+    /* Consume the edge-triggered events *before* drawing or opening anything:
+     * a click belongs to exactly one frame even if a dialog re-enters us. */
+    ui_input in = h->in;
+    in.n_chars = h->n_typed;
+    memcpy(in.chars, h->typed, sizeof h->typed);
+    in.wheel = (float)h->wheel;
+    in.released = !h->in.down;
+    h->n_typed = 0;
+    h->wheel = 0;
+    h->in.clicked = false;
+    h->in.key = 0;
     shell_live_tick(&h->shell, dt > 0 ? dt : 0.05);
     ui_set_time(&h->ui, (float)t);
-    shell_draw(&h->shell, &h->canvas, &h->ui, &h->in);
+    shell_draw(&h->shell, &h->canvas, &h->ui, &in);
     host_blit(h);
 
     /* The UI raises a request instead of calling a dialog itself, so the shell
@@ -304,7 +335,10 @@ static void host_frame(host *h) {
     int req = h->shell.request;
     if (req != REQ_NONE) {
         h->shell.request = REQ_NONE;
-        if (req == REQ_OPEN_FOLDER) osa_open_in_explorer(osa_path(OSAI_DIR_ROOT));
+        if (req == REQ_OPEN_FOLDER)
+            osa_open_in_explorer(h->shell.request_path[0] ? h->shell.request_path
+                                                          : osa_path(OSAI_DIR_ROOT));
+        else if (req == REQ_OPEN_URL) osa_open_url(h->shell.request_url);
         else if (start_dialog(h, req)) {
             /* handled (or the user cancelled) */
         } else {
@@ -318,10 +352,7 @@ static void host_frame(host *h) {
         h->pending_kind = REQ_NONE;
         start_dialog(h, k);
     }
-    h->n_typed = 0;
-    h->wheel = 0;
-    h->in.clicked = false;
-    h->in.key = 0;
+    h->in_frame = false;
 }
 
 /* ---- window proc -------------------------------------------------- */

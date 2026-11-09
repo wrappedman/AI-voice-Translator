@@ -102,8 +102,19 @@ float osa_process_ram_mb(void);
 void        osa_crash_log_init(bool quiet);
 const char *osa_crash_log_path(void);
 
+/* ---------------- model worker ----------------
+ * Absolute path of the inference worker. On Windows the worker is embedded in
+ * the executable and extracted into <exe>/data/Cache on first use, so a lone
+ * OpenSpeechAI.exe can still activate models. */
+bool osa_worker_path(char *out, size_t cap, osa_error *err);
+
 /* ---------------- desktop helpers ---------------- */
 bool osa_open_in_explorer(const char *path);   /* opens folder/file with the OS shell */
+bool osa_open_url(const char *url);            /* https:// or mailto: only */
+/* The worker's stderr file under <data>/Logs. The app appends its own notes so
+ * one file explains a failed activation, and can quote its tail in an error. */
+void osa_worker_log_note(const char *fmt, ...);
+bool osa_worker_log_tail(char *out, size_t cap);
 bool osa_clipboard_set(const char *utf8);
 
 /* Plays a short WAV file through the default output device. Playback is

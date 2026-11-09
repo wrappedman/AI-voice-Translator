@@ -991,47 +991,43 @@ int ui_popup_draw(ui_context *u) {
     if (!u->popup_id) return -1;
     int n = u->popup_n;
     if (n <= 0) { u->popup_id = 0; return -1; }
+    if(u->popup_scroll<0)u->popup_scroll=0;
+    int max_scroll=n>12?n-12:0;if(u->popup_scroll>max_scroll)u->popup_scroll=max_scroll;
+    int visible=n-u->popup_scroll;if(visible>12)visible=12;
     float row_h = 34 * u->L.scale;
     float pad = 6 * u->L.scale;
-    float h = row_h * n + pad * 2;
-    float w = MAXF(u->popup_rect.w, 160 * u->L.scale);
+    float h = row_h * visible + pad * 2;
+    float w = MAXF(u->popup_rect.w, 220 * u->L.scale);
     float x = u->popup_rect.x;
     float y = u->popup_rect.y + u->popup_rect.h + 6 * u->L.scale;
     if (y + h > u->c->h - 8) y = MAXF(8.0f, u->popup_rect.y - h - 6 * u->L.scale);
-    /* keep it on screen horizontally, remembering RTL's leading edge */
     if (x + w > u->c->w - 8) x = u->c->w - w - 8;
     if (x < 8) x = 8;
     osa_rect box = rectf(x, y, w, h);
+    if(hover(u,box)&&u->in.wheel!=0){u->popup_scroll-= (int)u->in.wheel*2;if(u->popup_scroll<0)u->popup_scroll=0;if(u->popup_scroll>max_scroll)u->popup_scroll=max_scroll;u->in.wheel=0;}
     c_soft_shadow(u->c, box, u->L.radius_sm, 16 * u->L.scale, 6 * u->L.scale, u->t.shadow);
     c_fill_round(u->c, box, u->L.radius_sm, u->t.panel_hover);
     c_stroke_round(u->c, box, u->L.radius_sm, 1.0f, u->t.border_strong);
     int result = -1;
-    for (int i = 0; i < n; i++) {
+    for (int i = 0; i < visible; i++) {
+        int global=i+u->popup_scroll;
         osa_rect rr = rectf(box.x + pad, box.y + pad + i * row_h, box.w - pad * 2, row_h);
         bool hov = hover(u, rr);
-        bool sel = (i == u->popup_sel);
+        bool sel = (global == u->popup_sel);
         if (hov) c_fill_round(u->c, rr, u->L.radius_sm * 0.7f, u->t.panel_alt);
-        if (sel) {
-            c_fill_round(u->c, rr, u->L.radius_sm * 0.7f,
-                         col_alpha(u->t.accent, hov ? 0.30f : 0.20f));
-        }
+        if (sel) c_fill_round(u->c, rr, u->L.radius_sm * 0.7f, col_alpha(u->t.accent, hov ? 0.30f : 0.20f));
         ui_label(u, rectf(rr.x + 12 * u->L.scale, rr.y, rr.w - 40 * u->L.scale, rr.h),
                  u->popup_items[i], UI_FS_BODY * u->L.scale,
                  sel ? u->t.accent : u->t.text, u->L.rtl ? 2 : 0);
         if (sel) {
-            /* check mark on the trailing edge */
             float cx = u->L.rtl ? rr.x + 18 * u->L.scale : rr.x + rr.w - 18 * u->L.scale;
-            float cy = rr.y + rr.h * 0.5f;
-            float s = 3.4f * u->L.scale;
+            float cy = rr.y + rr.h * 0.5f; float s = 3.4f * u->L.scale;
             c_line(u->c, cx - s, cy, cx, cy + s * 0.9f, 1.8f * u->L.scale, u->t.accent);
-            c_line(u->c, cx, cy + s * 0.9f, cx + s * 1.3f, cy - s * 0.9f, 1.8f * u->L.scale,
-                   u->t.accent);
+            c_line(u->c, cx, cy + s * 0.9f, cx + s * 1.3f, cy - s * 0.9f, 1.8f * u->L.scale, u->t.accent);
         }
-        if (hov && u->in.clicked && !u->consumed_click) {
-            u->consumed_click = true;
-            result = i;
-        }
+        if (hov && u->in.clicked && !u->consumed_click) { u->consumed_click = true; result = global; }
     }
+
     /* A click anywhere else dismisses the list. */
     if (u->in.clicked && !u->consumed_click) {
         u->consumed_click = true;
